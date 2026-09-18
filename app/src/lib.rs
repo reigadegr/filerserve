@@ -140,7 +140,7 @@ impl ListApi {
 pub fn build_router(root: PathBuf, port: u16) -> Router {
     Router::new()
         .push(
-            Router::with_path("/")
+            Router::new()
                 .filter(filters::get())
                 .goal(static_embed::<Asset>().fallback("index.html")),
         )
