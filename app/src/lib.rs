@@ -44,11 +44,6 @@ impl ListApi {
     pub const fn new(root: PathBuf, port: u16) -> Self {
         Self { root, port }
     }
-
-    #[must_use]
-    pub const fn root(&self) -> &PathBuf {
-        &self.root
-    }
 }
 
 #[handler]
