@@ -1,9 +1,6 @@
 use chrono::Local;
-use salvo::{
-    prelude::*,
-    routing::{Filter, filters},
-    serve_static::StaticDir,
-};
+use filerserve::build_router;
+use salvo::prelude::{Listener, Server, TcpListener};
 use std::{fmt, io::IsTerminal, path::PathBuf};
 use tracing_subscriber::{
     EnvFilter,
@@ -41,9 +38,7 @@ async fn main() {
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("serving {} on http://{addr}", root.display());
-    let router = Router::with_path("{**rest}")
-        .filter(filters::get().or(filters::head()))
-        .goal(StaticDir::new(root).auto_list(true));
+    let router = build_router(root, port);
 
     let acceptor = TcpListener::new(addr).bind().await;
     Server::new(acceptor).serve(router).await;

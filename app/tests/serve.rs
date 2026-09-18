@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use filerserve::build_router;
 use salvo::{
     http::header,
     prelude::*,
@@ -187,4 +188,95 @@ async fn serves_over_real_tcp() {
     assert!(text.contains("hello world"));
 
     server.abort();
+}
+
+// ---- JSON API tests ----
+
+fn api_router(root: PathBuf) -> Arc<Router> {
+    Arc::new(build_router(root, 8000))
+}
+
+#[tokio::test]
+async fn api_list_returns_json_for_root() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+
+    let router = api_router(dir.root());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/list")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+
+    let body = res.take_string().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["path"], "/");
+    assert_eq!(json["port"], 8000);
+    assert!(json["lan_ip"].is_null());
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+
+    let by_name: std::collections::HashMap<&str, &serde_json::Value> = entries
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap(), e))
+        .collect();
+    let a = by_name.get("a.txt").unwrap();
+    assert_eq!(a["type"], "file");
+    assert_eq!(a["size"], 3);
+    assert!(a["modified"].as_str().is_some());
+
+    let sub = by_name.get("sub").unwrap();
+    assert_eq!(sub["type"], "dir");
+    assert!(sub["size"].is_null());
+}
+
+#[tokio::test]
+async fn api_list_hides_dot_files() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
+    std::fs::write(dir.root().join("visible.txt"), "abc").unwrap();
+
+    let router = api_router(dir.root());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/list")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+
+    let body = res.take_string().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "visible.txt");
+    assert!(!body.contains(".hidden"));
+}
+
+#[tokio::test]
+async fn api_list_lists_subdirectory() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub").join("inner.txt"), "xyz").unwrap();
+
+    let router = api_router(dir.root());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/list/sub")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+
+    let body = res.take_string().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["path"], "/sub");
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "inner.txt");
+    assert_eq!(entries[0]["type"], "file");
+}
+
+#[tokio::test]
+async fn api_list_returns_404_for_missing_directory() {
+    let dir = TestDir::new();
+    let router = api_router(dir.root());
+    let res = TestClient::get("http://127.0.0.1:5800/api/list/nope")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
