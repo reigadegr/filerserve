@@ -31,12 +31,8 @@ pub struct ListApi {
 
 impl ListApi {
     #[must_use]
-    pub fn new(root: PathBuf, port: u16) -> Self {
-        let canonical_root = root.canonicalize().unwrap_or(root);
-        Self {
-            root: canonical_root,
-            port,
-        }
+    pub const fn new(root: PathBuf, port: u16) -> Self {
+        Self { root, port }
     }
 }
 
@@ -125,15 +121,7 @@ impl ListApi {
 
 #[must_use]
 pub fn list_routes(root: PathBuf, port: u16) -> Router {
-    Router::new()
-        .push(
-            Router::with_path("/api/list")
-                .filter(filters::get())
-                .goal(ListApi::new(root.clone(), port)),
-        )
-        .push(
-            Router::with_path("/api/list/{**path}")
-                .filter(filters::get())
-                .goal(ListApi::new(root, port)),
-        )
+    Router::with_path("/api/list/{**path}")
+        .filter(filters::get())
+        .goal(ListApi::new(root, port))
 }

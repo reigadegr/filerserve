@@ -4,6 +4,7 @@
   var loading = document.getElementById('loading');
   var errorDiv = document.getElementById('error');
 
+  // hash 中保存的是已编码路径，导航时原样透传，避免二次编码
   function currentPath() {
     return location.hash.slice(1);
   }
@@ -13,8 +14,7 @@
   }
 
   function joinPath(prefix, name) {
-    var enc = encodeURIComponent(name);
-    return prefix ? prefix + '/' + enc : enc;
+    return prefix ? prefix + '/' + encodeURIComponent(name) : encodeURIComponent(name);
   }
 
   function loadListing(path) {
@@ -22,7 +22,7 @@
     errorDiv.style.display = 'none';
     fileList.innerHTML = '';
 
-    var url = path ? '/api/list/' + path : '/api/list';
+    var url = '/api/list' + (path ? '/' + path : '');
     fetch(url)
       .then(function (res) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -70,9 +70,7 @@
       if (entry.type === 'dir') {
         nameCell.appendChild(icon);
         nameCell.appendChild(document.createTextNode(' ' + entry.name));
-        (function (p) {
-          nameCell.onclick = function () { navigate(p); };
-        })(fp);
+        nameCell.onclick = function () { navigate(fp); };
       } else {
         var link = document.createElement('a');
         link.href = '/files/' + fp;
@@ -123,10 +121,8 @@
         sep.textContent = '/';
         breadcrumb.appendChild(sep);
         var link = document.createElement('a');
-        link.textContent = part;
-        (function (p) {
-          link.onclick = function () { navigate(p); };
-        })(acc);
+        link.textContent = decodeURIComponent(part);
+        link.onclick = function () { navigate(acc); };
         breadcrumb.appendChild(link);
       });
     }
