@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文件浏览</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>文件浏览</h1>
+  </header>
+  <nav id="breadcrumb"></nav>
+  <main>
+    <table id="file-table">
+      <thead>
+        <tr>
+          <th>名称</th>
+          <th>大小</th>
+          <th>修改时间</th>
+          <th>直链</th>
+        </tr>
+      </thead>
+      <tbody id="file-list"></tbody>
+    </table>
+    <p id="loading">加载中…</p>
+    <p id="error"></p>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
