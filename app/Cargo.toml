@@ -7,3 +7,19 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+salvo = { version = "0.96.0", default-features = false, features = [
+  "server",
+  "http1",
+  "http2",
+  "oapi",
+  "affix-state",
+  "test",
+] }
+mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = [
+  "local-time",
+  "env-filter",
+] }
+tokio = { version = "1.53.1", features = ["full"] }
+chrono = "0.4.45"
