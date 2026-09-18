@@ -26,6 +26,14 @@ pub struct ListApi {
     pub port: u16,
 }
 
+#[must_use]
+pub fn detect_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    Some(addr.ip().to_string())
+}
+
 impl ListApi {
     #[must_use]
     pub const fn new(root: PathBuf, port: u16) -> Self {
@@ -117,7 +125,7 @@ impl ListApi {
 
         let response = ListResponse {
             path: display_path,
-            lan_ip: None,
+            lan_ip: detect_lan_ip(),
             port: self.port,
             entries: list_entries,
         };

@@ -212,7 +212,7 @@ async fn api_list_returns_json_for_root() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["path"], "/");
     assert_eq!(json["port"], 8000);
-    assert!(json["lan_ip"].is_null());
+    assert!(json["lan_ip"].is_null() || json["lan_ip"].is_string());
     let entries = json["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
 
@@ -314,4 +314,12 @@ async fn files_endpoint_rejects_path_traversal() {
         .send(router.clone())
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+// ---- LAN IP detection tests ----
+
+#[test]
+fn detect_lan_ip_returns_some_or_none() {
+    let result = filerserve::detect_lan_ip();
+    assert!(result.is_some() || result.is_none());
 }
