@@ -7,6 +7,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+salvo = { version = "0.96.0", default-features = false }
+chrono = "0.4.45"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

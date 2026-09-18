@@ -7,7 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-salvo = { version = "0.96.0", default-features = false, features = ["server"] }
-chrono = "0.4.45"
+salvo = { workspace = true, features = ["server"] }
+chrono = { workspace = true }
 serde = { version = "1.0.229", features = ["derive"] }
 if-addrs = "0.15"

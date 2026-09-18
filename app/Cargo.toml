@@ -12,17 +12,13 @@ workspace = true
 [dependencies]
 filerserve-assets = { path = "../assets" }
 filerserve-list = { path = "../list" }
-salvo = { version = "0.96.0", default-features = false, features = [
-  "server",
-  "http1",
-  "http2",
-] }
+salvo = { workspace = true, features = ["server", "http1", "http2"] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.53.1", features = ["full"] }
-chrono = "0.4.45"
+chrono = { workspace = true }
 
 [dev-dependencies]
-salvo = { version = "0.96.0", default-features = false, features = ["test"] }
+salvo = { workspace = true, features = ["test"] }
 serde_json = "1.0.151"

@@ -7,8 +7,5 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-salvo = { version = "0.96.0", default-features = false, features = [
-  "server",
-  "serve-static",
-] }
+salvo = { workspace = true, features = ["server", "serve-static"] }
 rust-embed = "8.12.0"
