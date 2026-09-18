@@ -1,9 +1,12 @@
-use rust_embed::RustEmbed;
-use salvo::prelude::*;
-use salvo::routing::{Filter, filters};
-use salvo::serve_static::{StaticDir, static_embed};
-use serde::Serialize;
 use std::path::PathBuf;
+
+use rust_embed::RustEmbed;
+use salvo::{
+    prelude::*,
+    routing::{Filter, filters},
+    serve_static::{StaticDir, static_embed},
+};
+use serde::Serialize;
 
 #[derive(RustEmbed)]
 #[folder = "static/"]
@@ -41,8 +44,12 @@ pub fn detect_lan_ip() -> Option<String> {
 
 impl ListApi {
     #[must_use]
-    pub const fn new(root: PathBuf, port: u16) -> Self {
-        Self { root, port }
+    pub fn new(root: PathBuf, port: u16) -> Self {
+        let canonical_root = root.canonicalize().unwrap_or(root);
+        Self {
+            root: canonical_root,
+            port,
+        }
     }
 }
 
@@ -53,17 +60,12 @@ impl ListApi {
         let path = req.param::<String>("path").unwrap_or_default();
         let full = self.root.join(&path);
 
-        let Ok(canonical_root) = self.root.canonicalize() else {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            return;
-        };
-
         let Ok(canonical_target) = full.canonicalize() else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
 
-        if !canonical_target.starts_with(&canonical_root) {
+        if !canonical_target.starts_with(&self.root) {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         }

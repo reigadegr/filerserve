@@ -1,16 +1,17 @@
 #![allow(clippy::unwrap_used)]
 
-use filerserve::build_router;
-use salvo::{
-    prelude::*,
-    test::{ResponseExt, TestClient},
-};
 use std::{
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
+};
+
+use filerserve::build_router;
+use salvo::{
+    prelude::*,
+    test::{ResponseExt, TestClient},
 };
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -205,14 +206,6 @@ async fn serves_over_real_tcp() {
     assert!(text.contains("hello world"));
 
     server.abort();
-}
-
-// ---- LAN IP detection tests ----
-
-#[test]
-fn detect_lan_ip_returns_some_or_none() {
-    let result = filerserve::detect_lan_ip();
-    assert!(result.is_some() || result.is_none());
 }
 
 // ---- Frontend page tests ----
