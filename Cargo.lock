@@ -362,14 +362,24 @@ name = "filerserve"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "filerserve-lib",
  "mimalloc",
+ "salvo",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "filerserve-lib"
+version = "0.1.0"
+dependencies = [
+ "chrono",
  "rust-embed",
  "salvo",
  "serde",
  "serde_json",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
