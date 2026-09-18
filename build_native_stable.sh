@@ -5,10 +5,8 @@ set -e
 export RUSTFLAGS="
     --cfg tokio_unstable
     -C default-linker-libraries
-    -C relro-level=full
     -C link-arg=-fuse-ld=mold
     -C symbol-mangling-version=v0
-    -C llvm-args=-fp-contract=off
     -C llvm-args=-enable-misched
     -C llvm-args=-enable-post-misched
     -C llvm-args=-enable-dfa-jump-thread
@@ -20,10 +18,10 @@ export RUSTFLAGS="
 
 if [ "$1" = "release" ] || [ "$1" = "r" ]; then
     cargo build -r
-    bin=target/release/op_charge_controller
+    bin=target/release/app
 else
     cargo build
-    bin=target/debug/op_charge_controller
+    bin=target/debug/app
 fi
 
 patchelf --remove-rpath "$bin"
