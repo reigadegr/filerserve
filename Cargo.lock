@@ -363,7 +363,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "mimalloc",
+ "mime_guess",
+ "rust-embed",
  "salvo",
+ "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
