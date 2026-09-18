@@ -1,0 +1,9 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

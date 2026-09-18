@@ -1,0 +1,46 @@
+[workspace]
+members = ["app"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+unwrap_used = { level = "warn", priority = -1 }
+expect_used = { level = "warn", priority = -1 }
+similar_names = "allow"
+missing_errors_doc = "allow"
+missing_safety_doc = "allow"
+missing_panics_doc = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+struct_excessive_bools = "allow"
+option_if_let_else = "allow"
+
+[profile.dev]
+debug = true
+debug-assertions = true
+panic = "abort"
+incremental = true
+
+[profile.release]
+overflow-checks = false
+codegen-units = 1
+lto = "thin"
+opt-level = 2
+strip = true
+debug = 0
+debug-assertions = false
+incremental = false
+panic = "abort"
