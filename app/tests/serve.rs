@@ -323,3 +323,31 @@ fn detect_lan_ip_returns_some_or_none() {
     let result = filerserve::detect_lan_ip();
     assert!(result.is_some() || result.is_none());
 }
+
+// ---- Frontend page tests ----
+
+#[tokio::test]
+async fn root_returns_html_page() {
+    let dir = TestDir::new();
+    let router = api_router(dir.root());
+    let mut res = TestClient::get("http://127.0.0.1:5800/")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let body = res.take_string().await.unwrap();
+    assert!(body.contains("<title>文件浏览</title>"));
+    assert!(body.contains("/static/style.css"));
+    assert!(body.contains("/static/app.js"));
+}
+
+#[tokio::test]
+async fn static_serves_css() {
+    let dir = TestDir::new();
+    let router = api_router(dir.root());
+    let mut res = TestClient::get("http://127.0.0.1:5800/static/style.css")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let body = res.take_string().await.unwrap();
+    assert!(body.contains("border-box"));
+}

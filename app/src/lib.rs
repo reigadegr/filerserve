@@ -1,8 +1,14 @@
+use rust_embed::RustEmbed;
+use salvo::http::{HeaderValue, header};
 use salvo::prelude::*;
 use salvo::routing::{Filter, filters};
 use salvo::serve_static::StaticDir;
 use serde::Serialize;
 use std::path::PathBuf;
+
+#[derive(RustEmbed)]
+#[folder = "static/"]
+struct Asset;
 
 #[derive(Serialize)]
 struct ListEntry {
@@ -134,9 +140,52 @@ impl ListApi {
     }
 }
 
+#[handler]
+fn serve_index(res: &mut Response) {
+    match Asset::get("index.html") {
+        Some(content) => {
+            res.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            res.body(content.data.to_vec());
+        }
+        None => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+}
+
+#[handler]
+fn serve_static(req: &mut Request, res: &mut Response) {
+    let path = req.param::<String>("path").unwrap_or_default();
+    match Asset::get(&path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            if let Ok(value) = HeaderValue::from_str(mime.as_ref()) {
+                res.headers_mut().insert(header::CONTENT_TYPE, value);
+            }
+            res.body(content.data.to_vec());
+        }
+        None => {
+            res.status_code(StatusCode::NOT_FOUND);
+        }
+    }
+}
+
 #[must_use]
 pub fn build_router(root: PathBuf, port: u16) -> Router {
     Router::new()
+        .push(
+            Router::with_path("/")
+                .filter(filters::get())
+                .goal(serve_index),
+        )
+        .push(
+            Router::with_path("/static/{**path}")
+                .filter(filters::get())
+                .goal(serve_static),
+        )
         .push(
             Router::with_path("/api/list")
                 .filter(filters::get())
