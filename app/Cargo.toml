@@ -23,3 +23,4 @@ tracing-subscriber = { version = "0.3.23", features = [
 ] }
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = "0.4.45"
+percent-encoding = "2.3.2"

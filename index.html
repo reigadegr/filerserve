@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>filerserve</title>
+<style>
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(160deg, #f6f8fa 0%, #e8eef4 100%);
+  }
+  main {
+    text-align: center;
+    padding: 3em 2em;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, .08);
+    max-width: 32em;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  h1 {
+    margin: 0 0 .4em;
+    font-size: 2em;
+    letter-spacing: .02em;
+  }
+  p {
+    margin: .4em 0;
+    color: #57606a;
+    line-height: 1.6;
+  }
+  code {
+    background: #f0f2f4;
+    padding: .15em .4em;
+    border-radius: 4px;
+    font-size: .95em;
+  }
+  a {
+    display: inline-block;
+    margin-top: 1.2em;
+    padding: .6em 1.4em;
+    background: #0969da;
+    color: #fff;
+    text-decoration: none;
+    border-radius: 6px;
+    font-weight: 600;
+  }
+  a:hover {
+    background: #0860c3;
+  }
+</style>
+</head>
+<body>
+  <main>
+    <h1>📁 filerserve</h1>
+    <p>基于 Salvo 的静态文件服务器，等效于 <code>python -m http.server</code></p>
+    <p>默认端口 <code>8000</code>，此页面来自 <code>index.html</code></p>
+    <a href="/">浏览文件列表</a>
+  </main>
+</body>
+</html>
