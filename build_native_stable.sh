@@ -18,10 +18,10 @@ export RUSTFLAGS="
 
 if [ "$1" = "release" ] || [ "$1" = "r" ]; then
     cargo build -r
-    bin=target/release/app
+    bin=target/release/filerserve
 else
     cargo build
-    bin=target/debug/app
+    bin=target/debug/filerserve
 fi
 
 patchelf --remove-rpath "$bin"
