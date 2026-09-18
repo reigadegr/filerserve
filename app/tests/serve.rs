@@ -280,3 +280,38 @@ async fn api_list_returns_404_for_missing_directory() {
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
+
+// ---- File download tests ----
+
+#[tokio::test]
+async fn files_endpoint_serves_file() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let router = api_router(dir.root());
+    let mut res = TestClient::get("http://127.0.0.1:5800/files/hello.txt")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    assert_eq!(res.take_string().await.unwrap(), "hello world");
+}
+
+#[tokio::test]
+async fn files_endpoint_returns_404_for_missing_file() {
+    let dir = TestDir::new();
+    let router = api_router(dir.root());
+    let res = TestClient::get("http://127.0.0.1:5800/files/nope.txt")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
+async fn files_endpoint_rejects_path_traversal() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("secret.txt"), "top secret").unwrap();
+    let router = api_router(dir.root());
+    let res = TestClient::get("http://127.0.0.1:5800/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
