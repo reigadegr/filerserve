@@ -64,15 +64,22 @@
       nameCell.className = 'name-cell ' + entry.type;
       var icon = document.createElement('span');
       icon.className = entry.type === 'dir' ? 'dir-icon' : 'file-icon';
-      nameCell.appendChild(icon);
-      nameCell.appendChild(document.createTextNode(' ' + entry.name));
 
       var fp = joinPath(prefix, entry.name);
 
       if (entry.type === 'dir') {
+        nameCell.appendChild(icon);
+        nameCell.appendChild(document.createTextNode(' ' + entry.name));
         (function (p) {
           nameCell.onclick = function () { navigate(p); };
         })(fp);
+      } else {
+        var link = document.createElement('a');
+        link.href = '/files/' + fp;
+        link.download = entry.name;
+        link.appendChild(icon);
+        link.appendChild(document.createTextNode(' ' + entry.name));
+        nameCell.appendChild(link);
       }
 
       var sizeCell = row.insertCell();
