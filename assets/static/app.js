@@ -41,7 +41,7 @@
   function render(data, encodedPath) {
     loading.style.display = 'none';
 
-    renderBreadcrumb(data.path);
+    renderBreadcrumb(data.path, encodedPath);
 
     var entries = data.entries;
     if (entries.length === 0) {
@@ -104,7 +104,7 @@
     });
   }
 
-  function renderBreadcrumb(decodedPath) {
+  function renderBreadcrumb(decodedPath, encodedPath) {
     breadcrumb.innerHTML = '';
     var home = document.createElement('a');
     home.textContent = '🏠 首页';
@@ -113,16 +113,18 @@
 
     if (decodedPath && decodedPath !== '/') {
       var parts = decodedPath.slice(1).split('/');
+      var encParts = encodedPath.split('/');
       var acc = '';
       parts.forEach(function (part, i) {
-        acc += (i > 0 ? '/' : '') + part;
+        acc += (i > 0 ? '/' : '') + encParts[i];
         var sep = document.createElement('span');
         sep.className = 'sep';
         sep.textContent = '/';
         breadcrumb.appendChild(sep);
         var link = document.createElement('a');
-        link.textContent = decodeURIComponent(part);
-        link.onclick = function () { navigate(acc); };
+        link.textContent = part;
+        var target = acc;
+        link.onclick = function () { navigate(target); };
         breadcrumb.appendChild(link);
       });
     }
