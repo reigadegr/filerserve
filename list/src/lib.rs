@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::mem::MaybeUninit;
 
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use salvo::{prelude::*, routing::filters};
 use serde::Serialize;
 
@@ -25,13 +26,13 @@ struct ListResponse {
 }
 
 pub struct ListApi {
-    root: PathBuf,
+    root: std::path::PathBuf,
     pub port: u16,
 }
 
 impl ListApi {
     #[must_use]
-    pub const fn new(root: PathBuf, port: u16) -> Self {
+    pub const fn new(root: std::path::PathBuf, port: u16) -> Self {
         Self { root, port }
     }
 }
@@ -53,39 +54,65 @@ impl ListApi {
             return;
         }
 
-        if !canonical_target.is_dir() {
+        // 1. openat 打开目录 fd
+        //    OFlags::DIRECTORY 隐含 is_dir 检查，省 1 次 stat
+        let Ok(dirfd) = fs::openat(
+            fs::CWD,
+            &canonical_target,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
             res.status_code(StatusCode::NOT_FOUND);
-            return;
-        }
-
-        let Ok(entries) = std::fs::read_dir(&canonical_target) else {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
             return;
         };
 
-        let mut list_entries: Vec<ListEntry> = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+        // 2. RawDir 用栈缓冲遍历（零堆分配，vs std read_dir 内部 Vec）
+        let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
+        let mut raw_dir = RawDir::new(&dirfd, &mut buf);
+
+        let mut list_entries: Vec<ListEntry> = Vec::with_capacity(64);
+        while let Some(entry) = raw_dir.next() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+
+            // 3. 用原始字节检查 dotfile（零分配跳过）
+            let name_cstr = entry.file_name();
+            let name_bytes = name_cstr.to_bytes();
+            if name_bytes.first().is_some_and(|&b| b == b'.') {
                 continue;
             }
-            let Ok(metadata) = entry.metadata() else {
+
+            // 4. d_type 判断 is_dir（零 syscall，来自 dirent）
+            let ft = entry.file_type();
+
+            // 5. statat 相对 dirfd 获取 size + mtime
+            //    SYMLINK_NOFOLLOW 不跟随符号链接（比 std metadata() 更安全）
+            //    相对路径解析比绝对路径更快
+            let Ok(stat) = fs::statat(&dirfd, name_cstr, AtFlags::SYMLINK_NOFOLLOW) else {
                 continue;
             };
-            let (entry_type, size) = if metadata.is_dir() {
-                ("dir", None)
+
+            // d_type 为 Unknown 时回退到 stat 的 st_mode
+            let is_dir = if ft == FileType::Unknown {
+                FileType::from_raw_mode(stat.st_mode).is_dir()
             } else {
-                ("file", Some(metadata.len()))
+                ft.is_dir()
             };
-            #[allow(clippy::cast_possible_wrap)]
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| {
-                    chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
-                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
-                })
+
+            // 6. 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
+            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            let entry_type = if is_dir { "dir" } else { "file" };
+            let size = if is_dir {
+                None
+            } else {
+                #[allow(clippy::cast_sign_loss)]
+                Some(stat.st_size as u64)
+            };
+
+            // 7. 直接读 st_mtime（跳过 SystemTime → Duration → as_secs 转换链）
+            let modified = chrono::DateTime::from_timestamp(stat.st_mtime, 0)
+                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
                 .unwrap_or_default();
 
             list_entries.push(ListEntry {
@@ -120,7 +147,7 @@ impl ListApi {
 }
 
 #[must_use]
-pub fn list_routes(root: PathBuf, port: u16) -> Router {
+pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
     Router::with_path("/api/list/{**path}")
         .filter(filters::get())
         .goal(ListApi::new(root, port))
