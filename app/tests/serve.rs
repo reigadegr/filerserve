@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use filerserve_lib::build_router;
+use filerserve::build_router;
 use salvo::{
     prelude::*,
     test::{ResponseExt, TestClient},

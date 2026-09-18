@@ -1,7 +1,7 @@
 use std::{fmt, io::IsTerminal, path::PathBuf};
 
 use chrono::Local;
-use filerserve_lib::build_router;
+use filerserve::build_router;
 use salvo::prelude::{Listener, Server, TcpListener};
 use tracing_subscriber::{
     EnvFilter,

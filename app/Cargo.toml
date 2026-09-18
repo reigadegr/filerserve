@@ -3,6 +3,9 @@ name = "filerserve"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+path = "src/router.rs"
+
 [lints]
 workspace = true
 
@@ -12,9 +15,14 @@ salvo = { version = "0.96.0", default-features = false, features = [
   "server",
   "http1",
   "http2",
+  "serve-static",
 ] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = "0.4.45"
+
+[dev-dependencies]
+salvo = { version = "0.96.0", default-features = false, features = ["test"] }
+serde_json = "1.0.151"

@@ -365,6 +365,7 @@ dependencies = [
  "filerserve-lib",
  "mimalloc",
  "salvo",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -378,8 +379,6 @@ dependencies = [
  "rust-embed",
  "salvo",
  "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
