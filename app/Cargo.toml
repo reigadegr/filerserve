@@ -13,6 +13,7 @@ salvo = { version = "0.96.0", default-features = false, features = [
   "http2",
   "oapi",
   "affix-state",
+  "serve-static",
   "test",
 ] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
@@ -23,4 +24,3 @@ tracing-subscriber = { version = "0.3.23", features = [
 ] }
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = "0.4.45"
-percent-encoding = "2.3.2"
