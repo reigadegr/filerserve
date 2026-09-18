@@ -2,10 +2,7 @@
 
 use filerserve::build_router;
 use salvo::{
-    http::header,
     prelude::*,
-    routing::{Filter, filters},
-    serve_static::StaticDir,
     test::{ResponseExt, TestClient},
 };
 use std::{
@@ -42,159 +39,11 @@ impl Drop for TestDir {
     }
 }
 
-fn router(root: PathBuf) -> Arc<Router> {
-    Arc::new(
-        Router::with_path("{**rest}")
-            .filter(filters::get().or(filters::head()))
-            .goal(StaticDir::new(root).auto_list(true)),
-    )
-}
-
-#[tokio::test]
-async fn lists_directory_at_root() {
-    let dir = TestDir::new();
-    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
-    std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
-    let router = router(dir.root());
-    let mut res = TestClient::get("http://127.0.0.1:5800/")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    let body = res.take_string().await.unwrap();
-    assert!(body.contains("a.txt"));
-    assert!(body.contains("sub"));
-}
-
-#[tokio::test]
-async fn lists_directory_even_with_index_html() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("index.html"), "<h1>hello</h1>").unwrap();
-    std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
-    let router = router(dir.root());
-    let mut res = TestClient::get("http://127.0.0.1:5800/")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    let body = res.take_string().await.unwrap();
-    assert!(body.contains("a.txt"));
-    assert!(!body.contains("<h1>hello</h1>"));
-}
-
-#[tokio::test]
-async fn hides_dot_files_in_listing() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
-    std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
-    let router = router(dir.root());
-    let mut res = TestClient::get("http://127.0.0.1:5800/")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    let body = res.take_string().await.unwrap();
-    assert!(body.contains("a.txt"));
-    assert!(!body.contains(".hidden"));
-}
-
-#[tokio::test]
-async fn redirects_dir_without_trailing_slash() {
-    let dir = TestDir::new();
-    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
-    let router = router(dir.root());
-    let res = TestClient::get("http://127.0.0.1:5800/sub")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::FOUND));
-    let location = res
-        .headers()
-        .get(header::LOCATION)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(location, "/sub/");
-}
-
-#[tokio::test]
-async fn serves_file() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = router(dir.root());
-    let mut res = TestClient::get("http://127.0.0.1:5800/hello.txt")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    assert_eq!(res.take_string().await.unwrap(), "hello world");
-}
-
-#[tokio::test]
-async fn returns_not_found_for_missing_file() {
-    let dir = TestDir::new();
-    let router = router(dir.root());
-    let res = TestClient::get("http://127.0.0.1:5800/nope.txt")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-#[tokio::test]
-async fn path_traversal_stays_within_root() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("secret.txt"), "top secret").unwrap();
-    let router = router(dir.root());
-    let res = TestClient::get("http://127.0.0.1:5800/%2e%2e%2f%2e%2e%2fetc%2fpasswd")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-#[tokio::test]
-async fn head_request_succeeds() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = router(dir.root());
-    let res = TestClient::head("http://127.0.0.1:5800/hello.txt")
-        .send(router.clone())
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-}
-
-#[tokio::test]
-async fn serves_over_real_tcp() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = Arc::new(
-        Router::with_path("{**rest}")
-            .filter(filters::get().or(filters::head()))
-            .goal(StaticDir::new(dir.root()).auto_list(true)),
-    );
-    let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
-    let addr = acceptor.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        Server::new(acceptor).serve(router).await;
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(b"GET /hello.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.unwrap();
-    let text = String::from_utf8_lossy(&buf);
-    assert!(text.starts_with("HTTP/1.1 200"), "response: {text}");
-    assert!(text.contains("hello world"));
-
-    server.abort();
-}
-
-// ---- JSON API tests ----
-
 fn api_router(root: PathBuf) -> Arc<Router> {
     Arc::new(build_router(root, 8000))
 }
+
+// ---- JSON API tests ----
 
 #[tokio::test]
 async fn api_list_returns_json_for_root() {
@@ -314,6 +163,48 @@ async fn files_endpoint_rejects_path_traversal() {
         .send(router.clone())
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
+async fn files_endpoint_head_request_succeeds() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let router = api_router(dir.root());
+    let res = TestClient::head("http://127.0.0.1:5800/files/hello.txt")
+        .send(router.clone())
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+}
+
+// ---- Real TCP download test ----
+
+#[tokio::test]
+async fn serves_over_real_tcp() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let router = api_router(dir.root());
+    let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
+    let addr = acceptor.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        Server::new(acceptor).serve(router).await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /files/hello.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 200"), "response: {text}");
+    assert!(text.contains("hello world"));
+
+    server.abort();
 }
 
 // ---- LAN IP detection tests ----

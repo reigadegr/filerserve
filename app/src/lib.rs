@@ -199,11 +199,6 @@ pub fn build_router(root: PathBuf, port: u16) -> Router {
         .push(
             Router::with_path("/files/{**path}")
                 .filter(filters::get().or(filters::head()))
-                .goal(StaticDir::new(root.clone())),
-        )
-        .push(
-            Router::with_path("{**rest}")
-                .filter(filters::get().or(filters::head()))
-                .goal(StaticDir::new(root).auto_list(true)),
+                .goal(StaticDir::new(root)),
         )
 }
