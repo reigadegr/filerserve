@@ -15,6 +15,11 @@ pub struct Asset;
 pub fn static_routes(root: PathBuf) -> Router {
     Router::new()
         .push(
+            Router::with_path("/files/{**path}")
+                .filter(filters::get().or(filters::head()))
+                .goal(StaticDir::new(root)),
+        )
+        .push(
             Router::new()
                 .filter(filters::get())
                 .goal(static_embed::<Asset>().fallback("index.html")),
@@ -23,10 +28,5 @@ pub fn static_routes(root: PathBuf) -> Router {
             Router::with_path("/static/{**path}")
                 .filter(filters::get())
                 .goal(static_embed::<Asset>()),
-        )
-        .push(
-            Router::with_path("/files/{**path}")
-                .filter(filters::get().or(filters::head()))
-                .goal(StaticDir::new(root)),
         )
 }
