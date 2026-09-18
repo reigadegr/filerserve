@@ -362,7 +362,8 @@ name = "filerserve"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "filerserve-lib",
+ "filerserve-assets",
+ "filerserve-list",
  "mimalloc",
  "salvo",
  "serde_json",
@@ -372,11 +373,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "filerserve-lib"
+name = "filerserve-assets"
+version = "0.1.0"
+dependencies = [
+ "rust-embed",
+ "salvo",
+]
+
+[[package]]
+name = "filerserve-list"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "rust-embed",
  "salvo",
  "serde",
 ]

@@ -10,12 +10,12 @@ path = "src/router.rs"
 workspace = true
 
 [dependencies]
-filerserve-lib = { path = "../filerserve-lib" }
+filerserve-assets = { path = "../assets" }
+filerserve-list = { path = "../list" }
 salvo = { version = "0.96.0", default-features = false, features = [
   "server",
   "http1",
   "http2",
-  "serve-static",
 ] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
 tracing = "0.1.44"

@@ -1,12 +1,7 @@
 use std::path::PathBuf;
 
-use rust_embed::RustEmbed;
-use salvo::prelude::*;
+use salvo::{prelude::*, routing::filters};
 use serde::Serialize;
-
-#[derive(RustEmbed)]
-#[folder = "static/"]
-pub struct Asset;
 
 #[derive(Serialize)]
 struct ListEntry {
@@ -130,4 +125,19 @@ impl ListApi {
 
         res.render(Json(response));
     }
+}
+
+#[must_use]
+pub fn list_routes(root: PathBuf, port: u16) -> Router {
+    Router::new()
+        .push(
+            Router::with_path("/api/list")
+                .filter(filters::get())
+                .goal(ListApi::new(root.clone(), port)),
+        )
+        .push(
+            Router::with_path("/api/list/{**path}")
+                .filter(filters::get())
+                .goal(ListApi::new(root, port)),
+        )
 }

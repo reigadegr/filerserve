@@ -1,5 +1,5 @@
 [package]
-name = "filerserve-lib"
+name = "filerserve-list"
 version.workspace = true
 edition.workspace = true
 
@@ -10,4 +10,3 @@ workspace = true
 salvo = { version = "0.96.0", default-features = false, features = ["server"] }
 chrono = "0.4.45"
 serde = { version = "1.0.229", features = ["derive"] }
-rust-embed = "8.12.0"

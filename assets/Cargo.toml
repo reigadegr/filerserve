@@ -1,0 +1,14 @@
+[package]
+name = "filerserve-assets"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+salvo = { version = "0.96.0", default-features = false, features = [
+  "server",
+  "serve-static",
+] }
+rust-embed = "8.12.0"
