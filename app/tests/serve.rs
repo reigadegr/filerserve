@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -29,8 +29,8 @@ impl TestDir {
         Self(path)
     }
 
-    fn root(&self) -> PathBuf {
-        self.0.clone()
+    fn root(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -52,9 +52,9 @@ async fn api_list_returns_json_for_root() {
     std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
     std::fs::create_dir_all(dir.root().join("sub")).unwrap();
 
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let mut res = TestClient::get("http://127.0.0.1:5800/api/list")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::OK));
 
@@ -86,9 +86,9 @@ async fn api_list_hides_dot_files() {
     std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
     std::fs::write(dir.root().join("visible.txt"), "abc").unwrap();
 
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let mut res = TestClient::get("http://127.0.0.1:5800/api/list")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::OK));
 
@@ -106,9 +106,9 @@ async fn api_list_lists_subdirectory() {
     std::fs::create_dir_all(dir.root().join("sub")).unwrap();
     std::fs::write(dir.root().join("sub").join("inner.txt"), "xyz").unwrap();
 
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let mut res = TestClient::get("http://127.0.0.1:5800/api/list/sub")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::OK));
 
@@ -124,9 +124,9 @@ async fn api_list_lists_subdirectory() {
 #[tokio::test]
 async fn api_list_returns_404_for_missing_directory() {
     let dir = TestDir::new();
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let res = TestClient::get("http://127.0.0.1:5800/api/list/nope")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
@@ -137,9 +137,9 @@ async fn api_list_returns_404_for_missing_directory() {
 async fn files_endpoint_serves_file() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let mut res = TestClient::get("http://127.0.0.1:5800/files/hello.txt")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::OK));
     assert_eq!(res.take_string().await.unwrap(), "hello world");
@@ -148,9 +148,9 @@ async fn files_endpoint_serves_file() {
 #[tokio::test]
 async fn files_endpoint_returns_404_for_missing_file() {
     let dir = TestDir::new();
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let res = TestClient::get("http://127.0.0.1:5800/files/nope.txt")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
@@ -159,9 +159,9 @@ async fn files_endpoint_returns_404_for_missing_file() {
 async fn files_endpoint_rejects_path_traversal() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("secret.txt"), "top secret").unwrap();
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let res = TestClient::get("http://127.0.0.1:5800/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
@@ -170,9 +170,9 @@ async fn files_endpoint_rejects_path_traversal() {
 async fn files_endpoint_head_request_succeeds() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let res = TestClient::head("http://127.0.0.1:5800/files/hello.txt")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::OK));
 }
@@ -185,7 +185,7 @@ async fn serves_over_real_tcp() {
 
     let dir = TestDir::new();
     std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
     let addr = acceptor.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -213,10 +213,8 @@ async fn serves_over_real_tcp() {
 #[tokio::test]
 async fn root_returns_html_page() {
     let dir = TestDir::new();
-    let router = api_router(dir.root());
-    let mut res = TestClient::get("http://127.0.0.1:5800/")
-        .send(router.clone())
-        .await;
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/").send(router).await;
     assert_eq!(res.status_code, Some(StatusCode::OK));
     let body = res.take_string().await.unwrap();
     assert!(body.contains("<title>文件浏览</title>"));
@@ -227,9 +225,9 @@ async fn root_returns_html_page() {
 #[tokio::test]
 async fn static_serves_css() {
     let dir = TestDir::new();
-    let router = api_router(dir.root());
+    let router = api_router(dir.root().to_path_buf());
     let mut res = TestClient::get("http://127.0.0.1:5800/static/style.css")
-        .send(router.clone())
+        .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::OK));
     let body = res.take_string().await.unwrap();
