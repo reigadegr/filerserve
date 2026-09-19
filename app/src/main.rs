@@ -24,12 +24,18 @@ async fn main() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let is_terminal = std::io::stdout().is_terminal();
+    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_timer(LoggerFormatter)
         .with_ansi(is_terminal)
+        .with_writer(non_blocking)
         .init();
+
+    // guard keeps the non-blocking writer's background thread alive;
+    // bound it so the buffer is flushed on shutdown
+    let _guard = guard;
 
     let (port, dir) = parse_args(std::env::args().skip(1));
     let root = std::fs::canonicalize(&dir).unwrap_or_else(|error| {

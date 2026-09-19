@@ -16,6 +16,7 @@ salvo = { workspace = true, features = ["server", "http1", "http2"] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2"
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = { workspace = true }
 
