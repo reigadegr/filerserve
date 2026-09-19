@@ -81,7 +81,7 @@ async fn api_list_returns_json_for_root() {
 }
 
 #[tokio::test]
-async fn api_list_hides_dot_files() {
+async fn api_list_shows_dot_files() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
     std::fs::write(dir.root().join("visible.txt"), "abc").unwrap();
@@ -95,9 +95,14 @@ async fn api_list_hides_dot_files() {
     let body = res.take_string().await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     let entries = json["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["name"], "visible.txt");
-    assert!(!body.contains(".hidden"));
+    assert_eq!(entries.len(), 2);
+
+    let by_name: std::collections::HashMap<&str, &serde_json::Value> = entries
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap(), e))
+        .collect();
+    assert!(by_name.contains_key(".hidden"));
+    assert!(by_name.contains_key("visible.txt"));
 }
 
 #[tokio::test]

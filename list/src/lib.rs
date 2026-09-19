@@ -116,10 +116,11 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
             continue;
         };
 
-        // 3. 用原始字节检查 dotfile（零分配跳过）
+        // 3. 名字按原始字节读取，后续 statat 与 String 分配复用
         let name_cstr = entry.file_name();
         let name_bytes = name_cstr.to_bytes();
-        if name_bytes.first().is_some_and(|&b| b == b'.') {
+        // RawDir 原样返回 . 与 ..，需显式跳过
+        if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
 
