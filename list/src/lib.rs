@@ -1,5 +1,8 @@
 use std::mem::MaybeUninit;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use salvo::{prelude::*, routing::filters};
 use serde::Serialize;
@@ -7,6 +10,11 @@ use serde::Serialize;
 mod ip;
 
 use ip::detect_lan_ip;
+
+struct LanIpCache {
+    ip: Option<String>,
+    fetched_at: Option<Instant>,
+}
 
 #[derive(Serialize)]
 struct ListEntry {
@@ -20,7 +28,7 @@ struct ListEntry {
 #[derive(Serialize)]
 struct ListResponse {
     path: String,
-    lan_ip: Option<&'static str>,
+    lan_ip: Option<String>,
     port: u16,
     entries: Vec<ListEntry>,
 }
@@ -28,12 +36,37 @@ struct ListResponse {
 pub struct ListApi {
     root: std::path::PathBuf,
     pub port: u16,
+    lan_ip: ArcSwap<LanIpCache>,
 }
 
 impl ListApi {
     #[must_use]
-    pub const fn new(root: std::path::PathBuf, port: u16) -> Self {
-        Self { root, port }
+    pub fn new(root: std::path::PathBuf, port: u16) -> Self {
+        Self {
+            root,
+            port,
+            lan_ip: ArcSwap::new(Arc::new(LanIpCache {
+                ip: None,
+                fetched_at: None,
+            })),
+        }
+    }
+
+    fn get_lan_ip(&self) -> Option<String> {
+        let cache = self.lan_ip.load();
+        if cache
+            .fetched_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return cache.ip.clone();
+        }
+        drop(cache);
+        let new_ip = detect_lan_ip();
+        self.lan_ip.store(Arc::new(LanIpCache {
+            ip: new_ip.clone(),
+            fetched_at: Some(Instant::now()),
+        }));
+        new_ip
     }
 }
 
@@ -137,7 +170,7 @@ impl ListApi {
 
         let response = ListResponse {
             path: display_path,
-            lan_ip: detect_lan_ip(),
+            lan_ip: self.get_lan_ip(),
             port: self.port,
             entries: list_entries,
         };

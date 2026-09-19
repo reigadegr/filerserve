@@ -1,5 +1,4 @@
 use std::net::Ipv4Addr;
-use std::sync::OnceLock;
 
 use if_addrs::{IfAddr, Interface, get_if_addrs};
 
@@ -8,8 +7,6 @@ const VPN_IFACE_PREFIXES: &[&str] = &[
 ];
 
 const LAN_IFACE_PREFIXES: &[&str] = &["wlan", "eth", "en", "usb"];
-
-static LAN_IP: OnceLock<Option<String>> = OnceLock::new();
 
 fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack
@@ -42,11 +39,7 @@ fn lan_ip_candidate(iface: &Interface) -> Option<Ipv4Addr> {
 }
 
 #[must_use]
-pub fn detect_lan_ip() -> Option<&'static str> {
-    LAN_IP.get_or_init(detect_lan_ip_impl).as_deref()
-}
-
-fn detect_lan_ip_impl() -> Option<String> {
+pub fn detect_lan_ip() -> Option<String> {
     let interfaces = get_if_addrs().ok()?;
 
     // Prefer wlan/eth/en/usb, then any remaining non-VPN interface
