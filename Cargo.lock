@@ -458,10 +458,10 @@ dependencies = [
 name = "filerserve-assets"
 version = "0.1.0"
 dependencies = [
- "mime-infer",
  "rust-embed",
  "rustix",
  "salvo",
+ "tokio",
 ]
 
 [[package]]

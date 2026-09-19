@@ -179,6 +179,30 @@ async fn files_endpoint_returns_404_for_directory() {
 }
 
 #[tokio::test]
+async fn files_endpoint_rejects_symlink() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("real.txt"), "real").unwrap();
+    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt")).unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::get("http://127.0.0.1:5800/files/alias.txt")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
+async fn files_endpoint_hides_dot_symlink() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("real.txt"), "real").unwrap();
+    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join(".hidden")).unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::get("http://127.0.0.1:5800/files/.hidden")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
 async fn files_endpoint_rejects_path_traversal() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("secret.txt"), "top secret").unwrap();

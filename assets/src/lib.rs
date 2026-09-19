@@ -25,9 +25,17 @@ impl ServeFiles {
     }
 }
 
-/// 解析请求路径对应的绝对路径，且必须位于 root 之内（防目录穿越）。
-fn resolve_under(root: &Path, sub: &str) -> Option<PathBuf> {
-    let canonical = root.join(sub).canonicalize().ok()?;
+/// 解析请求路径对应的绝对文件路径，且必须位于 root 之内（防目录穿越）。
+///
+/// 与 salvo `StaticDir` 一致：用 `symlink_metadata` 判断类型，符号链接不会被当作
+/// 文件服务，从而避免 canonicalize 跟随符号链接绕过 dotfile 或引入 TOCTOU 窗口。
+async fn resolve_file(root: &Path, sub: &str) -> Option<PathBuf> {
+    let joined = root.join(sub);
+    let metadata = tokio::fs::symlink_metadata(&joined).await.ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let canonical = tokio::fs::canonicalize(&joined).await.ok()?;
     canonical.starts_with(root).then_some(canonical)
 }
 
@@ -35,32 +43,25 @@ fn resolve_under(root: &Path, sub: &str) -> Option<PathBuf> {
 impl ServeFiles {
     #[allow(clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        let path = req.param::<String>("path").unwrap_or_default();
-        let Some(abs_path) = resolve_under(&self.root, &path) else {
-            res.status_code(StatusCode::NOT_FOUND);
-            return;
-        };
-        // 与 StaticDir 默认行为一致：跳过 dotfile，目录不列目录直接 404
-        let is_dot_file = abs_path
+        let sub = req.param::<String>("path").unwrap_or_default();
+
+        // 与 StaticDir 一致：在路径解析前按请求名跳过 dotfile，
+        // 避免 canonicalize 跟随符号链接后改用目标名判定而被绕过。
+        let is_dot_file = Path::new(&sub)
             .file_name()
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.starts_with('.'));
-        if is_dot_file || !abs_path.is_file() {
+        if is_dot_file {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         }
 
-        let requested_name = abs_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        let content_type = mime_infer::from_path(&abs_path).first();
+        let Some(abs_path) = resolve_file(&self.root, &sub).await else {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        };
+
         let mut builder = NamedFile::builder(abs_path);
-        if let Some(content_type) = content_type {
-            builder = builder.content_type(content_type);
-        }
-        if let Some(requested_name) = requested_name {
-            builder = builder.disposition_name(requested_name);
-        }
         if req.method() == Method::HEAD {
             builder = builder.preload_threshold(0);
         }
