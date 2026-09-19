@@ -240,7 +240,7 @@ impl ZipApi {
         let tx = res.channel();
         tokio::spawn(async move {
             let mut writer = ZipFileWriter::with_tokio(tx);
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; 262_144];
             for (abs, name) in entries {
                 let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
                 let Ok(mut ew) = writer.write_entry_stream(entry).await else {
@@ -250,15 +250,10 @@ impl ZipApi {
                     let _ = ew.close().await;
                     continue;
                 };
-                loop {
-                    match f.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if ew.write_all(&buf[..n]).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
+                // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
+                let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
+                if copy_entry(&mut f, &mut ew, &mut buf).await.is_err() {
+                    return;
                 }
                 if ew.close().await.is_err() {
                     return;
@@ -282,4 +277,72 @@ pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
                 .filter(filters::get())
                 .goal(ZipApi::new(root)),
         )
+}
+
+/// 顺序拷贝文件内容到 entry 流；读错视为跳过该文件，写错向上传播中断整个 zip。
+async fn copy_entry(
+    src: &mut (impl tokio::io::AsyncRead + Unpin),
+    dst: &mut (impl futures_lite::io::AsyncWrite + Unpin),
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    loop {
+        match src.read(buf).await {
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(n) => dst.write_all(&buf[..n]).await?,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::{path::Path, time::Instant};
+
+    use super::copy_entry;
+    use tokio::io::AsyncWriteExt;
+
+    const FILE_SIZE: usize = 64 * 1024 * 1024;
+
+    async fn copy_throughput(buf_size: usize, path: &Path) -> f64 {
+        let mut src = tokio::fs::File::open(path).await.unwrap();
+        let mut dst = futures_lite::io::sink();
+        let mut buf = vec![0u8; buf_size];
+        let start = Instant::now();
+        copy_entry(&mut src, &mut dst, &mut buf).await.unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        FILE_SIZE as f64 / (1024.0 * 1024.0) / elapsed
+    }
+
+    #[tokio::test]
+    async fn zip_copy_throughput_by_buffer_size() {
+        let path = std::env::temp_dir().join(format!("filerserve-perf-{}", std::process::id()));
+        let mut f = tokio::fs::File::create(&path).await.unwrap();
+        let chunk = vec![0xABu8; 1024 * 1024];
+        let mut remaining = FILE_SIZE;
+        while remaining > 0 {
+            f.write_all(&chunk).await.unwrap();
+            remaining -= chunk.len();
+        }
+        drop(f);
+
+        let mut total_64k = 0.0;
+        let mut total_256k = 0.0;
+        for _ in 0..3 {
+            total_64k += copy_throughput(64 * 1024, &path).await;
+            total_256k += copy_throughput(256 * 1024, &path).await;
+        }
+        let avg_64k = total_64k / 3.0;
+        let avg_256k = total_256k / 3.0;
+
+        println!("zip 拷贝吞吐 64KB 缓冲: {avg_64k:.1} MB/s");
+        println!("zip 拷贝吞吐 256KB 缓冲: {avg_256k:.1} MB/s");
+
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            avg_256k >= avg_64k * 0.8,
+            "256KB 缓冲吞吐不应显著低于 64KB: {avg_64k:.1} vs {avg_256k:.1} MB/s",
+        );
+    }
 }
