@@ -8,8 +8,11 @@ use arc_swap::ArcSwap;
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
-use salvo::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue};
-use salvo::{prelude::*, routing::filters};
+use salvo::{
+    http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue},
+    prelude::*,
+    routing::filters,
+};
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
@@ -299,8 +302,9 @@ mod tests {
 
     use std::{path::Path, time::Instant};
 
-    use super::copy_entry;
     use tokio::io::AsyncWriteExt;
+
+    use super::copy_entry;
 
     const FILE_SIZE: usize = 64 * 1024 * 1024;
 
