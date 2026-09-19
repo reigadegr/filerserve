@@ -9,3 +9,5 @@ workspace = true
 [dependencies]
 salvo = { workspace = true, features = ["server", "serve-static"] }
 rust-embed = "8.12.0"
+rustix = { version = "1.1.5", features = ["fs"] }
+mime-infer = "4"

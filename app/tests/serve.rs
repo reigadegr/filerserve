@@ -156,6 +156,29 @@ async fn files_endpoint_returns_404_for_missing_file() {
 }
 
 #[tokio::test]
+async fn files_endpoint_hides_dot_files() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::get("http://127.0.0.1:5800/files/.hidden")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
+async fn files_endpoint_returns_404_for_directory() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub/inner.txt"), "xyz").unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::get("http://127.0.0.1:5800/files/sub")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
 async fn files_endpoint_rejects_path_traversal() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("secret.txt"), "top secret").unwrap();

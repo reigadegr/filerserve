@@ -1,15 +1,82 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rust_embed::RustEmbed;
+use rustix::fs::{self as rfs, Advice};
 use salvo::{
+    fs::NamedFile,
+    http::Method,
     prelude::*,
     routing::{Filter, filters},
-    serve_static::{StaticDir, static_embed},
+    serve_static::static_embed,
 };
 
 #[derive(RustEmbed)]
 #[folder = "static/"]
 pub struct Asset;
+
+pub struct ServeFiles {
+    root: PathBuf,
+}
+
+impl ServeFiles {
+    #[must_use]
+    pub const fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+/// 解析请求路径对应的绝对路径，且必须位于 root 之内（防目录穿越）。
+fn resolve_under(root: &Path, sub: &str) -> Option<PathBuf> {
+    let canonical = root.join(sub).canonicalize().ok()?;
+    canonical.starts_with(root).then_some(canonical)
+}
+
+#[handler]
+impl ServeFiles {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        let path = req.param::<String>("path").unwrap_or_default();
+        let Some(abs_path) = resolve_under(&self.root, &path) else {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        };
+        // 与 StaticDir 默认行为一致：跳过 dotfile，目录不列目录直接 404
+        let is_dot_file = abs_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with('.'));
+        if is_dot_file || !abs_path.is_file() {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        }
+
+        let requested_name = abs_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let content_type = mime_infer::from_path(&abs_path).first();
+        let mut builder = NamedFile::builder(abs_path);
+        if let Some(content_type) = content_type {
+            builder = builder.content_type(content_type);
+        }
+        if let Some(requested_name) = requested_name {
+            builder = builder.disposition_name(requested_name);
+        }
+        if req.method() == Method::HEAD {
+            builder = builder.preload_threshold(0);
+        }
+        let Ok(named_file) = builder.build().await else {
+            res.render(StatusError::internal_server_error().brief("read file failed"));
+            return;
+        };
+        // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
+        let _ = rfs::fadvise(named_file.file(), 0, None, Advice::Sequential);
+        if req.method() == Method::HEAD {
+            named_file.send_head(req.headers(), res).await;
+        } else {
+            named_file.send(req.headers(), res).await;
+        }
+    }
+}
 
 #[must_use]
 pub fn static_routes(root: PathBuf) -> Router {
@@ -17,7 +84,7 @@ pub fn static_routes(root: PathBuf) -> Router {
         .push(
             Router::with_path("/files/{**path}")
                 .filter(filters::get().or(filters::head()))
-                .goal(StaticDir::new(root)),
+                .goal(ServeFiles::new(root)),
         )
         .push(
             Router::new()
