@@ -241,12 +241,12 @@ impl ZipApi {
         tokio::spawn(async move {
             let mut writer = ZipFileWriter::with_tokio(tx);
             let mut buf = vec![0u8; 65536];
-            for (abs, name) in &entries {
-                let entry = ZipEntryBuilder::new(name.clone().into(), Compression::Stored);
+            for (abs, name) in entries {
+                let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
                 let Ok(mut ew) = writer.write_entry_stream(entry).await else {
                     return;
                 };
-                let Ok(mut f) = tokio::fs::File::open(abs).await else {
+                let Ok(mut f) = tokio::fs::File::open(&abs).await else {
                     let _ = ew.close().await;
                     continue;
                 };
