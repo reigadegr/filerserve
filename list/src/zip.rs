@@ -60,14 +60,14 @@ pub fn collect_entries(
     Ok(())
 }
 
-/// 收集文件夹根级列表。zip 内路径前缀 = 文件夹自身名。
-pub fn collect_folder(dir: &Path) -> io::Result<Vec<(PathBuf, String)>> {
+/// 收集文件夹根级列表，返回 (zip 内根前缀, (绝对路径, zip 内路径) 列表)。
+pub fn collect_folder(dir: &Path) -> io::Result<(String, Vec<(PathBuf, String)>)> {
     let folder_name = dir
         .file_name()
         .map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned());
     let mut out = Vec::with_capacity(64);
     collect_entries(dir, &folder_name, &mut out)?;
-    Ok(out)
+    Ok((folder_name, out))
 }
 
 /// 生成 RFC 5987 风格的 Content-Disposition 值：filename*=UTF-8''<pct>.zip

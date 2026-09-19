@@ -1,5 +1,6 @@
 use std::{
     mem::MaybeUninit,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -44,14 +45,14 @@ struct ListResponse {
 }
 
 pub struct ListApi {
-    root: std::path::PathBuf,
+    root: PathBuf,
     pub port: u16,
     lan_ip: ArcSwap<LanIpCache>,
 }
 
 impl ListApi {
     #[must_use]
-    pub fn new(root: std::path::PathBuf, port: u16) -> Self {
+    pub fn new(root: PathBuf, port: u16) -> Self {
         Self {
             root,
             port,
@@ -80,28 +81,27 @@ impl ListApi {
     }
 }
 
+/// 解析请求路径对应的绝对目录，且必须位于 root 之内（防目录穿越）。
+fn resolve_under(root: &std::path::Path, sub: &str) -> Option<PathBuf> {
+    let canonical = root.join(sub).canonicalize().ok()?;
+    canonical.starts_with(root).then_some(canonical)
+}
+
 #[handler]
 impl ListApi {
     #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
         let path = req.param::<String>("path").unwrap_or_default();
-        let full = self.root.join(&path);
-
-        let Ok(canonical_target) = full.canonicalize() else {
+        let Some(dir) = resolve_under(&self.root, &path) else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
-
-        if !canonical_target.starts_with(&self.root) {
-            res.status_code(StatusCode::NOT_FOUND);
-            return;
-        }
 
         // 1. openat 打开目录 fd
         //    OFlags::DIRECTORY 隐含 is_dir 检查，省 1 次 stat
         let Ok(dirfd) = fs::openat(
             fs::CWD,
-            &canonical_target,
+            &dir,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         ) else {
@@ -190,12 +190,12 @@ impl ListApi {
 }
 
 pub struct ZipApi {
-    root: std::path::PathBuf,
+    root: PathBuf,
 }
 
 impl ZipApi {
     #[must_use]
-    pub const fn new(root: std::path::PathBuf) -> Self {
+    pub const fn new(root: PathBuf) -> Self {
         Self { root }
     }
 }
@@ -205,34 +205,21 @@ impl ZipApi {
     #[allow(clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
         let path = req.param::<String>("path").unwrap_or_default();
-        let full = self.root.join(&path);
-
-        let Ok(canonical) = full.canonicalize() else {
+        let Some(canonical) = resolve_under(&self.root, &path) else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
-        if !canonical.starts_with(&self.root) {
-            res.status_code(StatusCode::NOT_FOUND);
-            return;
-        }
         if !canonical.is_dir() {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         }
 
-        let Ok(Ok(entries)) =
+        let Ok(Ok((folder_name, entries))) =
             tokio::task::spawn_blocking(move || zip::collect_folder(&canonical)).await
         else {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
             return;
         };
-
-        let folder_name = path
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("root")
-            .to_string();
 
         res.headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));

@@ -53,11 +53,4 @@ pub fn detect_lan_ip() -> Option<String> {
         .find_map(lan_ip_candidate)
         .or_else(|| interfaces.iter().find_map(lan_ip_candidate))
         .map(|ip| ip.to_string())
-        .or_else(|| {
-            // Fallback: UDP socket method (may return VPN address if VPN is active)
-            let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-            socket.connect("8.8.8.8:80").ok()?;
-            let addr = socket.local_addr().ok()?;
-            Some(addr.ip().to_string())
-        })
 }
