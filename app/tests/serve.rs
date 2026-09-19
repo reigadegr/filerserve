@@ -233,3 +233,43 @@ async fn static_serves_css() {
     let body = res.take_string().await.unwrap();
     assert!(body.contains("border-box"));
 }
+
+// ---- Zip download tests ----
+
+#[tokio::test]
+async fn api_zip_streams_folder() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("a.txt"), "hello").unwrap();
+    std::fs::write(dir.root().join("sub/b.txt"), "world").unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/zip")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let body = res.take_string().await.unwrap();
+    assert!(body.starts_with("PK\x03\x04"));
+    assert!(body.contains("a.txt"));
+    assert!(body.contains("sub/b.txt"));
+}
+
+#[tokio::test]
+async fn api_zip_returns_404_for_missing() {
+    let dir = TestDir::new();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::get("http://127.0.0.1:5800/api/zip/nope")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
+async fn api_zip_rejects_path_traversal() {
+    let dir = TestDir::new();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::get("http://127.0.0.1:5800/api/zip/%2e%2e")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}

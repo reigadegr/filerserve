@@ -98,8 +98,11 @@
         }
         linkCell.appendChild(makeCopyBtn('本地', 'http://127.0.0.1:' + port + base));
       } else {
-        linkCell.textContent = '—';
-        linkCell.style.color = '#999';
+        var zbase = '/api/zip/' + fp;
+        if (lanIp) {
+          linkCell.appendChild(makeCopyBtn('zip局域网', 'http://' + lanIp + ':' + port + zbase));
+        }
+        linkCell.appendChild(makeCopyBtn('zip本地', 'http://127.0.0.1:' + port + zbase));
       }
     });
   }

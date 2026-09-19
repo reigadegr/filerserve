@@ -5,11 +5,16 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
+use futures_lite::io::AsyncWriteExt;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
+use salvo::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue};
 use salvo::{prelude::*, routing::filters};
 use serde::Serialize;
+use tokio::io::AsyncReadExt;
 
 mod ip;
+mod zip;
 
 use ip::detect_lan_ip;
 
@@ -181,9 +186,100 @@ impl ListApi {
     }
 }
 
+pub struct ZipApi {
+    root: std::path::PathBuf,
+}
+
+impl ZipApi {
+    #[must_use]
+    pub const fn new(root: std::path::PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[handler]
+impl ZipApi {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        let path = req.param::<String>("path").unwrap_or_default();
+        let full = self.root.join(&path);
+
+        let Ok(canonical) = full.canonicalize() else {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        };
+        if !canonical.starts_with(&self.root) {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        }
+        if !canonical.is_dir() {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        }
+
+        let Ok(Ok(entries)) =
+            tokio::task::spawn_blocking(move || zip::collect_folder(&canonical)).await
+        else {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        };
+
+        let folder_name = path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("root")
+            .to_string();
+
+        res.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+        if let Ok(val) = HeaderValue::from_str(&zip::content_disposition(&folder_name)) {
+            res.headers_mut().insert(CONTENT_DISPOSITION, val);
+        }
+
+        let tx = res.channel();
+        tokio::spawn(async move {
+            let mut writer = ZipFileWriter::with_tokio(tx);
+            let mut buf = vec![0u8; 65536];
+            for (abs, name) in &entries {
+                let entry = ZipEntryBuilder::new(name.clone().into(), Compression::Stored);
+                let Ok(mut ew) = writer.write_entry_stream(entry).await else {
+                    return;
+                };
+                let Ok(mut f) = tokio::fs::File::open(abs).await else {
+                    let _ = ew.close().await;
+                    continue;
+                };
+                loop {
+                    match f.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if ew.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if ew.close().await.is_err() {
+                    return;
+                }
+            }
+            let _ = writer.close().await;
+        });
+    }
+}
+
 #[must_use]
 pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
-    Router::with_path("/api/list/{**path}")
-        .filter(filters::get())
-        .goal(ListApi::new(root, port))
+    Router::new()
+        .push(
+            Router::with_path("/api/list/{**path}")
+                .filter(filters::get())
+                .goal(ListApi::new(root.clone(), port)),
+        )
+        .push(
+            Router::with_path("/api/zip/{**path}")
+                .filter(filters::get())
+                .goal(ZipApi::new(root)),
+        )
 }
