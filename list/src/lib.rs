@@ -126,7 +126,7 @@ impl ListApi {
                 continue;
             }
 
-            // 4. d_type 判断 is_dir（零 syscall，来自 dirent）
+            // 4. d_type 判断类型（零 syscall，来自 dirent）
             let ft = entry.file_type();
 
             // 5. statat 相对 dirfd 获取 size + mtime
@@ -137,11 +137,18 @@ impl ListApi {
             };
 
             // d_type 为 Unknown 时回退到 stat 的 st_mode
-            let is_dir = if ft == FileType::Unknown {
-                FileType::from_raw_mode(stat.st_mode).is_dir()
+            let actual_ft = if ft == FileType::Unknown {
+                FileType::from_raw_mode(stat.st_mode)
             } else {
-                ft.is_dir()
+                ft
             };
+
+            // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目
+            if actual_ft.is_symlink() {
+                continue;
+            }
+
+            let is_dir = actual_ft.is_dir();
 
             // 6. 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
             let name = String::from_utf8_lossy(name_bytes).into_owned();

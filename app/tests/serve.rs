@@ -101,6 +101,26 @@ async fn api_list_hides_dot_files() {
 }
 
 #[tokio::test]
+async fn api_list_hides_symlinks() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("real.txt"), "real").unwrap();
+    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt")).unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/list")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+
+    let body = res.take_string().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "real.txt");
+    assert!(!body.contains("alias.txt"));
+}
+
+#[tokio::test]
 async fn api_list_lists_subdirectory() {
     let dir = TestDir::new();
     std::fs::create_dir_all(dir.root().join("sub")).unwrap();
@@ -156,14 +176,28 @@ async fn files_endpoint_returns_404_for_missing_file() {
 }
 
 #[tokio::test]
-async fn files_endpoint_hides_dot_files() {
+async fn files_endpoint_serves_dot_files() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
     let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::get("http://127.0.0.1:5800/files/.hidden")
+    let mut res = TestClient::get("http://127.0.0.1:5800/files/.hidden")
         .send(router)
         .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    assert_eq!(res.take_string().await.unwrap(), "secret");
+}
+
+#[tokio::test]
+async fn files_endpoint_serves_hidden_dir_member() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join(".git")).unwrap();
+    std::fs::write(dir.root().join(".git/config"), "secret-config").unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/files/.git/config")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    assert_eq!(res.take_string().await.unwrap(), "secret-config");
 }
 
 #[tokio::test]
@@ -185,18 +219,6 @@ async fn files_endpoint_rejects_symlink() {
     std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt")).unwrap();
     let router = api_router(dir.root().to_path_buf());
     let res = TestClient::get("http://127.0.0.1:5800/files/alias.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-#[tokio::test]
-async fn files_endpoint_hides_dot_symlink() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("real.txt"), "real").unwrap();
-    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join(".hidden")).unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::get("http://127.0.0.1:5800/files/.hidden")
         .send(router)
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
