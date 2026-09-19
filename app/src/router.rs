@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use filerserve_assets::static_routes;
 use filerserve_list::list_routes;
-use salvo::http::header::CONTENT_LENGTH;
-use salvo::prelude::*;
+use salvo::{http::header::CONTENT_LENGTH, prelude::*};
 
 #[handler]
 async fn access_log(req: &mut Request, depot: &mut Depot, res: &mut Response, ctrl: &mut FlowCtrl) {

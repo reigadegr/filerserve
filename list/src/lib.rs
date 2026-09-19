@@ -1,6 +1,8 @@
-use std::mem::MaybeUninit;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    mem::MaybeUninit,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arc_swap::ArcSwap;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
