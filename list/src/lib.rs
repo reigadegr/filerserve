@@ -328,15 +328,27 @@ mod tests {
 
         let mut total_64k = 0.0;
         let mut total_256k = 0.0;
-        for _ in 0..3 {
+
+        let mut total_512k = 0.0;
+        let mut total_1024k = 0.0;
+
+        for _ in 0..10 {
             total_64k += copy_throughput(64 * 1024, &path).await;
             total_256k += copy_throughput(256 * 1024, &path).await;
+            total_512k += copy_throughput(512 * 1024, &path).await;
+            total_1024k += copy_throughput(1024 * 1024, &path).await;
         }
-        let avg_64k = total_64k / 3.0;
-        let avg_256k = total_256k / 3.0;
+        let avg_64k = total_64k / 10.0;
+        let avg_256k = total_256k / 10.0;
+
+        let avg_512k = total_512k / 10.0;
+        let avg_1024k = total_1024k / 10.0;
 
         println!("zip 拷贝吞吐 64KB 缓冲: {avg_64k:.1} MB/s");
         println!("zip 拷贝吞吐 256KB 缓冲: {avg_256k:.1} MB/s");
+
+        println!("zip 拷贝吞吐 512KB 缓冲: {avg_512k:.1} MB/s");
+        println!("zip 拷贝吞吐 1024KB 缓冲: {avg_1024k:.1} MB/s");
 
         std::fs::remove_file(&path).unwrap();
 
