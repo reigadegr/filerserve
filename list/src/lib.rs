@@ -1,9 +1,11 @@
 use std::{
     mem::MaybeUninit,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
@@ -13,7 +15,7 @@ use salvo::{
     routing::filters,
 };
 use serde::Serialize;
-use tokio::{io::AsyncReadExt, sync::Mutex};
+use tokio::io::AsyncReadExt;
 
 mod ip;
 mod zip;
@@ -45,7 +47,7 @@ struct ListResponse {
 pub struct ListApi {
     root: PathBuf,
     pub port: u16,
-    lan_ip: Mutex<LanIpCache>,
+    lan_ip: ArcSwap<LanIpCache>,
 }
 
 impl ListApi {
@@ -54,15 +56,15 @@ impl ListApi {
         Self {
             root,
             port,
-            lan_ip: Mutex::new(LanIpCache {
+            lan_ip: ArcSwap::new(Arc::new(LanIpCache {
                 ip: None,
                 fetched_at: None,
-            }),
+            })),
         }
     }
 
     async fn get_lan_ip(&self) -> Option<String> {
-        let mut cache = self.lan_ip.lock().await;
+        let cache = self.lan_ip.load();
         if cache
             .fetched_at
             .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
@@ -74,8 +76,10 @@ impl ListApi {
             .await
             .ok()
             .flatten();
-        cache.ip.clone_from(&new_ip);
-        cache.fetched_at = Some(Instant::now());
+        self.lan_ip.store(Arc::new(LanIpCache {
+            ip: new_ip.clone(),
+            fetched_at: Some(Instant::now()),
+        }));
         new_ip
     }
 }
