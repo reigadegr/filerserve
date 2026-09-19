@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use std::sync::OnceLock;
 
 use if_addrs::{IfAddr, Interface, get_if_addrs};
 
@@ -8,9 +9,19 @@ const VPN_IFACE_PREFIXES: &[&str] = &[
 
 const LAN_IFACE_PREFIXES: &[&str] = &["wlan", "eth", "en", "usb"];
 
+static LAN_IP: OnceLock<Option<String>> = OnceLock::new();
+
+fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .get(..needle.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle))
+}
+
 fn lan_ip_candidate(iface: &Interface) -> Option<Ipv4Addr> {
-    let name = iface.name.to_lowercase();
-    if VPN_IFACE_PREFIXES.iter().any(|p| name.starts_with(p)) {
+    if VPN_IFACE_PREFIXES
+        .iter()
+        .any(|p| starts_with_ignore_ascii_case(&iface.name, p))
+    {
         return None;
     }
     let IfAddr::V4(v4) = &iface.addr else {
@@ -31,15 +42,20 @@ fn lan_ip_candidate(iface: &Interface) -> Option<Ipv4Addr> {
 }
 
 #[must_use]
-pub fn detect_lan_ip() -> Option<String> {
+pub fn detect_lan_ip() -> Option<&'static str> {
+    LAN_IP.get_or_init(detect_lan_ip_impl).as_deref()
+}
+
+fn detect_lan_ip_impl() -> Option<String> {
     let interfaces = get_if_addrs().ok()?;
 
     // Prefer wlan/eth/en/usb, then any remaining non-VPN interface
     interfaces
         .iter()
         .filter(|iface| {
-            let name = iface.name.to_lowercase();
-            LAN_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
+            LAN_IFACE_PREFIXES
+                .iter()
+                .any(|p| starts_with_ignore_ascii_case(&iface.name, p))
         })
         .find_map(lan_ip_candidate)
         .or_else(|| interfaces.iter().find_map(lan_ip_candidate))

@@ -20,7 +20,7 @@ struct ListEntry {
 #[derive(Serialize)]
 struct ListResponse {
     path: String,
-    lan_ip: Option<String>,
+    lan_ip: Option<&'static str>,
     port: u16,
     entries: Vec<ListEntry>,
 }
@@ -123,10 +123,10 @@ impl ListApi {
             });
         }
 
-        list_entries.sort_by(|a, b| match (a.entry_type, b.entry_type) {
-            ("dir", "file") => std::cmp::Ordering::Less,
-            ("file", "dir") => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
+        list_entries.sort_unstable_by(|a, b| {
+            let a_dir = a.entry_type == "dir";
+            let b_dir = b.entry_type == "dir";
+            b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
         });
 
         let display_path = if path.is_empty() {
