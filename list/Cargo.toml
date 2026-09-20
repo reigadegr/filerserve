@@ -17,7 +17,7 @@ async_zip = { version = "0.0.19", default-features = false, features = [
   "tokio",
 ] }
 futures-lite = { version = "2.6", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["rt", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt", "sync", "fs", "io-util"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }

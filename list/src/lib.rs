@@ -232,15 +232,15 @@ impl ZipApi {
         let path = req.param::<String>("path").unwrap_or_default();
         let root = self.root.clone();
 
-        // 解析、类型判断与递归收集都是阻塞的 fs 操作，整体放进阻塞线程池
-        let collected = tokio::task::spawn_blocking(move || {
+        // 解析路径 + 类型判断是阻塞 fs 操作，放进阻塞线程池
+        let resolved = tokio::task::spawn_blocking(move || {
             let canonical = resolve_under(&root, &path)?;
-            canonical.is_dir().then(|| zip::collect_folder(&canonical))
+            canonical.is_dir().then_some(canonical)
         })
         .await;
 
-        let (folder_name, entries) = match collected {
-            Ok(Some(inner)) => inner,
+        let canonical = match resolved {
+            Ok(Some(canonical)) => canonical,
             Ok(None) => {
                 res.status_code(StatusCode::NOT_FOUND);
                 return;
@@ -251,17 +251,28 @@ impl ZipApi {
             }
         };
 
+        let folder_name = zip::folder_name(&canonical);
         res.headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
         if let Ok(val) = HeaderValue::from_str(&zip::content_disposition(&folder_name)) {
             res.headers_mut().insert(CONTENT_DISPOSITION, val);
         }
 
+        // 边遍历边流式打包，不先把整棵树攒进内存：
+        // - 阻塞遍历在 spawn_blocking 里，通过有界 channel 逐条发 Entry（有界 = 内存封顶）
+        // - 异步写 zip 在 tokio 里，逐条收 Entry 写入
+        let (entry_tx, mut entry_rx) = tokio::sync::mpsc::channel::<zip::Entry>(64);
+        tokio::task::spawn_blocking(move || {
+            zip::walk(&canonical, &folder_name, &mut |entry| {
+                entry_tx.blocking_send(entry).is_ok()
+            });
+        });
+
         let tx = res.channel();
         tokio::spawn(async move {
             let mut writer = ZipFileWriter::with_tokio(tx);
             let mut buf = vec![0u8; 262_144];
-            for entry in entries {
+            while let Some(entry) = entry_rx.recv().await {
                 match entry {
                     zip::Entry::Dir { name } => {
                         // 目录条目：名字以 / 结尾、置 S_IFDIR 权限位，解压后保留空目录结构

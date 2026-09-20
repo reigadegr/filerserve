@@ -12,23 +12,37 @@ pub enum Entry {
     Dir { name: String },
 }
 
-/// 递归收集目录树为 zip 条目列表。
+/// 取目录名作为 zip 内根前缀（也用于 Content-Disposition 文件名）。
+pub fn folder_name(dir: &Path) -> String {
+    dir.file_name()
+        .map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned())
+}
+
+/// 深度优先遍历目录树，把每个条目交给 `on_entry`；`on_entry` 返回 `false` 时提前停止。
 /// `RawDir` 零分配遍历 + `d_type` 免 stat；与 /api/list 一致包含 dotfile、跳过符号链接。
+/// 每个目录的条目按名称排序，保证 zip 内顺序确定。
 /// 目录不可读（无权限等）时跳过该目录，不中断整个打包。
-fn collect_entries(dir: &Path, prefix: &str, out: &mut Vec<Entry>) {
+pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) {
+    let _ = walk_inner(dir, prefix, on_entry);
+}
+
+/// 递归实现，返回 `false` 表示应停止遍历。
+fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
     let Ok(dirfd) = rfs::openat(
         rfs::CWD,
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     ) else {
-        return;
+        return true;
     };
 
     // 记录目录自身，空目录解压后也能保留，保证目录结构原样
-    out.push(Entry::Dir {
+    if !on_entry(Entry::Dir {
         name: format!("{prefix}/"),
-    });
+    }) {
+        return false;
+    }
 
     let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
     let mut raw_dir = RawDir::new(&dirfd, &mut buf);
@@ -60,26 +74,22 @@ fn collect_entries(dir: &Path, prefix: &str, out: &mut Vec<Entry>) {
             ft
         };
 
-        if actual_ft.is_dir() {
-            collect_entries(&path, &zip_name, out);
+        let keep_going = if actual_ft.is_dir() {
+            walk_inner(&path, &zip_name, on_entry)
         } else if actual_ft.is_file() {
-            out.push(Entry::File {
+            on_entry(Entry::File {
                 abs: path,
                 name: zip_name,
-            });
+            })
+        } else {
+            // 符号链接等其它类型：跳过
+            true
+        };
+        if !keep_going {
+            return false;
         }
-        // 符号链接等其它类型：跳过
     }
-}
-
-/// 收集文件夹根级列表，返回 (zip 内根前缀, 条目列表)。
-pub fn collect_folder(dir: &Path) -> (String, Vec<Entry>) {
-    let folder_name = dir
-        .file_name()
-        .map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned());
-    let mut out = Vec::with_capacity(64);
-    collect_entries(dir, &folder_name, &mut out);
-    (folder_name, out)
+    true
 }
 
 /// 生成 RFC 5987 风格的 Content-Disposition 值：filename*=UTF-8''<pct>.zip
@@ -95,4 +105,75 @@ pub fn content_disposition(folder_name: &str) -> String {
     }
     out.push_str(".zip");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("filerserve-zip-{tag}-{}", std::process::id()))
+    }
+
+    /// 建一棵小目录树 root/{a, b, dir/{c, d, e}}，共 7 个条目（2 目录 + 5 文件）。
+    fn make_tree(root: &Path) {
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(root.join(name), "x").unwrap();
+        }
+        for name in ["c", "d", "e"] {
+            std::fs::write(root.join("dir").join(name), "x").unwrap();
+        }
+    }
+
+    #[test]
+    fn walk_emits_all_entries_with_structure() {
+        let root = tmp_root("full");
+        let _ = std::fs::remove_dir_all(&root);
+        make_tree(&root);
+
+        let mut out = Vec::new();
+        walk(&root, "root", &mut |e| {
+            out.push(e);
+            true
+        });
+
+        assert_eq!(out.len(), 7);
+        // 目录结构原样：根目录与子目录条目都以 / 结尾，文件 zip 内路径带前缀
+        assert!(matches!(&out[0], Entry::Dir { name } if name == "root/"));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, Entry::Dir { name } if name == "root/dir/"))
+        );
+        for e in &out {
+            match e {
+                Entry::Dir { name } => assert!(name.ends_with('/'), "目录条目应以 / 结尾: {name}"),
+                Entry::File { abs, name } => {
+                    assert!(name.starts_with("root/"), "文件 zip 路径应带前缀: {name}");
+                    assert!(abs.exists(), "文件应存在于磁盘: {abs:?}");
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn walk_stops_when_callback_returns_false() {
+        let root = tmp_root("stop");
+        let _ = std::fs::remove_dir_all(&root);
+        make_tree(&root);
+
+        let mut count = 0;
+        walk(&root, "root", &mut |_e| {
+            count += 1;
+            count < 4
+        });
+
+        assert_eq!(count, 4);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
