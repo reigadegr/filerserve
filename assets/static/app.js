@@ -105,6 +105,12 @@
         linkCell.appendChild(makeCopyBtn('本地', 'http://127.0.0.1:' + port + base));
       } else {
         var zbase = '/api/zip/' + fp;
+        var dl = document.createElement('a');
+        dl.className = 'dl-link';
+        dl.href = zbase;
+        dl.download = entry.name + '.zip';
+        dl.textContent = '下载';
+        linkCell.appendChild(dl);
         if (lanIp) {
           linkCell.appendChild(makeCopyBtn('zip局域网', 'http://' + lanIp + ':' + port + zbase));
         }

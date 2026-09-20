@@ -1,21 +1,34 @@
 use std::{
     fmt::Write as _,
-    io,
     mem::MaybeUninit,
     path::{Path, PathBuf},
 };
 
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
-/// 递归收集 (绝对路径, zip 内相对路径)。
-/// `RawDir` 零分配遍历 + `d_type` 免 stat；跳过 dotfile，与 /api/list 行为一致。
-fn collect_entries(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String)>) -> io::Result<()> {
-    let dirfd = rfs::openat(
+/// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
+pub enum Entry {
+    File { abs: PathBuf, name: String },
+    Dir { name: String },
+}
+
+/// 递归收集目录树为 zip 条目列表。
+/// `RawDir` 零分配遍历 + `d_type` 免 stat；与 /api/list 一致包含 dotfile、跳过符号链接。
+/// 目录不可读（无权限等）时跳过该目录，不中断整个打包。
+fn collect_entries(dir: &Path, prefix: &str, out: &mut Vec<Entry>) {
+    let Ok(dirfd) = rfs::openat(
         rfs::CWD,
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
+    ) else {
+        return;
+    };
+
+    // 记录目录自身，空目录解压后也能保留，保证目录结构原样
+    out.push(Entry::Dir {
+        name: format!("{prefix}/"),
+    });
 
     let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
     let mut raw_dir = RawDir::new(&dirfd, &mut buf);
@@ -26,7 +39,8 @@ fn collect_entries(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String)>) -
             continue;
         };
         let name_bytes = entry.file_name().to_bytes();
-        if name_bytes.first().is_some_and(|&b| b == b'.') {
+        // 只跳过 . 与 ..，点开头的文件/目录一并打包
+        if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
         let name = String::from_utf8_lossy(name_bytes).into_owned();
@@ -47,23 +61,25 @@ fn collect_entries(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String)>) -
         };
 
         if actual_ft.is_dir() {
-            collect_entries(&path, &zip_name, out)?;
+            collect_entries(&path, &zip_name, out);
         } else if actual_ft.is_file() {
-            out.push((path, zip_name));
+            out.push(Entry::File {
+                abs: path,
+                name: zip_name,
+            });
         }
+        // 符号链接等其它类型：跳过
     }
-
-    Ok(())
 }
 
-/// 收集文件夹根级列表，返回 (zip 内根前缀, (绝对路径, zip 内路径) 列表)。
-pub fn collect_folder(dir: &Path) -> io::Result<(String, Vec<(PathBuf, String)>)> {
+/// 收集文件夹根级列表，返回 (zip 内根前缀, 条目列表)。
+pub fn collect_folder(dir: &Path) -> (String, Vec<Entry>) {
     let folder_name = dir
         .file_name()
         .map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned());
     let mut out = Vec::with_capacity(64);
-    collect_entries(dir, &folder_name, &mut out)?;
-    Ok((folder_name, out))
+    collect_entries(dir, &folder_name, &mut out);
+    (folder_name, out)
 }
 
 /// 生成 RFC 5987 风格的 Content-Disposition 值：filename*=UTF-8''<pct>.zip

@@ -347,3 +347,62 @@ async fn api_zip_rejects_path_traversal() {
         .await;
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
+
+#[tokio::test]
+async fn api_zip_includes_dot_files_and_dirs() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
+    std::fs::create_dir_all(dir.root().join(".git")).unwrap();
+    std::fs::write(dir.root().join(".git/config"), "cfg").unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/zip")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let body = res.take_string().await.unwrap();
+    assert!(body.contains(".hidden"), "body: {body}");
+    assert!(body.contains(".git/config"), "body: {body}");
+}
+
+#[tokio::test]
+async fn api_zip_preserves_empty_directory() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("empty")).unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/zip")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let body = res.take_string().await.unwrap();
+    assert!(body.contains("empty/"), "body: {body}");
+}
+
+#[tokio::test]
+async fn api_zip_skips_unreadable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("locked")).unwrap();
+    std::fs::write(dir.root().join("locked/secret.txt"), "secret").unwrap();
+    std::fs::set_permissions(
+        dir.root().join("locked"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/zip")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let _ = res.take_string().await;
+
+    // 恢复权限，避免 TestDir 清理失败
+    std::fs::set_permissions(
+        dir.root().join("locked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+}

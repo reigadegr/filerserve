@@ -240,12 +240,12 @@ impl ZipApi {
         .await;
 
         let (folder_name, entries) = match collected {
-            Ok(Some(Ok(inner))) => inner,
+            Ok(Some(inner)) => inner,
             Ok(None) => {
                 res.status_code(StatusCode::NOT_FOUND);
                 return;
             }
-            Ok(Some(Err(_))) | Err(_) => {
+            Err(_) => {
                 res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
                 return;
             }
@@ -261,22 +261,34 @@ impl ZipApi {
         tokio::spawn(async move {
             let mut writer = ZipFileWriter::with_tokio(tx);
             let mut buf = vec![0u8; 262_144];
-            for (abs, name) in entries {
-                let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
-                let Ok(mut ew) = writer.write_entry_stream(entry).await else {
-                    return;
-                };
-                let Ok(mut f) = tokio::fs::File::open(&abs).await else {
-                    let _ = ew.close().await;
-                    continue;
-                };
-                // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
-                let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
-                if copy_entry(&mut f, &mut ew, &mut buf).await.is_err() {
-                    return;
-                }
-                if ew.close().await.is_err() {
-                    return;
+            for entry in entries {
+                match entry {
+                    zip::Entry::Dir { name } => {
+                        // 目录条目：名字以 / 结尾、置 S_IFDIR 权限位，解压后保留空目录结构
+                        let dir = ZipEntryBuilder::new(name.into(), Compression::Stored)
+                            .unix_permissions(0o40755);
+                        if writer.write_entry_whole(dir, &[]).await.is_err() {
+                            return;
+                        }
+                    }
+                    zip::Entry::File { abs, name } => {
+                        let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
+                        let Ok(mut ew) = writer.write_entry_stream(entry).await else {
+                            return;
+                        };
+                        let Ok(mut f) = tokio::fs::File::open(&abs).await else {
+                            let _ = ew.close().await;
+                            continue;
+                        };
+                        // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
+                        let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
+                        if copy_entry(&mut f, &mut ew, &mut buf).await.is_err() {
+                            return;
+                        }
+                        if ew.close().await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
             let _ = writer.close().await;
