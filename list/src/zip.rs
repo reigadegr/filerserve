@@ -1,9 +1,12 @@
 use std::{
     fmt::Write as _,
-    mem::MaybeUninit,
     path::{Path, PathBuf},
 };
 
+#[cfg(not(windows))]
+use std::mem::MaybeUninit;
+
+#[cfg(not(windows))]
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
@@ -26,6 +29,7 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
     walk_inner(dir, prefix, on_entry);
 }
 
+#[cfg(not(windows))]
 /// 递归实现，返回 `false` 表示应停止遍历。
 fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
     let Ok(dirfd) = rfs::openat(
@@ -77,6 +81,53 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
         let keep_going = if actual_ft.is_dir() {
             walk_inner(&path, &zip_name, on_entry)
         } else if actual_ft.is_file() {
+            on_entry(Entry::File {
+                abs: path,
+                name: zip_name,
+            })
+        } else {
+            // 符号链接等其它类型：跳过
+            true
+        };
+        if !keep_going {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+/// Windows 下的递归遍历：`rustix::fs` 没有 Windows 实现，改用 `std::fs`，行为与 Unix 版本一致。
+fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
+    if !on_entry(Entry::Dir {
+        name: format!("{prefix}/"),
+    }) {
+        return false;
+    }
+
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return true;
+    };
+
+    let mut entries: Vec<(PathBuf, String)> = Vec::new();
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        entries.push((entry.path(), name));
+    }
+    entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+
+    for (path, name) in entries {
+        let zip_name = format!("{prefix}/{name}");
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let ft = metadata.file_type();
+        let keep_going = if ft.is_dir() {
+            walk_inner(&path, &zip_name, on_entry)
+        } else if ft.is_file() {
             on_entry(Entry::File {
                 abs: path,
                 name: zip_name,

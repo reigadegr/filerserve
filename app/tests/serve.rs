@@ -105,6 +105,7 @@ async fn api_list_shows_dot_files() {
     assert!(by_name.contains_key("visible.txt"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn api_list_hides_symlinks() {
     let dir = TestDir::new();
@@ -217,6 +218,7 @@ async fn files_endpoint_returns_404_for_directory() {
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn files_endpoint_rejects_symlink() {
     let dir = TestDir::new();
@@ -379,6 +381,7 @@ async fn api_zip_preserves_empty_directory() {
     assert!(body.contains("empty/"), "body: {body}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn api_zip_skips_unreadable_directory() {
     use std::os::unix::fs::PermissionsExt;

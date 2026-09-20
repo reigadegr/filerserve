@@ -1,13 +1,16 @@
 use std::{
-    mem::MaybeUninit,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+#[cfg(not(windows))]
+use std::mem::MaybeUninit;
+
 use arc_swap::ArcSwap;
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
+#[cfg(not(windows))]
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use salvo::{
     http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue},
@@ -90,6 +93,7 @@ fn resolve_under(root: &std::path::Path, sub: &str) -> Option<PathBuf> {
     canonical.starts_with(root).then_some(canonical)
 }
 
+#[cfg(not(windows))]
 /// 枚举目录并返回排序后的条目；路径非法或非目录返回 `None`。
 /// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`，避免拖慢异步 worker。
 fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
@@ -166,6 +170,57 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
         list_entries.push(ListEntry {
             name,
             entry_type,
+            size,
+            modified,
+        });
+    }
+
+    list_entries.sort_unstable_by(|a, b| {
+        let a_dir = a.entry_type == "dir";
+        let b_dir = b.entry_type == "dir";
+        b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
+    });
+
+    Some(list_entries)
+}
+
+#[cfg(windows)]
+/// Windows 下的目录枚举：`rustix::fs` 没有 Windows 实现，改用 `std::fs`，行为与 Unix 版本一致。
+fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
+    let dir = resolve_under(root, path)?;
+
+    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+        return None;
+    };
+
+    let mut list_entries: Vec<ListEntry> = Vec::with_capacity(64);
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let entry_path = entry.path();
+        // symlink_metadata 不跟随符号链接，与 Unix 版本 SYMLINK_NOFOLLOW 语义一致
+        let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        let ft = metadata.file_type();
+        // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目
+        if ft.is_symlink() {
+            continue;
+        }
+        let is_dir = ft.is_dir();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let size = if is_dir { None } else { Some(metadata.len()) };
+        let modified = metadata
+            .modified()
+            .ok()
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default();
+
+        list_entries.push(ListEntry {
+            name,
+            entry_type: if is_dir { "dir" } else { "file" },
             size,
             modified,
         });
@@ -292,6 +347,7 @@ impl ZipApi {
                             continue;
                         };
                         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
+                        #[cfg(not(windows))]
                         let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
                         if copy_entry(&mut f, &mut ew, &mut buf).await.is_err() {
                             return;
