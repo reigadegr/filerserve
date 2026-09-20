@@ -23,7 +23,7 @@ pub fn folder_name(dir: &Path) -> String {
 /// 每个目录的条目按名称排序，保证 zip 内顺序确定。
 /// 目录不可读（无权限等）时跳过该目录，不中断整个打包。
 pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) {
-    let _ = walk_inner(dir, prefix, on_entry);
+    walk_inner(dir, prefix, on_entry);
 }
 
 /// 递归实现，返回 `false` 表示应停止遍历。
