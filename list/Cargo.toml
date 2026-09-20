@@ -11,13 +11,15 @@ salvo = { workspace = true, features = ["server"] }
 chrono = { workspace = true }
 serde = { version = "1.0.229", features = ["derive"] }
 if-addrs = "0.15"
-rustix = { version = "1.1.5", features = ["fs"] }
 arc-swap = "1.9"
 async_zip = { version = "0.0.19", default-features = false, features = [
   "tokio",
 ] }
 futures-lite = { version = "2.6", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "sync", "fs", "io-util"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }

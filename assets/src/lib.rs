@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use rust_embed::RustEmbed;
-#[cfg(not(windows))]
+#[cfg(unix)]
 use rustix::fs::{self as rfs, Advice};
 use salvo::{
     fs::NamedFile,
@@ -67,7 +67,7 @@ impl ServeFiles {
             return;
         };
         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         let _ = rfs::fadvise(named_file.file(), 0, None, Advice::Sequential);
         if req.method() == Method::HEAD {
             named_file.send_head(req.headers(), res).await;

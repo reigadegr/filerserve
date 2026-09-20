@@ -4,13 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 use std::mem::MaybeUninit;
 
 use arc_swap::ArcSwap;
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
-#[cfg(not(windows))]
+#[cfg(unix)]
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use salvo::{
     http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue},
@@ -93,7 +93,16 @@ fn resolve_under(root: &std::path::Path, sub: &str) -> Option<PathBuf> {
     canonical.starts_with(root).then_some(canonical)
 }
 
-#[cfg(not(windows))]
+/// 目录条目排序：目录在前，同类按名称升序。
+fn sort_list_entries(entries: &mut [ListEntry]) {
+    entries.sort_unstable_by(|a, b| {
+        let a_dir = a.entry_type == "dir";
+        let b_dir = b.entry_type == "dir";
+        b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+#[cfg(unix)]
 /// 枚举目录并返回排序后的条目；路径非法或非目录返回 `None`。
 /// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`，避免拖慢异步 worker。
 fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
@@ -175,16 +184,12 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
         });
     }
 
-    list_entries.sort_unstable_by(|a, b| {
-        let a_dir = a.entry_type == "dir";
-        let b_dir = b.entry_type == "dir";
-        b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
-    });
+    sort_list_entries(&mut list_entries);
 
     Some(list_entries)
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 /// Windows 下的目录枚举：`rustix::fs` 没有 Windows 实现，改用 `std::fs`，行为与 Unix 版本一致。
 fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
     let dir = resolve_under(root, path)?;
@@ -226,11 +231,7 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
         });
     }
 
-    list_entries.sort_unstable_by(|a, b| {
-        let a_dir = a.entry_type == "dir";
-        let b_dir = b.entry_type == "dir";
-        b_dir.cmp(&a_dir).then_with(|| a.name.cmp(&b.name))
-    });
+    sort_list_entries(&mut list_entries);
 
     Some(list_entries)
 }
@@ -347,7 +348,7 @@ impl ZipApi {
                             continue;
                         };
                         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
-                        #[cfg(not(windows))]
+                        #[cfg(unix)]
                         let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
                         if copy_entry(&mut f, &mut ew, &mut buf).await.is_err() {
                             return;

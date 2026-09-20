@@ -3,10 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 use std::mem::MaybeUninit;
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
@@ -29,7 +29,12 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
     walk_inner(dir, prefix, on_entry);
 }
 
-#[cfg(not(windows))]
+/// 按名称排序目录条目，保证 zip 内顺序确定；两个平台的实现共用。
+fn sort_by_name<T>(entries: &mut [(T, String)]) {
+    entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+}
+
+#[cfg(unix)]
 /// 递归实现，返回 `false` 表示应停止遍历。
 fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
     let Ok(dirfd) = rfs::openat(
@@ -65,7 +70,7 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
         entries.push((entry.file_type(), name));
     }
 
-    entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    sort_by_name(&mut entries);
 
     for (ft, name) in entries {
         let path = dir.join(&name);
@@ -96,18 +101,19 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
     true
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 /// Windows 下的递归遍历：`rustix::fs` 没有 Windows 实现，改用 `std::fs`，行为与 Unix 版本一致。
 fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
+    // 目录不可读时不产出目录条目，与 Unix 版本 openat 失败时的行为保持一致
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return true;
+    };
+
     if !on_entry(Entry::Dir {
         name: format!("{prefix}/"),
     }) {
         return false;
     }
-
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return true;
-    };
 
     let mut entries: Vec<(PathBuf, String)> = Vec::new();
     for entry in read_dir {
@@ -117,7 +123,7 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
         let name = entry.file_name().to_string_lossy().into_owned();
         entries.push((entry.path(), name));
     }
-    entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    sort_by_name(&mut entries);
 
     for (path, name) in entries {
         let zip_name = format!("{prefix}/{name}");
