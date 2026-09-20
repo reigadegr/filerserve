@@ -57,10 +57,13 @@
     var lanIp = data.lan_ip;
     var prefix = encodedPath;
 
-    entries.forEach(function (entry) {
-      var row = fileList.insertRow();
+    var frag = document.createDocumentFragment();
 
-      var nameCell = row.insertCell();
+    entries.forEach(function (entry) {
+      var row = document.createElement('tr');
+
+      var nameCell = document.createElement('td');
+      row.appendChild(nameCell);
       nameCell.className = 'name-cell ' + entry.type;
       var icon = document.createElement('span');
       icon.className = entry.type === 'dir' ? 'dir-icon' : 'file-icon';
@@ -80,15 +83,18 @@
         nameCell.appendChild(link);
       }
 
-      var sizeCell = row.insertCell();
+      var sizeCell = document.createElement('td');
+      row.appendChild(sizeCell);
       sizeCell.className = 'size-col';
       sizeCell.textContent = entry.size != null ? humanSize(entry.size) : '—';
 
-      var modCell = row.insertCell();
+      var modCell = document.createElement('td');
+      row.appendChild(modCell);
       modCell.className = 'modified-col';
       modCell.textContent = entry.modified ? entry.modified.replace('T', ' ') : '—';
 
-      var linkCell = row.insertCell();
+      var linkCell = document.createElement('td');
+      row.appendChild(linkCell);
       linkCell.className = 'link-group';
 
       if (entry.type === 'file') {
@@ -104,7 +110,11 @@
         }
         linkCell.appendChild(makeCopyBtn('zip本地', 'http://127.0.0.1:' + port + zbase));
       }
+
+      frag.appendChild(row);
     });
+
+    fileList.appendChild(frag);
   }
 
   function renderBreadcrumb(decodedPath, encodedPath) {

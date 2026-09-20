@@ -44,15 +44,15 @@ struct ListResponse {
     entries: Vec<ListEntry>,
 }
 
-pub struct ListApi {
+struct ListApi {
     root: PathBuf,
-    pub port: u16,
+    port: u16,
     lan_ip: ArcSwap<LanIpCache>,
 }
 
 impl ListApi {
     #[must_use]
-    pub fn new(root: PathBuf, port: u16) -> Self {
+    fn new(root: PathBuf, port: u16) -> Self {
         Self {
             root,
             port,
@@ -214,13 +214,13 @@ impl ListApi {
     }
 }
 
-pub struct ZipApi {
+struct ZipApi {
     root: PathBuf,
 }
 
 impl ZipApi {
     #[must_use]
-    pub const fn new(root: PathBuf) -> Self {
+    const fn new(root: PathBuf) -> Self {
         Self { root }
     }
 }

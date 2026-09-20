@@ -14,13 +14,13 @@ use salvo::{
 #[folder = "static/"]
 pub struct Asset;
 
-pub struct ServeFiles {
+struct ServeFiles {
     root: PathBuf,
 }
 
 impl ServeFiles {
     #[must_use]
-    pub const fn new(root: PathBuf) -> Self {
+    const fn new(root: PathBuf) -> Self {
         Self { root }
     }
 }
@@ -29,13 +29,14 @@ impl ServeFiles {
 ///
 /// 用 `symlink_metadata` 判断类型，符号链接不会被当作文件服务，
 /// 避免 canonicalize 跟随符号链接逃逸 root 或引入 TOCTOU 窗口。
-async fn resolve_file(root: &Path, sub: &str) -> Option<PathBuf> {
+/// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`。
+fn resolve_file(root: &Path, sub: &str) -> Option<PathBuf> {
     let joined = root.join(sub);
-    let metadata = tokio::fs::symlink_metadata(&joined).await.ok()?;
+    let metadata = std::fs::symlink_metadata(&joined).ok()?;
     if !metadata.is_file() {
         return None;
     }
-    let canonical = tokio::fs::canonicalize(&joined).await.ok()?;
+    let canonical = std::fs::canonicalize(&joined).ok()?;
     canonical.starts_with(root).then_some(canonical)
 }
 
@@ -45,7 +46,13 @@ impl ServeFiles {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
         let sub = req.param::<String>("path").unwrap_or_default();
 
-        let Some(abs_path) = resolve_file(&self.root, &sub).await else {
+        // 路径解析是阻塞的 fs 操作，整体放进阻塞线程池，避免拖慢异步 worker
+        let root = self.root.clone();
+        let Some(abs_path) = tokio::task::spawn_blocking(move || resolve_file(&root, &sub))
+            .await
+            .ok()
+            .flatten()
+        else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };

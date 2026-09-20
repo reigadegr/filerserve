@@ -9,11 +9,7 @@ use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
 /// 递归收集 (绝对路径, zip 内相对路径)。
 /// `RawDir` 零分配遍历 + `d_type` 免 stat；跳过 dotfile，与 /api/list 行为一致。
-pub fn collect_entries(
-    dir: &Path,
-    prefix: &str,
-    out: &mut Vec<(PathBuf, String)>,
-) -> io::Result<()> {
+fn collect_entries(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String)>) -> io::Result<()> {
     let dirfd = rfs::openat(
         rfs::CWD,
         dir,
