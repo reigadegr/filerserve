@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use filerserve::build_router;
+use lanfile::build_router;
 use salvo::{
     prelude::*,
     test::{ResponseExt, TestClient},
@@ -21,7 +21,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "filerserve-test-{}-{}",
+            "lanfile-test-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed),
         ));

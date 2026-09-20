@@ -171,7 +171,7 @@ mod tests {
     use super::*;
 
     fn tmp_root(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("filerserve-zip-{tag}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("lanfile-zip-{tag}-{}", std::process::id()))
     }
 
     /// 建一棵小目录树 root/{a, b, dir/{c, d, e}}，共 7 个条目（2 目录 + 5 文件）。

@@ -1,5 +1,5 @@
 [package]
-name = "filerserve"
+name = "lanfile"
 version.workspace = true
 edition.workspace = true
 
@@ -10,8 +10,8 @@ path = "src/router.rs"
 workspace = true
 
 [dependencies]
-filerserve-assets = { path = "../assets" }
-filerserve-list = { path = "../list" }
+lanfile-assets = { path = "../assets" }
+lanfile-list = { path = "../list" }
 salvo = { workspace = true, features = ["server", "http1"] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
 tracing = "0.1.44"

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use filerserve_assets::static_routes;
-use filerserve_list::list_routes;
+use lanfile_assets::static_routes;
+use lanfile_list::list_routes;
 use salvo::{http::header::CONTENT_LENGTH, prelude::*};
 
 #[handler]

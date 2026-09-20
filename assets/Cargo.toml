@@ -1,5 +1,5 @@
 [package]
-name = "filerserve-assets"
+name = "lanfile-assets"
 version.workspace = true
 edition.workspace = true
 

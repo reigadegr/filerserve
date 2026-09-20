@@ -417,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn zip_copy_throughput_by_buffer_size() {
-        let path = std::env::temp_dir().join(format!("filerserve-perf-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("lanfile-perf-{}", std::process::id()));
         let mut f = tokio::fs::File::create(&path).await.unwrap();
         let chunk = vec![0xABu8; 1024 * 1024];
         let mut remaining = FILE_SIZE;
