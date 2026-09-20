@@ -4,13 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::mem::MaybeUninit;
 
 use arc_swap::ArcSwap;
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use salvo::{
     http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue},
@@ -102,7 +102,7 @@ fn sort_list_entries(entries: &mut [ListEntry]) {
     });
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 /// 枚举目录并返回排序后的条目；路径非法或非目录返回 `None`。
 /// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`，避免拖慢异步 worker。
 fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
@@ -189,8 +189,8 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
     Some(list_entries)
 }
 
-#[cfg(not(unix))]
-/// Windows 下的目录枚举：`rustix::fs` 没有 Windows 实现，改用 `std::fs`，行为与 Unix 版本一致。
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// 非 Linux/Android（Windows、macOS 等）下的目录枚举：`rustix::fs` 的 Linux 专用接口不可用，改用 `std::fs`，行为与 Linux 版本一致。
 fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
     let dir = resolve_under(root, path)?;
 
@@ -348,7 +348,7 @@ impl ZipApi {
                             continue;
                         };
                         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
-                        #[cfg(unix)]
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
                         let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
                         if copy_entry(&mut f, &mut ew, &mut buf).await.is_err() {
                             return;

@@ -3,10 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::mem::MaybeUninit;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
@@ -34,7 +34,7 @@ fn sort_by_name<T>(entries: &mut [(T, String)]) {
     entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 /// 递归实现，返回 `false` 表示应停止遍历。
 fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
     let Ok(dirfd) = rfs::openat(
@@ -101,10 +101,10 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
     true
 }
 
-#[cfg(not(unix))]
-/// Windows 下的递归遍历：`rustix::fs` 没有 Windows 实现，改用 `std::fs`，行为与 Unix 版本一致。
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// 非 Linux/Android（Windows、macOS 等）下的递归遍历：`rustix::fs` 的 Linux 专用接口不可用，改用 `std::fs`，行为与 Linux 版本一致。
 fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
-    // 目录不可读时不产出目录条目，与 Unix 版本 openat 失败时的行为保持一致
+    // 目录不可读时不产出目录条目，与 Linux 版本 openat 失败时的行为保持一致
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return true;
     };

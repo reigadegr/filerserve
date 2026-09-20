@@ -2,7 +2,6 @@
 
 export RUSTFLAGS="
     --cfg tokio_unstable
-    -C relro-level=full
     -C code-model=small
     -C linker-plugin-lto=no
     -C relocation-model=pic
