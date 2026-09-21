@@ -2,6 +2,7 @@ use std::{fmt, io::IsTerminal, path::PathBuf};
 
 use chrono::Local;
 use lanfile::build_router;
+use lanfile_sendfile::SendfileListener;
 use salvo::prelude::{Listener, Server, TcpListener};
 use tracing_subscriber::{
     EnvFilter,
@@ -47,7 +48,7 @@ async fn main() {
     tracing::info!("serving {} on http://{addr}", root.display());
     let router = build_router(root, port);
 
-    let acceptor = TcpListener::new(addr).bind().await;
+    let acceptor = SendfileListener::new(TcpListener::new(addr)).bind().await;
     Server::new(acceptor).serve(router).await;
 }
 

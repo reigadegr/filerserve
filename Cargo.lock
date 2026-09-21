@@ -879,6 +879,7 @@ dependencies = [
  "chrono",
  "lanfile-assets",
  "lanfile-list",
+ "lanfile-sendfile",
  "mimalloc",
  "salvo",
  "serde_json",
@@ -892,6 +893,7 @@ dependencies = [
 name = "lanfile-assets"
 version = "0.1.0"
 dependencies = [
+ "lanfile-sendfile",
  "rust-embed",
  "rustix",
  "salvo",
@@ -910,6 +912,16 @@ dependencies = [
  "rustix",
  "salvo",
  "serde",
+ "tokio",
+]
+
+[[package]]
+name = "lanfile-sendfile"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rustix",
+ "salvo",
  "tokio",
 ]
 

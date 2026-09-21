@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use lanfile_sendfile::{duplicate_file, upgrade_response};
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, Advice};
@@ -71,8 +72,16 @@ impl ServeFiles {
         let _ = rfs::fadvise(named_file.file(), 0, None, Advice::Sequential);
         if req.method() == Method::HEAD {
             named_file.send_head(req.headers(), res).await;
-        } else {
-            named_file.send(req.headers(), res).await;
+            return;
+        }
+
+        // 大文件走 sendfile 零拷贝；`send` 会消费原文件，先复制一份描述符备用
+        let sendfile_file = duplicate_file(named_file.file());
+        named_file.send(req.headers(), res).await;
+
+        // 命中条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体
+        if let Some(file) = sendfile_file {
+            upgrade_response(req, res, file);
         }
     }
 }

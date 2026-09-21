@@ -9,6 +9,7 @@ use std::{
 };
 
 use lanfile::build_router;
+use lanfile_sendfile::SendfileListener;
 use salvo::{
     prelude::*,
     test::{ResponseExt, TestClient},
@@ -282,6 +283,143 @@ async fn serves_over_real_tcp() {
     assert!(text.contains("hello world"));
 
     server.abort();
+}
+
+// ---- sendfile tests ----
+
+/// 3 MiB of non-zero, non-repeating bytes.
+///
+/// A placeholder leak would surface as zeros, and a mis-ordered or duplicated
+/// range would surface as a byte mismatch, so an exact comparison proves the
+/// response really came from `sendfile(2)`.
+fn sendfile_payload() -> Vec<u8> {
+    (0..3 * 1024 * 1024_u32)
+        .map(|index| (index % 251) as u8 + 1)
+        .collect()
+}
+
+async fn serve_with_sendfile(root: PathBuf) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let router = api_router(root);
+    let acceptor = SendfileListener::new(TcpListener::new("127.0.0.1:0"))
+        .bind()
+        .await;
+    let addr = acceptor.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        Server::new(acceptor).serve(router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    (addr, server)
+}
+
+/// Reads one response, using `Content-Length` to find the end of the body.
+async fn read_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let read = stream.read(&mut byte).await.unwrap();
+        assert_ne!(read, 0, "connection closed while reading the head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_string();
+    let len = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; len];
+    stream.read_exact(&mut body).await.unwrap();
+    (head, body)
+}
+
+#[tokio::test]
+async fn large_file_is_served_byte_for_byte_over_sendfile() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = TestDir::new();
+    let payload = sendfile_payload();
+    std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /files/big.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, body) = read_response(&mut stream).await;
+    server.abort();
+
+    assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("content-length: {}", payload.len())),
+        "head: {head}"
+    );
+    assert_eq!(body, payload, "body must be the exact file contents");
+}
+
+#[tokio::test]
+async fn range_request_over_sendfile_returns_the_exact_slice() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = TestDir::new();
+    let payload = sendfile_payload();
+    std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    // The slice must exceed `SENDFILE_THRESHOLD`, or it would be served the
+    // ordinary way and this test would prove nothing about ranges.
+    let (start, end) = (500_000_usize, 2_600_000_usize);
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /files/big.bin HTTP/1.1\r\nHost: localhost\r\nRange: bytes={start}-{}\r\nConnection: close\r\n\r\n",
+                end - 1
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (head, body) = read_response(&mut stream).await;
+    server.abort();
+
+    assert!(head.starts_with("HTTP/1.1 206"), "head: {head}");
+    assert_eq!(body, payload[start..end].to_vec());
+}
+
+#[tokio::test]
+async fn sendfile_response_keeps_the_connection_reusable() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = TestDir::new();
+    let payload = sendfile_payload();
+    std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /files/big.bin HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, body) = read_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+    assert_eq!(body, payload);
+
+    // The stream must be back to pass-through for the next response on the same
+    // connection, or the JSON below would be swallowed as file content.
+    stream
+        .write_all(b"GET /api/list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, body) = read_response(&mut stream).await;
+    server.abort();
+
+    assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["path"], "/");
 }
 
 // ---- Frontend page tests ----
