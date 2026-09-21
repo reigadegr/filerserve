@@ -937,6 +937,7 @@ name = "lanfile-sendfile"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "memchr",
  "rustix",
  "salvo",
  "tokio",

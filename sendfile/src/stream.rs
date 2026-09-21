@@ -191,28 +191,21 @@ fn write_zero() -> io::Error {
 /// Index in `buf` of the last byte of the first head terminator ending there.
 ///
 /// `carry` holds up to three trailing bytes from earlier calls, so a terminator
-/// split across writes is still found.
+/// split across writes is still found. A terminator that starts in `carry` ends
+/// within the first `HEAD_END.len() - 1` bytes of `buf`, so only that little window
+/// has to be joined; the rest of the head is one vectorized scan over `buf`.
 fn find_head_end(carry: &[u8], buf: &[u8]) -> Option<usize> {
     let carried = carry.len();
-    let total = carried + buf.len();
-    if total < HEAD_END.len() {
-        return None;
-    }
-    for start in 0..=(total - HEAD_END.len()) {
-        let matched = HEAD_END.iter().enumerate().all(|(offset, expected)| {
-            let index = start + offset;
-            let byte = if index < carried {
-                carry[index]
-            } else {
-                buf[index - carried]
-            };
-            byte == *expected
-        });
-        if matched {
+    if carried > 0 {
+        let mut joined = [0_u8; 2 * HEAD_END.len() - 2];
+        let take = buf.len().min(HEAD_END.len() - 1);
+        joined[..carried].copy_from_slice(carry);
+        joined[carried..carried + take].copy_from_slice(&buf[..take]);
+        if let Some(start) = memchr::memmem::find(&joined[..carried + take], HEAD_END) {
             return Some(start + HEAD_END.len() - 1 - carried);
         }
     }
-    None
+    memchr::memmem::find(buf, HEAD_END).map(|start| start + HEAD_END.len() - 1)
 }
 
 /// The last up-to-three bytes of `carry` followed by `buf`.
