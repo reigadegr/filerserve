@@ -25,9 +25,17 @@ const HEAD_END: &[u8; 4] = b"\r\n\r\n";
 pub trait SendfileTarget: AsyncWrite + Unpin {
     /// Transfers up to `count` bytes of `file` starting at `offset`.
     ///
-    /// Returns `Err(WouldBlock)` only after arranging for the current task to be
-    /// woken once the transport becomes writable again.
+    /// `Err(WouldBlock)` means the transport is momentarily full. It does **not**
+    /// arrange a wakeup — the bytes move through a bare `sendfile(2)` syscall, so
+    /// nothing in the `Poll` machinery is touched — which is why the caller has to
+    /// call [`SendfileTarget::poll_writable`] before parking the task.
     fn try_sendfile(&self, file: &File, offset: u64, count: usize) -> io::Result<usize>;
+
+    /// Registers the current task to be woken once the transport is writable.
+    ///
+    /// `Poll::Ready(Ok(()))` means writability is already available again, so the
+    /// caller should retry its syscall instead of parking.
+    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -38,12 +46,20 @@ impl SendfileTarget for tokio::net::TcpStream {
             rustix::fs::sendfile(self, file, Some(&mut offset), count).map_err(io::Error::from)
         })
     }
+
+    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_write_ready(cx)
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl SendfileTarget for tokio::net::TcpStream {
     fn try_sendfile(&self, _file: &File, _offset: u64, _count: usize) -> io::Result<usize> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    fn poll_writable(&self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::from(io::ErrorKind::Unsupported)))
     }
 }
 
@@ -262,28 +278,37 @@ impl<S: SendfileTarget> SendfileStream<S> {
     }
 
     /// Replaces `buf` with file content of the same length.
-    fn write_placeholders(&mut self, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn write_placeholders(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let len = buf.len();
-        let done = {
-            let Self { inner, plan, .. } = self;
-            let Some(plan) = plan.as_mut() else {
-                return Poll::Ready(Err(io::Error::other("sendfile plan disappeared")));
+        loop {
+            let done = {
+                let Self { inner, plan, .. } = self;
+                let Some(plan) = plan.as_mut() else {
+                    return Poll::Ready(Err(io::Error::other("sendfile plan disappeared")));
+                };
+                if len as u64 > plan.remaining {
+                    return Poll::Ready(Err(io::Error::other(
+                        "sendfile body exceeds its content length",
+                    )));
+                }
+                match transfer(inner, plan, len) {
+                    Ok(done) => done,
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
             };
-            if len as u64 > plan.remaining {
-                return Poll::Ready(Err(io::Error::other(
-                    "sendfile body exceeds its content length",
-                )));
+            if done > 0 {
+                self.retire();
+                return Poll::Ready(Ok(done));
             }
-            match transfer(inner, plan, len) {
-                Ok(done) => done,
-                Err(error) => return Poll::Ready(Err(error)),
+            // `sendfile(2)` is a bare syscall, so a full socket leaves no waker
+            // behind. Parking here without registering one would strand the
+            // response until some unrelated event happened to wake the task.
+            match self.inner.poll_writable(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
             }
-        };
-        if done == 0 {
-            return Poll::Pending;
         }
-        self.retire();
-        Poll::Ready(Ok(done))
     }
 }
 
@@ -314,7 +339,7 @@ impl<S: SendfileTarget> AsyncWrite for SendfileStream<S> {
         }
 
         if matches!(this.state, State::Sending) {
-            this.write_placeholders(buf)
+            this.write_placeholders(cx, buf)
         } else {
             this.write_head(cx, buf)
         }
@@ -419,6 +444,10 @@ mod transport_tests {
         /// Stall the next write once, to force the stream to hold head bytes.
         stall_once: Rc<Cell<bool>>,
         sendfile_calls: Rc<Cell<usize>>,
+        /// Make every `sendfile` report a full socket, as a slow peer would.
+        block_sendfile: Rc<Cell<bool>>,
+        /// How often the stream asked to be woken once the socket drains.
+        writable_polls: Rc<Cell<usize>>,
     }
 
     struct FakeTarget(Record);
@@ -449,10 +478,23 @@ mod transport_tests {
     impl SendfileTarget for FakeTarget {
         fn try_sendfile(&self, file: &File, offset: u64, count: usize) -> io::Result<usize> {
             self.0.sendfile_calls.set(self.0.sendfile_calls.get() + 1);
+            if self.0.block_sendfile.get() {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
             let mut buf = vec![0_u8; count.min(64 * 1024)];
             let read = file.read_at(&mut buf, offset)?;
             self.0.out.borrow_mut().extend_from_slice(&buf[..read]);
             Ok(read)
+        }
+
+        fn poll_writable(&self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.writable_polls.set(self.0.writable_polls.get() + 1);
+            if self.0.block_sendfile.get() {
+                // A socket that stays full: the caller must park here.
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
     }
 
@@ -525,6 +567,27 @@ mod transport_tests {
         assert_eq!(
             &out[HEAD.len()..],
             &payload[OFFSET as usize..(OFFSET + LEN) as usize]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_sendfile_registers_a_wakeup() {
+        let (record, mut stream, _) = armed_stream("blocked.bin");
+        // A peer that stops reading fills the socket, so every `sendfile` fails.
+        record.block_sendfile.set(true);
+
+        let stalled = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            write_response(&mut stream),
+        )
+        .await;
+        assert!(
+            stalled.is_err(),
+            "a write must not finish while the socket stays full"
+        );
+        assert!(
+            record.writable_polls.get() > 0,
+            "a blocked sendfile parked the task without registering a wakeup"
         );
     }
 }
