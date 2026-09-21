@@ -59,11 +59,13 @@ impl ServeFiles {
             return;
         };
 
-        let mut builder = NamedFile::builder(abs_path);
-        if req.method() == Method::HEAD {
-            builder = builder.preload_threshold(0);
-        }
-        let Ok(named_file) = builder.build().await else {
+        // 关闭 NamedFile 的小文件预读：预读会把内容读进用户态，而 sendfile 直接从页缓存发，
+        // 那次读纯属浪费；关掉后所有响应体都交给 sendfile，HEAD 本来也不需要预读
+        let Ok(named_file) = NamedFile::builder(abs_path)
+            .preload_threshold(0)
+            .build()
+            .await
+        else {
             res.render(StatusError::internal_server_error().brief("read file failed"));
             return;
         };
@@ -75,7 +77,7 @@ impl ServeFiles {
             return;
         }
 
-        // 大文件走 sendfile 零拷贝；`send` 会消费原文件，先复制一份描述符备用
+        // `send` 会消费原文件，先复制一份描述符供 sendfile 使用
         let sendfile_file = duplicate_file(named_file.file());
         named_file.send(req.headers(), res).await;
 

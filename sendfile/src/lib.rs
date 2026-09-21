@@ -5,7 +5,7 @@
 //!
 //! 1. [`SendfileListener`] wraps each accepted connection's transport in a
 //!    [`SendfileStream`].
-//! 2. [`upgrade_response`] replaces the body of a large file response with a
+//! 2. [`upgrade_response`] replaces the body of a file response with a
 //!    [`SendfileBody`], which reports the file's exact length but yields
 //!    placeholder bytes instead of content.
 //! 3. The stream recognises those placeholders and issues `sendfile(2)` for the
@@ -49,12 +49,6 @@ pub use conn::{SendfileAcceptor, SendfileListener};
 pub use registry::{ConnKey, conn_key, slot_for};
 pub use stream::{SendfileStream, SendfileTarget};
 
-/// Responses no larger than this are not served with `sendfile(2)`.
-///
-/// Below this size the syscall overhead outweighs the copy it saves, and Salvo's
-/// `NamedFile` already serves the file from memory.
-pub const SENDFILE_THRESHOLD: u64 = 1024 * 1024;
-
 /// Duplicates an open file so a later [`upgrade_response`] can serve it.
 ///
 /// [`upgrade_response`] must be called after the response has been built, by
@@ -78,16 +72,21 @@ pub fn duplicate_file(file: &tokio::fs::File) -> Option<File> {
     }
 }
 
-/// Replaces a large streamed file response with a zero-copy `sendfile(2)` body.
+/// Replaces a file response body with a zero-copy `sendfile(2)` body.
 ///
 /// Call this after the response headers and body have been produced, passing the
 /// file that was opened for the same response. The response is left untouched
 /// unless every condition holds:
 ///
 /// - the status is `200 OK` or `206 Partial Content`;
-/// - `Content-Length` exceeds [`SENDFILE_THRESHOLD`];
+/// - `Content-Length` is present and non-zero;
 /// - the request arrived on a [`SendfileListener`] connection;
 /// - the platform has `sendfile(2)`.
+///
+/// There is deliberately no size threshold: even for a few kilobytes `sendfile`
+/// removes the read into userspace that an ordinary body needs, and the caller
+/// is expected to have disabled `NamedFile`'s small-file preload so that read is
+/// not paid before this is reached.
 ///
 /// The returned value reports whether the body was replaced.
 pub fn upgrade_response(req: &Request, res: &mut Response, file: File) -> bool {
@@ -98,9 +97,6 @@ pub fn upgrade_response(req: &Request, res: &mut Response, file: File) -> bool {
     let Some(len) = header_u64(res, CONTENT_LENGTH) else {
         return false;
     };
-    if len <= SENDFILE_THRESHOLD {
-        return false;
-    }
     let Some(slot) = slot_for(req.local_addr(), req.remote_addr()) else {
         return false;
     };

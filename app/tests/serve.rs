@@ -298,6 +298,28 @@ fn sendfile_payload() -> Vec<u8> {
         .collect()
 }
 
+/// A few hundred non-zero bytes, for the same reason as [`sendfile_payload`].
+fn small_payload() -> Vec<u8> {
+    (0..700_u32).map(|index| (index % 251) as u8 + 1).collect()
+}
+
+/// Downloads `name` over a real connection and returns the head and body.
+async fn download(addr: std::net::SocketAddr, name: &str, extra: &str) -> (String, Vec<u8>) {
+    use tokio::io::AsyncWriteExt;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /files/{name} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    read_response(&mut stream).await
+}
+
 async fn serve_with_sendfile(root: PathBuf) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let router = api_router(root);
     let acceptor = SendfileListener::new(TcpListener::new("127.0.0.1:0"))
@@ -336,19 +358,12 @@ async fn read_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) 
 
 #[tokio::test]
 async fn large_file_is_served_byte_for_byte_over_sendfile() {
-    use tokio::io::AsyncWriteExt;
-
     let dir = TestDir::new();
     let payload = sendfile_payload();
     std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
     let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(b"GET /files/big.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let (head, body) = read_response(&mut stream).await;
+    let (head, body) = download(addr, "big.bin", "").await;
     server.abort();
 
     assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
@@ -361,29 +376,35 @@ async fn large_file_is_served_byte_for_byte_over_sendfile() {
 }
 
 #[tokio::test]
-async fn range_request_over_sendfile_returns_the_exact_slice() {
-    use tokio::io::AsyncWriteExt;
+async fn small_file_is_served_byte_for_byte_over_sendfile() {
+    let dir = TestDir::new();
+    let payload = small_payload();
+    std::fs::write(dir.root().join("small.bin"), &payload).unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
+    let (head, body) = download(addr, "small.bin", "").await;
+    server.abort();
+
+    assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+    // The body is a placeholder unless the transport really sent the file, so
+    // an exact match also proves small files take the `sendfile` path.
+    assert_eq!(body, payload, "small files must also be served by sendfile");
+}
+
+#[tokio::test]
+async fn range_request_over_sendfile_returns_the_exact_slice() {
     let dir = TestDir::new();
     let payload = sendfile_payload();
     std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
     let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
-    // The slice must exceed `SENDFILE_THRESHOLD`, or it would be served the
-    // ordinary way and this test would prove nothing about ranges.
     let (start, end) = (500_000_usize, 2_600_000_usize);
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(
-            format!(
-                "GET /files/big.bin HTTP/1.1\r\nHost: localhost\r\nRange: bytes={start}-{}\r\nConnection: close\r\n\r\n",
-                end - 1
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let (head, body) = read_response(&mut stream).await;
+    let (head, body) = download(
+        addr,
+        "big.bin",
+        &format!("Range: bytes={start}-{}\r\n", end - 1),
+    )
+    .await;
     server.abort();
 
     assert!(head.starts_with("HTTP/1.1 206"), "head: {head}");
