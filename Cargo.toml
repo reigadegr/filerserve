@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "assets", "list", "sendfile"]
+members = ["app", "assets", "list", "namedfile", "sendfile"]
 resolver = "3"
 
 [workspace.package]

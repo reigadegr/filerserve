@@ -60,7 +60,7 @@ pub use stream::{SendfileStream, SendfileTarget};
 /// Returns `None` on platforms without `sendfile(2)`, or when the handle cannot
 /// be duplicated; the caller then keeps the ordinary response body.
 #[must_use]
-pub fn duplicate_file(file: &tokio::fs::File) -> Option<File> {
+pub fn duplicate_file(file: &std::fs::File) -> Option<File> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         rustix::io::dup(file).ok().map(File::from)

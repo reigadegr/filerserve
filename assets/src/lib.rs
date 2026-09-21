@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use lanfile_namedfile::NamedFile;
 use lanfile_sendfile::{duplicate_file, upgrade_response};
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, Advice};
 use salvo::{
-    fs::NamedFile,
     http::Method,
     prelude::*,
     routing::{Filter, filters},

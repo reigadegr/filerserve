@@ -893,6 +893,7 @@ dependencies = [
 name = "lanfile-assets"
 version = "0.1.0"
 dependencies = [
+ "lanfile-namedfile",
  "lanfile-sendfile",
  "rust-embed",
  "rustix",
@@ -913,6 +914,22 @@ dependencies = [
  "salvo",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "lanfile-namedfile"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "enumflags2",
+ "futures-util",
+ "mime",
+ "mime-infer",
+ "percent-encoding",
+ "salvo",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
