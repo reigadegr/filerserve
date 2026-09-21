@@ -36,6 +36,20 @@ pub trait SendfileTarget: AsyncWrite + Unpin {
     /// `Poll::Ready(Ok(()))` means writability is already available again, so the
     /// caller should retry its syscall instead of parking.
     fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+
+    /// Writes response-head bytes that the body follows immediately.
+    ///
+    /// The default writes them straight through. A transport that can hold them
+    /// back until the body arrives overrides this so the head and the body leave
+    /// as one segment instead of two; that halves the packet count of a small
+    /// response, which is where a loopback benchmark spends most of its time.
+    fn poll_write_more(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.get_mut()).poll_write(cx, buf)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -49,6 +63,36 @@ impl SendfileTarget for tokio::net::TcpStream {
 
     fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_write_ready(cx)
+    }
+
+    /// Writes the head with `MSG_MORE` so the `sendfile(2)` that follows lands in
+    /// the same segment.
+    ///
+    /// Without it the head leaves as its own segment and the body as a second one:
+    /// a 600B download costs four segments per request instead of two, which is
+    /// most of the gap to a server that buffers head and body together.
+    fn poll_write_more(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let stream: &Self = self.get_mut();
+        loop {
+            let sent = stream.try_io(tokio::io::Interest::WRITABLE, || {
+                rustix::net::send(stream, buf, rustix::net::SendFlags::MORE)
+                    .map_err(io::Error::from)
+            });
+            match sent {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    match stream.poll_write_ready(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                sent => return Poll::Ready(sent),
+            }
+        }
     }
 }
 
@@ -228,7 +272,7 @@ impl<S: SendfileTarget> SendfileStream<S> {
         let mut written = 0;
         let mut blocked = false;
         while written < head_len {
-            match Pin::new(&mut self.inner).poll_write(cx, &buf[written..head_len]) {
+            match Pin::new(&mut self.inner).poll_write_more(cx, &buf[written..head_len]) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(write_zero())),
                 Poll::Ready(Ok(count)) => written += count,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -441,6 +485,9 @@ mod transport_tests {
     #[derive(Clone, Default)]
     struct Record {
         out: Rc<RefCell<Vec<u8>>>,
+        /// Bytes the stream handed over as a response head, which the transport is
+        /// allowed to hold back until the body follows.
+        head: Rc<RefCell<Vec<u8>>>,
         /// Stall the next write once, to force the stream to hold head bytes.
         stall_once: Rc<Cell<bool>>,
         sendfile_calls: Rc<Cell<usize>>,
@@ -496,6 +543,20 @@ mod transport_tests {
                 Poll::Ready(Ok(()))
             }
         }
+
+        fn poll_write_more(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.0.stall_once.replace(false) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.0.out.borrow_mut().extend_from_slice(buf);
+            self.0.head.borrow_mut().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
     }
 
     const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 150000\r\n\r\n";
@@ -548,6 +609,18 @@ mod transport_tests {
             &payload[OFFSET as usize..(OFFSET + LEN) as usize]
         );
         assert!(record.sendfile_calls.get() > 0, "no sendfile was issued");
+    }
+
+    #[tokio::test]
+    async fn the_head_is_handed_over_with_more_so_it_shares_a_segment_with_the_body() {
+        let (record, mut stream, _) = armed_stream("coalesced.bin");
+        write_response(&mut stream).await;
+
+        assert_eq!(
+            record.head.borrow().as_slice(),
+            HEAD,
+            "the response head was not written as a head that the body may join"
+        );
     }
 
     #[tokio::test]

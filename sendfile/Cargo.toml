@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["fs", "io-util", "net", "rt"] }
 bytes = "1"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { version = "1.1.5", features = ["fs", "std"] }
+rustix = { version = "1.1.5", features = ["fs", "net", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
