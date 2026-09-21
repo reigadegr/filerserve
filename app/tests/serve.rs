@@ -391,6 +391,52 @@ async fn small_file_is_served_byte_for_byte_over_sendfile() {
     assert_eq!(body, payload, "small files must also be served by sendfile");
 }
 
+/// A run of small responses must not pay a per-response stall.
+///
+/// 一串小响应不能每个都卡一下。
+///
+/// The transport writes the head and the body as two separate writes, and when
+/// the body is smaller than the MSS Nagle holds the second write back until the
+/// peer's delayed ACK fires (about 40ms on Linux); the measured median for a
+/// small response went from 0.2ms to 43ms. A fresh connection stays in Linux's
+/// quick-ACK mode and hides the stall, so this reuses one keep-alive connection
+/// to let the delayed ACK take effect.
+///
+/// 传输层把响应头与 body 分两次写出，当 body 小于 MSS 时 Nagle 会压住第二次写，
+/// 直到对端 delayed ACK 超时（Linux 上约 40ms）；实测小响应中位数从 0.2ms 变成
+/// 43ms。新连接仍处于 Linux 的 quick-ACK 模式，会掩盖这个停顿，所以这里复用同一条
+/// keep-alive 连接，让 delayed ACK 生效。
+#[tokio::test]
+async fn small_response_body_is_not_held_by_nagle() {
+    use tokio::io::AsyncWriteExt;
+
+    let payload = small_payload();
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("small.bin"), &payload).unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request =
+        b"GET /files/small.bin HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+
+    // 10 healthy responses take about 2ms; a stall per response takes about 430ms.
+    let started = std::time::Instant::now();
+    for _ in 0..10 {
+        stream.write_all(request).await.unwrap();
+        let (head, body) = read_response(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+        assert_eq!(body, payload);
+    }
+    let elapsed = started.elapsed();
+
+    server.abort();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "10 keep-alive responses took {elapsed:?}: Nagle is holding every small body until the delayed ACK fires"
+    );
+}
+
 #[tokio::test]
 async fn range_request_over_sendfile_returns_the_exact_slice() {
     let dir = TestDir::new();

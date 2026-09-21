@@ -119,6 +119,11 @@ impl Acceptor for SendfileAcceptor {
             let Some((conn, _)) = self.pending.take() else {
                 continue;
             };
+            // HTTP/1.1 把一个响应写成「响应头」+「body」两次写。body 小于 MSS 时
+            // Nagle 会压住第二次写，直到对端的 delayed ACK 超时（Linux 约 40ms），
+            // 于是静态资源、JSON、小文件这类小响应每个都平白多出 40ms；实测小响应
+            // 中位数从 0.2ms 变成 43ms。Go 的 net 包默认就打开 TCP_NODELAY，这里对齐。
+            conn.set_nodelay(true)?;
             let key = registry::conn_key(&local_addr, &remote_addr);
             let stream = SendfileStream::new(conn, Arc::new(SendfileSlot::new()), key);
             return Ok(Accepted {
