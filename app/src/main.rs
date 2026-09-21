@@ -1,4 +1,9 @@
-use std::{fmt, io::IsTerminal, path::PathBuf};
+use std::{
+    cell::RefCell,
+    fmt::{self, Write as _},
+    io::IsTerminal,
+    path::PathBuf,
+};
 
 use chrono::Local;
 use lanfile::build_router;
@@ -12,11 +17,30 @@ use tracing_subscriber::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+thread_local! {
+    /// The last second formatted and the text for it.
+    ///
+    /// Every log line carries a timestamp and the access log writes one line per
+    /// request, so `chrono`'s `strftime` ends up costing more than the rest of the
+    /// line put together; what it returns only changes once a second.
+    static STAMP: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) };
+}
+
 struct LoggerFormatter;
 
 impl FormatTime for LoggerFormatter {
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
-        write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
+        let now = Local::now();
+        let second = now.timestamp();
+        STAMP.with(|stamp| {
+            let mut stamp = stamp.borrow_mut();
+            if stamp.0 != second {
+                stamp.0 = second;
+                stamp.1.clear();
+                write!(stamp.1, "{}", now.format("%Y-%m-%d %H:%M:%S"))?;
+            }
+            w.write_str(&stamp.1)
+        })
     }
 }
 
