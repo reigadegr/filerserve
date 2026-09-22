@@ -362,6 +362,11 @@ mod tests {
     fn openat2_handles_ordinary_paths() -> std::io::Result<()> {
         let fixture = Fixture::new("fast")?;
         let files = ServeFiles::new(fixture.root.clone());
+        // seccomp 环境里 openat2 不在白名单，硬调会被 SIGSYS 杀掉：这时快路径本就不会走，
+        // 直接跳过这些断言，回退路径的正确性由 open_keeps_previous_behaviour 覆盖
+        if !files.openat2_allowed {
+            return Ok(());
+        }
         let Some(fd) = files.root_fd.as_ref() else {
             panic!("root 目录 fd 应当打开成功");
         };
