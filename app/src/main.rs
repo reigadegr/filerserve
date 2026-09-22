@@ -3,6 +3,7 @@ use std::{
     fmt::{self, Write as _},
     io::IsTerminal,
     path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chrono::Local;
@@ -22,7 +23,9 @@ thread_local! {
     ///
     /// Every log line carries a timestamp and the access log writes one line per
     /// request, so `chrono`'s `strftime` ends up costing more than the rest of the
-    /// line put together; what it returns only changes once a second.
+    /// line put together; what it returns only changes once a second. Reading the
+    /// second straight off `SystemTime` also avoids the timezone conversion that
+    /// `Local::now` does on every call.
     static STAMP: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) };
 }
 
@@ -30,14 +33,17 @@ struct LoggerFormatter;
 
 impl FormatTime for LoggerFormatter {
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
-        let now = Local::now();
-        let second = now.timestamp();
+        let second = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(i64::MIN, |since_epoch| {
+                i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX)
+            });
         STAMP.with(|stamp| {
             let mut stamp = stamp.borrow_mut();
             if stamp.0 != second {
                 stamp.0 = second;
                 stamp.1.clear();
-                write!(stamp.1, "{}", now.format("%Y-%m-%d %H:%M:%S"))?;
+                write!(stamp.1, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))?;
             }
             w.write_str(&stamp.1)
         })
