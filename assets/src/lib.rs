@@ -17,6 +17,12 @@ use salvo::{
     serve_static::static_embed,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod file_cache;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use file_cache::FileCache;
+
 #[derive(RustEmbed)]
 #[folder = "static/"]
 pub struct Asset;
@@ -29,6 +35,9 @@ struct ServeFiles {
     /// 是否允许调用 `openat2`：装了 seccomp filter 的环境里它不在白名单，调用即被 SIGSYS 杀死
     #[cfg(any(target_os = "linux", target_os = "android"))]
     openat2_allowed: bool,
+    /// 已打开文件的缓存：命中时省掉 openat、4 次 readlink 与 fadvise
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    cache: FileCache,
 }
 
 impl ServeFiles {
@@ -45,31 +54,54 @@ impl ServeFiles {
             .map(Arc::new),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             openat2_allowed: !seccomp_filter_installed(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            cache: FileCache::default(),
             root,
         }
     }
 
     /// 打开请求路径对应的文件，且必须位于 root 之内（防目录穿越）。
     ///
-    /// 先用 `symlink_metadata` 判断类型，符号链接不会被当作文件服务；
-    /// 再让内核用一次 `openat2(RESOLVE_BENEATH)` 同时完成路径解析、越界检查与打开，
-    /// 省掉 `canonicalize` 对每一层路径各一次的 `readlink`。装了 seccomp filter 的环境
-    /// （Android）根本不调用 `openat2`（调用会被 SIGSYS 杀掉进程，见
-    /// [`seccomp_filter_installed`]），旧内核上它会返回错误，两种情况都回退到
-    /// canonicalize，因此对外行为与改动前一致。
+    /// 先用 `symlink_metadata` 判断类型，符号链接不会被当作文件服务；这一步同时用来校验
+    /// 缓存是否还有效。未命中时才真正去解析路径：让内核用一次 `openat2(RESOLVE_BENEATH)`
+    /// 同时完成路径解析、越界检查与打开，省掉 `canonicalize` 对每一层路径各一次的
+    /// `readlink`。装了 seccomp filter 的环境（Android）根本不调用 `openat2`（调用会被
+    /// SIGSYS 杀掉进程，见 [`seccomp_filter_installed`]），旧内核上它会返回错误，两种情况
+    /// 都回退到 canonicalize，因此对外行为与改动前一致。
     fn open(&self, sub: &str) -> Option<(PathBuf, File)> {
         let joined = self.root.join(sub);
-        let metadata = std::fs::symlink_metadata(&joined).ok()?;
+        let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
+            // 路径已经不存在了，顺手把缓存里占着的 fd 放掉
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            self.cache.remove(sub);
+            return None;
+        };
         if !metadata.is_file() {
             return None;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(file) = self.cache.get(sub, &metadata) {
+            return Some((joined, file));
+        }
+        let file = self.open_uncached(sub, &joined)?;
+        // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回。
+        // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以只在未命中时调一次。
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.cache.insert(sub, &file, &metadata);
+        Some((joined, file))
+    }
+
+    /// 缓存未命中时真正去解析并打开文件（类型检查已由 [`Self::open`] 完成）。
+    fn open_uncached(&self, sub: &str, joined: &Path) -> Option<File> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.openat2_allowed
             && let Some(file) = self.root_fd.as_ref().and_then(|fd| open_beneath(fd, sub))
         {
-            return Some((joined, file));
+            return Some(file);
         }
-        open_via_canonicalize(&self.root, &joined).map(|file| (joined, file))
+        open_via_canonicalize(&self.root, joined)
     }
 }
 
@@ -146,9 +178,6 @@ impl ServeFiles {
             res.render(StatusError::internal_server_error().brief("read file failed"));
             return;
         };
-        // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let _ = rfs::fadvise(named_file.file(), 0, None, Advice::Sequential);
         if req.method() == Method::HEAD {
             named_file.send_head(req.headers(), res).await;
             return;

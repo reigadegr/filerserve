@@ -46,7 +46,11 @@ use std::borrow::Cow;
 use std::cmp;
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
-use std::io::{Read as StdRead, Seek as StdSeek, SeekFrom};
+use std::io::Read as StdRead;
+#[cfg(not(unix))]
+use std::io::{Seek as StdSeek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -460,8 +464,15 @@ impl NamedFileBuilder {
                     Some(preread[..cmp::min(1024, preread.len())].to_vec())
                 } else {
                     let mut sample = vec![0u8; cmp::min(1024, file_size) as usize];
-                    file.read_exact(&mut sample)?;
-                    file.seek(SeekFrom::Start(0))?;
+                    // 用 pread 读、不动文件偏移量：调用方可能把同一个 fd 缓存下来给多个请求
+                    // 共用（dup 共享同一个 file description），移动偏移量会互相干扰。
+                    #[cfg(unix)]
+                    file.read_exact_at(&mut sample, 0)?;
+                    #[cfg(not(unix))]
+                    {
+                        file.read_exact(&mut sample)?;
+                        file.seek(SeekFrom::Start(0))?;
+                    }
                     Some(sample)
                 }
             } else {
