@@ -34,6 +34,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use lanfile_namedfile::FileMeta;
+
 use crate::CachedHeaders;
 
 /// 分片数：把一把全局锁拆成 16 把
@@ -62,7 +64,7 @@ struct Entry {
     /// 与响应体共享的 fd：命中时只克隆 `Arc`，不再 `dup`
     file: Arc<File>,
     /// 这个 fd 自己的 `fstat` 结果，命中时直接交给 `NamedFile`，省掉每请求一次 `fstat`
-    metadata: Metadata,
+    metadata: FileMeta,
     headers: CachedHeaders,
     /// 最近一次被用到的序号，淘汰时取最小的那条
     used: u64,
@@ -92,7 +94,7 @@ fn shard_index(path: &str) -> usize {
 }
 
 /// 从命中的条目里取出要交出去的三样东西，并刷新它的 LRU 序号
-fn take(entry: &mut Entry, clock: u64) -> (Arc<File>, Metadata, CachedHeaders) {
+fn take(entry: &mut Entry, clock: u64) -> (Arc<File>, FileMeta, CachedHeaders) {
     entry.used = clock;
     // 锁里只做拷贝：克隆 Arc、元数据与已经编码好的响应头，没有任何系统调用
     (
@@ -112,7 +114,7 @@ impl FileCache {
     /// 这里**不刷新**时间戳：否则持续被请求的热文件永远等不到复校验，陈旧窗口就成了无界。
     /// 复校验由 [`Self::get`] 做，它命中时会把时间戳刷新到当前时刻。
     #[must_use]
-    pub fn get_fresh(&self, path: &str) -> Option<(Arc<File>, Metadata, CachedHeaders)> {
+    pub fn get_fresh(&self, path: &str) -> Option<(Arc<File>, FileMeta, CachedHeaders)> {
         let mut shard = self.shard(path).lock().ok()?;
         shard.clock += 1;
         let clock = shard.clock;
@@ -133,7 +135,7 @@ impl FileCache {
         &self,
         path: &str,
         metadata: &Metadata,
-    ) -> Option<(Arc<File>, Metadata, CachedHeaders)> {
+    ) -> Option<(Arc<File>, FileMeta, CachedHeaders)> {
         let mut shard = self.shard(path).lock().ok()?;
         shard.clock += 1;
         let clock = shard.clock;
@@ -156,7 +158,7 @@ impl FileCache {
     /// `metadata` 必须是这个 fd 自己的 `fstat` 结果（而不是路径的 `lstat`）：命中时它会被
     /// 直接当作文件的元数据使用，两者必须是同一个 inode 的属性。`headers` 里的 `ETag` 与
     /// `Content-Disposition` 必须是从同一份元数据算出来的，否则命中时会给出错的响应头。
-    pub fn insert(&self, path: &str, file: Arc<File>, metadata: Metadata, headers: CachedHeaders) {
+    pub fn insert(&self, path: &str, file: Arc<File>, metadata: FileMeta, headers: CachedHeaders) {
         let Ok(mut shard) = self.shard(path).lock() else {
             return;
         };
@@ -251,9 +253,9 @@ mod tests {
         }
 
         /// 打开文件并返回它的 fd 与 `fstat` 结果，模拟未命中时写入缓存的那份
-        fn open(&self) -> std::io::Result<(File, Metadata)> {
+        fn open(&self) -> std::io::Result<(File, FileMeta)> {
             let file = File::open(&self.path)?;
-            let metadata = file.metadata()?;
+            let metadata = crate::fd_meta(&file)?;
             Ok((file, metadata))
         }
 

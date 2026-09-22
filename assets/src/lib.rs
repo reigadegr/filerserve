@@ -1,8 +1,8 @@
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lanfile_namedfile::NamedFile;
+use lanfile_namedfile::{FileMeta, NamedFile};
 use lanfile_sendfile::upgrade_response;
 use mime::Mime;
 use rust_embed::RustEmbed;
@@ -89,7 +89,7 @@ impl ServeFiles {
     /// 校验结果在 `REVALIDATE_MILLIS`（1 秒）内直接复用：这段时间里连上面那次
     /// `symlink_metadata` 都不做，所以文件被改写、替换或删除后，最长 1 秒内仍按上一次校验过的
     /// 元数据与 fd 响应。
-    fn open(&self, sub: &str) -> Option<(PathBuf, Arc<File>, Metadata, Option<CachedHeaders>)> {
+    fn open(&self, sub: &str) -> Option<(PathBuf, Arc<File>, FileMeta, Option<CachedHeaders>)> {
         let joined = self.root.join(sub);
         // 有效期内的快路径：连 `symlink_metadata` 都省掉（本机 1.03 µs，占每请求 CPU 的 3%）
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -112,7 +112,7 @@ impl ServeFiles {
         let file = self.open_uncached(sub, &joined)?;
         // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
         // 缓存里必须记 fd 的属性而不是路径的 lstat，否则文件被换掉时会串味。
-        let metadata = file.metadata().ok()?;
+        let metadata = fd_meta(&file).ok()?;
         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回。
         // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以只在未命中时调一次。
         // 一页以内的文件整个读完也只有一页，预读窗口开多大结果都一样，这次系统调用可以省掉。
@@ -133,6 +133,32 @@ impl ServeFiles {
         }
         open_via_canonicalize(&self.root, joined)
     }
+}
+
+/// 取已打开 fd 的元数据。
+///
+/// 不用 `std::fs::File::metadata()`：它在本目标上发的是 `statx(fd, AT_EMPTY_PATH)`
+/// （实测 353 ns），而 `fstat` 只要 285 ns，两者给出的 inode、长度与 mtime 完全相同。
+///
+/// `Stat` 字段的符号性随 rustix 后端而变（`linux_raw` 与 `libc` 不同），这里统一按非负的 stat
+/// 字段转换宽度，所以显式关掉这两条 cast 检查。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+fn fd_meta(file: &File) -> std::io::Result<FileMeta> {
+    let stat = rfs::fstat(file)?;
+    Ok(FileMeta::from_raw(
+        stat.st_size as u64,
+        stat.st_ino as u64,
+        stat.st_mtime as i64,
+        stat.st_mtime_nsec as i64,
+    ))
+}
+
+/// 其他平台没有直接发 `fstat` 的分支，退回 `std` 的元数据，字段值一致。
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn fd_meta(file: &File) -> std::io::Result<FileMeta> {
+    file.metadata()
+        .map(|metadata| FileMeta::from_metadata(&metadata))
 }
 
 /// 一次 `openat2` 完成路径解析、越界检查与打开。
