@@ -11,7 +11,8 @@
 //! 而它正是命中时那个 fd 自己的 `fstat` 结果。
 //!
 //! 并发上用 [`SHARDS`] 把一把全局锁拆成多把：路径按哈希固定落在其中一片，请求只在这一片上
-//! 竞争；片内的 `dup` 是系统调用，一律挪到锁外，锁里只做查找与拷贝。
+//! 竞争，锁里只做查找与拷贝。条目与响应体共享同一个 fd（`Arc<File>`），命中与写入都不再
+//! `dup`：sendfile 带显式 offset，共享文件描述符本来就是安全的。
 //!
 //! 淘汰按 LRU：每片记一个自增序号，命中时刷新该条的序号，满了就淘汰序号最小的那条。每片只有
 //! [`CAPACITY_PER_SHARD`] 条，线性扫一遍比维护链表简单得多；也避免了"满了全清"把热文件一起
@@ -25,7 +26,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use lanfile_sendfile::duplicate_file;
 use mime::Mime;
 
 /// 分片数：把一把全局锁拆成 16 把
@@ -34,7 +34,7 @@ const SHARDS: usize = 16;
 const CAPACITY_PER_SHARD: usize = 32;
 
 struct Entry {
-    /// 缓存自己持有的一份 fd；命中时克隆这个 `Arc`，`dup` 在锁外做
+    /// 与响应体共享的 fd：命中时只克隆 `Arc`，不再 `dup`
     file: Arc<File>,
     /// 这个 fd 自己的 `fstat` 结果，命中时直接交给 `NamedFile`，省掉每请求一次 `fstat`
     metadata: Metadata,
@@ -73,7 +73,7 @@ impl FileCache {
     ///
     /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中。
     #[must_use]
-    pub fn get(&self, path: &str, metadata: &Metadata) -> Option<(File, Metadata, Mime)> {
+    pub fn get(&self, path: &str, metadata: &Metadata) -> Option<(Arc<File>, Metadata, Mime)> {
         let mut shard = self.shard(path).lock().ok()?;
         shard.clock += 1;
         let clock = shard.clock;
@@ -86,11 +86,10 @@ impl FileCache {
             return None;
         }
         entry.used = clock;
-        // 锁里只做拷贝，`dup` 是系统调用，放到锁外
+        // 锁里只做拷贝：克隆 Arc、元数据与类型，没有任何系统调用
         let file = Arc::clone(&entry.file);
         let (metadata, content_type) = (entry.metadata.clone(), entry.content_type.clone());
         drop(shard);
-        let file = duplicate_file(&file)?;
         Some((file, metadata, content_type))
     }
 
@@ -98,11 +97,7 @@ impl FileCache {
     ///
     /// `metadata` 必须是这个 fd 自己的 `fstat` 结果（而不是路径的 `lstat`）：命中时它会被
     /// 直接当作文件的元数据使用，两者必须是同一个 inode 的属性。
-    pub fn insert(&self, path: &str, file: &File, metadata: Metadata, content_type: Mime) {
-        // `dup` 是系统调用，放在锁外
-        let Some(cached) = duplicate_file(file) else {
-            return;
-        };
+    pub fn insert(&self, path: &str, file: Arc<File>, metadata: Metadata, content_type: Mime) {
         let Ok(mut shard) = self.shard(path).lock() else {
             return;
         };
@@ -122,7 +117,7 @@ impl FileCache {
         shard.entries.insert(
             path.into(),
             Entry {
-                file: Arc::new(cached),
+                file,
                 metadata,
                 content_type,
                 used: clock,
@@ -194,9 +189,10 @@ mod tests {
         }
     }
 
-    fn read_all(mut file: File) -> std::io::Result<String> {
+    fn read_all(file: &File) -> std::io::Result<String> {
         let mut text = String::new();
-        file.read_to_string(&mut text)?;
+        let mut reader = file;
+        reader.read_to_string(&mut text)?;
         Ok(text)
     }
 
@@ -206,11 +202,11 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
 
-        cache.insert("file.txt", &file, metadata, text_plain());
+        cache.insert("file.txt", Arc::new(file), metadata, text_plain());
         let cached = cache.get("file.txt", &fixture.lstat()?);
         assert!(cached.is_some(), "元数据没变就应该命中");
         if let Some((file, metadata, content_type)) = cached {
-            assert_eq!(read_all(file)?, "hello");
+            assert_eq!(read_all(&file)?, "hello");
             assert_eq!(metadata.len(), 5, "命中时给出的元数据就是那个 fd 的");
             assert_eq!(content_type, text_plain(), "命中时类型也从缓存来");
         }
@@ -226,7 +222,7 @@ mod tests {
         let fixture = Fixture::new("change")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
-        cache.insert("file.txt", &file, metadata, text_plain());
+        cache.insert("file.txt", Arc::new(file), metadata, text_plain());
 
         std::fs::write(&fixture.path, b"hello, world")?;
         assert!(
@@ -243,7 +239,7 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
         let original = fixture.lstat()?;
-        cache.insert("file.txt", &file, metadata, text_plain());
+        cache.insert("file.txt", Arc::new(file), metadata, text_plain());
 
         let replacement = fixture.dir.join("replacement.txt");
         std::fs::write(&replacement, b"world")?;
@@ -278,7 +274,7 @@ mod tests {
         let fixture = Fixture::new("remove")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
-        cache.insert("file.txt", &file, metadata, text_plain());
+        cache.insert("file.txt", Arc::new(file), metadata, text_plain());
         cache.remove("file.txt");
         assert!(cache.get("file.txt", &fixture.lstat()?).is_none());
         Ok(())
@@ -290,8 +286,14 @@ mod tests {
         let fixture = Fixture::new("bound")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
+        let file = Arc::new(file);
         for i in 0..2000 {
-            cache.insert(&format!("path-{i}"), &file, metadata.clone(), text_plain());
+            cache.insert(
+                &format!("path-{i}"),
+                Arc::clone(&file),
+                metadata.clone(),
+                text_plain(),
+            );
         }
         assert!(
             cache.total_len() <= SHARDS * CAPACITY_PER_SHARD,
@@ -310,6 +312,7 @@ mod tests {
         let fixture = Fixture::new("lru")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
+        let file = Arc::new(file);
         // 凑够同一片里的 CAPACITY_PER_SHARD + 1 条路径，把这一片填满
         let shard = shard_index("same-shard-0");
         let mut paths = Vec::new();
@@ -326,14 +329,14 @@ mod tests {
             unreachable!("至少有一条用于触发淘汰");
         };
         for path in &paths {
-            cache.insert(path, &file, metadata.clone(), text_plain());
+            cache.insert(path, Arc::clone(&file), metadata.clone(), text_plain());
         }
         assert!(
             cache.get(&target, &fixture.lstat()?).is_some(),
             "刚插入的应当命中"
         );
 
-        cache.insert(&extra, &file, metadata, text_plain());
+        cache.insert(&extra, Arc::clone(&file), metadata, text_plain());
         assert!(
             cache.get(&target, &fixture.lstat()?).is_some(),
             "刚用过的不能被淘汰"

@@ -29,6 +29,7 @@
 //! ```
 
 use std::fs::File;
+use std::sync::Arc;
 
 use salvo::{
     http::{
@@ -57,21 +58,6 @@ pub use stream::{SendfileStream, SendfileTarget};
 /// `open(2)`, and it guarantees the same file is served even if the path is
 /// replaced in between.
 ///
-/// Returns `None` on platforms without `sendfile(2)`, or when the handle cannot
-/// be duplicated; the caller then keeps the ordinary response body.
-#[must_use]
-pub fn duplicate_file(file: &std::fs::File) -> Option<File> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        rustix::io::dup(file).ok().map(File::from)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let _ = file;
-        None
-    }
-}
-
 /// Replaces a file response body with a zero-copy `sendfile(2)` body.
 ///
 /// Call this after the response headers and body have been produced, passing the
@@ -89,7 +75,7 @@ pub fn duplicate_file(file: &std::fs::File) -> Option<File> {
 /// not paid before this is reached.
 ///
 /// The returned value reports whether the body was replaced.
-pub fn upgrade_response(req: &Request, res: &mut Response, file: File) -> bool {
+pub fn upgrade_response(req: &Request, res: &mut Response, file: Arc<File>) -> bool {
     let status = res.status_code;
     if status != Some(StatusCode::OK) && status != Some(StatusCode::PARTIAL_CONTENT) {
         return false;

@@ -1,10 +1,9 @@
 use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::Arc;
 
 use lanfile_namedfile::NamedFile;
-use lanfile_sendfile::{duplicate_file, upgrade_response};
+use lanfile_sendfile::upgrade_response;
 use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -70,7 +69,7 @@ impl ServeFiles {
     /// 对每一层路径各一次的 `readlink`。装了 seccomp filter 的环境（Android）根本不调用
     /// `openat2`（调用会被 SIGSYS 杀掉进程，见 [`seccomp_filter_installed`]），旧内核上它
     /// 会返回错误，两种情况都回退到 canonicalize，因此对外行为与改动前一致。
-    fn open(&self, sub: &str) -> Option<(PathBuf, File, Metadata, Option<Mime>)> {
+    fn open(&self, sub: &str) -> Option<(PathBuf, Arc<File>, Metadata, Option<Mime>)> {
         let joined = self.root.join(sub);
         let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
             // 路径已经不存在了，顺手把缓存里占着的 fd 放掉
@@ -93,7 +92,7 @@ impl ServeFiles {
         // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以只在未命中时调一次。
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
-        Some((joined, file, metadata, None))
+        Some((joined, Arc::new(file), metadata, None))
     }
 
     /// 缓存未命中时真正去解析并打开文件（类型检查已由 [`Self::open`] 完成）。
@@ -181,7 +180,7 @@ impl ServeFiles {
         }
         // 元数据跟着缓存一起给出来（未命中时是刚 fstat 的），所以这里不必再 fstat 一次
         let Ok(named_file) = builder
-            .build_from_file_with_metadata(file, metadata.clone())
+            .build_from_file_with_metadata(Arc::clone(&file), metadata.clone())
             .await
         else {
             res.render(StatusError::internal_server_error().brief("read file failed"));
@@ -192,7 +191,7 @@ impl ServeFiles {
         if missed {
             self.cache.insert(
                 &sub,
-                named_file.file(),
+                Arc::clone(&file),
                 metadata,
                 named_file.content_type().clone(),
             );
@@ -202,14 +201,11 @@ impl ServeFiles {
             return;
         }
 
-        // `send` 会消费原文件，先复制一份描述符供 sendfile 使用
-        let sendfile_file = duplicate_file(named_file.file());
         named_file.send(req.headers(), res).await;
 
-        // 命中条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体
-        if let Some(file) = sendfile_file {
-            upgrade_response(req, res, file);
-        }
+        // 命中条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
+        // 这里不再 dup：响应体直接共享缓存里那个 fd（sendfile 带显式 offset，共享描述符是安全的）
+        upgrade_response(req, res, file);
     }
 }
 
@@ -353,15 +349,12 @@ mod tests {
                 assert!(cached.is_none(), "第一次不该命中");
                 let named = NamedFile::builder(fixture.root.join("ok.txt"))
                     .preload_threshold(0)
-                    .build_from_file_with_metadata(file, metadata.clone())
+                    .build_from_file_with_metadata(Arc::clone(&file), metadata.clone())
                     .await
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                files.cache.insert(
-                    "ok.txt",
-                    named.file(),
-                    metadata,
-                    named.content_type().clone(),
-                );
+                files
+                    .cache
+                    .insert("ok.txt", file, metadata, named.content_type().clone());
                 let Some((_, _, _, cached)) = files.open("ok.txt") else {
                     panic!("第二次应当打开成功");
                 };

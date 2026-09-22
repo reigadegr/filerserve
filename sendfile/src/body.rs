@@ -4,7 +4,7 @@ use std::{
     fs::File,
     pin::Pin,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -24,7 +24,7 @@ static PHANTOM: [u8; 256 * 1024] = [0; 256 * 1024];
 
 /// The file range a connection's next response must send with `sendfile(2)`.
 pub struct Plan {
-    pub file: File,
+    pub file: Arc<File>,
     pub offset: u64,
     pub remaining: u64,
 }
@@ -52,7 +52,7 @@ impl SendfileSlot {
     /// Returns `None` — and leaves the slot untouched — when the platform has no
     /// `sendfile`, when a plan is already armed, or when `len` is zero. A caller
     /// that gets `None` must keep the ordinary response body.
-    pub fn arm(&self, file: File, offset: u64, len: u64) -> Option<SendfileBody> {
+    pub fn arm(&self, file: Arc<File>, offset: u64, len: u64) -> Option<SendfileBody> {
         if !cfg!(any(target_os = "linux", target_os = "android")) || len == 0 {
             return None;
         }

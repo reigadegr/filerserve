@@ -46,6 +46,7 @@ use std::borrow::Cow;
 use std::cmp;
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
+#[cfg(not(unix))]
 use std::io::Read as StdRead;
 #[cfg(not(unix))]
 use std::io::{Seek as StdSeek, SeekFrom};
@@ -54,6 +55,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -180,9 +182,9 @@ pub struct NamedFile {
     /// Overrides the name `Content-Disposition` reports, when the bytes come from
     /// a different path than the requested resource.
     disposition_name: Option<String>,
-    /// Held as a plain `std::fs::File` so both the response body and the
-    /// `sendfile(2)` upgrade can use it without a blocking-pool round trip.
-    file: File,
+    /// 共享持有：缓存、响应体与 sendfile 升级共用同一个 fd，每请求因此不必再 `dup`。
+    /// sendfile 带显式 offset，不会移动共享的文件偏移量，所以并发共用是安全的。
+    file: Arc<File>,
     modified: Option<SystemTime>,
     buffer_size: u64,
     metadata: Metadata,
@@ -378,7 +380,7 @@ impl NamedFileBuilder {
     /// caller has already opened the file — for example after resolving it with
     /// `openat2` — so that build does not open it a second time.
     pub async fn build_from_file(self, file: File) -> Result<NamedFile> {
-        self.build_inner(Some(file), None).await
+        self.build_inner(Some(Arc::new(file)), None).await
     }
 
     /// Build a new [`NamedFile`] from an already-opened file and its metadata.
@@ -387,9 +389,12 @@ impl NamedFileBuilder {
     /// `fstat` an ordinary build performs. Callers that cached an earlier
     /// `fstat` of the same descriptor — and revalidated it against the current
     /// path — can pass it here.
+    ///
+    /// The file is shared rather than owned so that the caller keeps using the
+    /// same descriptor for `sendfile(2)` without duplicating it.
     pub async fn build_from_file_with_metadata(
         self,
-        file: File,
+        file: Arc<File>,
         metadata: Metadata,
     ) -> Result<NamedFile> {
         self.build_inner(Some(file), Some(metadata)).await
@@ -398,7 +403,7 @@ impl NamedFileBuilder {
     /// Shared implementation of [`Self::build`] and the `build_from_file*` variants.
     async fn build_inner(
         self,
-        file: Option<File>,
+        file: Option<Arc<File>>,
         metadata: Option<Metadata>,
     ) -> Result<NamedFile> {
         let Self {
@@ -452,7 +457,7 @@ impl NamedFileBuilder {
         // 压测下来这一次 spawn_blocking 就占掉每请求约 4 次 futex 等待，比它省下的阻塞还贵。
         // open/metadata 命中页缓存时是微秒级，因此直接在 worker 上同步执行。
         struct FileInfo {
-            file: File,
+            file: Arc<File>,
             metadata: Metadata,
             preread: Option<Vec<u8>>,
             detection_sample: Option<Vec<u8>>,
@@ -460,9 +465,9 @@ impl NamedFileBuilder {
         let info = (|| -> std::io::Result<FileInfo> {
             // 调用方可能已经打开过这个文件（例如用 openat2 解析过路径），那就直接用它，
             // 不要再按路径打开一次。
-            let mut file = match file {
+            let file = match file {
                 Some(file) => file,
-                None => File::open(&path)?,
+                None => Arc::new(File::open(&path)?),
             };
             // 调用方可能已经 fstat 过同一个描述符（并把结果缓存下来做了校验），那就直接用，
             // 省掉这次 fstat。它必须描述的就是这个已打开的文件。
@@ -476,7 +481,14 @@ impl NamedFileBuilder {
             // This avoids ChunkedFile's spawn_blocking overhead later.
             let preread = if file_size <= preload_threshold {
                 let mut buf = vec![0u8; file_size as usize];
-                file.read_exact(&mut buf)?;
+                // 用 pread 读、不动共享的文件偏移量（同一个 fd 可能被多个请求共用）
+                #[cfg(unix)]
+                file.read_exact_at(&mut buf, 0)?;
+                #[cfg(not(unix))]
+                {
+                    let mut owned = file.try_clone()?;
+                    owned.read_exact(&mut buf)?;
+                }
                 Some(buf)
             } else {
                 None
@@ -493,8 +505,9 @@ impl NamedFileBuilder {
                     file.read_exact_at(&mut sample, 0)?;
                     #[cfg(not(unix))]
                     {
-                        file.read_exact(&mut sample)?;
-                        file.seek(SeekFrom::Start(0))?;
+                        let mut owned = file.try_clone()?;
+                        owned.seek(SeekFrom::Start(0))?;
+                        owned.read_exact(&mut sample)?;
                     }
                     Some(sample)
                 }
@@ -733,8 +746,8 @@ impl NamedFile {
 
     /// Returns reference to the underlying `File` object.
     #[inline]
-    pub const fn file(&self) -> &File {
-        &self.file
+    pub fn file(&self) -> &File {
+        self.file.as_ref()
     }
 
     /// Retrieve the path of this file.
@@ -1064,11 +1077,16 @@ impl NamedFile {
                 let start = cmp::min(offset as usize, end);
                 res.replace_body(ResBody::Once(preread.slice(start..end)));
             } else {
+                // 回退到普通响应体：它要独占句柄并按偏移 seek，只有这条路才复制一份
+                let Ok(file) = self.file.try_clone() else {
+                    res.render(StatusError::internal_server_error());
+                    return;
+                };
                 let reader = ChunkedFile {
                     offset,
                     total_size,
                     read_size: 0,
-                    state: ChunkedState::File(Some(self.file)),
+                    state: ChunkedState::File(Some(file)),
                     buffer_size: self.buffer_size,
                 };
                 res.stream(reader);
@@ -1086,9 +1104,14 @@ impl NamedFile {
             if let Some(preread) = self.preread.take() {
                 res.replace_body(ResBody::Once(preread));
             } else {
+                // 回退到普通响应体：它要独占句柄并按偏移 seek，只有这条路才复制一份
+                let Ok(file) = self.file.try_clone() else {
+                    res.render(StatusError::internal_server_error());
+                    return;
+                };
                 let reader = ChunkedFile {
                     offset,
-                    state: ChunkedState::File(Some(self.file)),
+                    state: ChunkedState::File(Some(file)),
                     total_size: length,
                     read_size: 0,
                     buffer_size: self.buffer_size,

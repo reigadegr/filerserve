@@ -566,7 +566,9 @@ mod transport_tests {
         std::fs::write(&path, &payload).unwrap();
 
         let slot = Arc::new(SendfileSlot::new());
-        let body = slot.arm(File::open(&path).unwrap(), OFFSET, LEN).unwrap();
+        let body = slot
+            .arm(Arc::new(File::open(&path).unwrap()), OFFSET, LEN)
+            .unwrap();
         assert_eq!(body.len(), LEN);
 
         let record = Record::default();
