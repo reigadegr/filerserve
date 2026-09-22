@@ -895,6 +895,7 @@ version = "0.1.0"
 dependencies = [
  "lanfile-namedfile",
  "lanfile-sendfile",
+ "mime",
  "rust-embed",
  "rustix",
  "salvo",

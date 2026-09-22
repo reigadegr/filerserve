@@ -1,10 +1,11 @@
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::Arc;
 
 use lanfile_namedfile::NamedFile;
 use lanfile_sendfile::{duplicate_file, upgrade_response};
+use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fd::OwnedFd;
@@ -63,12 +64,13 @@ impl ServeFiles {
     /// 打开请求路径对应的文件，且必须位于 root 之内（防目录穿越）。
     ///
     /// 先用 `symlink_metadata` 判断类型，符号链接不会被当作文件服务；这一步同时用来校验
-    /// 缓存是否还有效。未命中时才真正去解析路径：让内核用一次 `openat2(RESOLVE_BENEATH)`
-    /// 同时完成路径解析、越界检查与打开，省掉 `canonicalize` 对每一层路径各一次的
-    /// `readlink`。装了 seccomp filter 的环境（Android）根本不调用 `openat2`（调用会被
-    /// SIGSYS 杀掉进程，见 [`seccomp_filter_installed`]），旧内核上它会返回错误，两种情况
-    /// 都回退到 canonicalize，因此对外行为与改动前一致。
-    fn open(&self, sub: &str) -> Option<(PathBuf, File)> {
+    /// 缓存是否还有效。命中时直接给出缓存里的 fd、它的元数据与解析好的 `Content-Type`
+    /// （第四个元素为 `Some`）。未命中才真正去解析路径：让内核用一次
+    /// `openat2(RESOLVE_BENEATH)` 同时完成路径解析、越界检查与打开，省掉 `canonicalize`
+    /// 对每一层路径各一次的 `readlink`。装了 seccomp filter 的环境（Android）根本不调用
+    /// `openat2`（调用会被 SIGSYS 杀掉进程，见 [`seccomp_filter_installed`]），旧内核上它
+    /// 会返回错误，两种情况都回退到 canonicalize，因此对外行为与改动前一致。
+    fn open(&self, sub: &str) -> Option<(PathBuf, File, Metadata, Option<Mime>)> {
         let joined = self.root.join(sub);
         let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
             // 路径已经不存在了，顺手把缓存里占着的 fd 放掉
@@ -80,17 +82,18 @@ impl ServeFiles {
             return None;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(file) = self.cache.get(sub, &metadata) {
-            return Some((joined, file));
+        if let Some((file, metadata, content_type)) = self.cache.get(sub, &metadata) {
+            return Some((joined, file, metadata, Some(content_type)));
         }
         let file = self.open_uncached(sub, &joined)?;
+        // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
+        // 缓存里必须记 fd 的属性而不是路径的 lstat，否则文件被换掉时会串味。
+        let metadata = file.metadata().ok()?;
         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回。
         // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以只在未命中时调一次。
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        self.cache.insert(sub, &file, &metadata);
-        Some((joined, file))
+        Some((joined, file, metadata, None))
     }
 
     /// 缓存未命中时真正去解析并打开文件（类型检查已由 [`Self::open`] 完成）。
@@ -163,21 +166,37 @@ impl ServeFiles {
         // 路径解析直接在 worker 上做：只有 lstat + openat2，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
-        let Some((path, file)) = self.open(&sub) else {
+        let Some((path, file, metadata, cached_type)) = self.open(&sub) else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
 
         // 关闭 NamedFile 的小文件预读：预读会把内容读进用户态，而 sendfile 直接从页缓存发，
         // 那次读纯属浪费；关掉后所有响应体都交给 sendfile，HEAD 本来也不需要预读
-        let Ok(named_file) = NamedFile::builder(path)
-            .preload_threshold(0)
-            .build_from_file(file)
+        let mut builder = NamedFile::builder(path).preload_threshold(0);
+        let missed = cached_type.is_none();
+        // 缓存命中时把上次解析好的类型直接交给它：需要 charset 的类型因此不必再读一次样本
+        if let Some(content_type) = cached_type {
+            builder = builder.content_type(content_type);
+        }
+        // 元数据跟着缓存一起给出来（未命中时是刚 fstat 的），所以这里不必再 fstat 一次
+        let Ok(named_file) = builder
+            .build_from_file_with_metadata(file, metadata.clone())
             .await
         else {
             res.render(StatusError::internal_server_error().brief("read file failed"));
             return;
         };
+        // 未命中：把 fd、它的元数据和刚解析出来的类型一起存进缓存
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if missed {
+            self.cache.insert(
+                &sub,
+                named_file.file(),
+                metadata,
+                named_file.content_type().clone(),
+            );
+        }
         if req.method() == Method::HEAD {
             named_file.send_head(req.headers(), res).await;
             return;
@@ -317,5 +336,37 @@ mod tests {
             "O_NOFOLLOW 必须拦下符号链接"
         );
         Ok(())
+    }
+
+    /// 缓存命中时 `open` 要把 fd、元数据与类型一起给出来，构建时不再 fstat、也不再读嗅探样本
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn cache_hit_reuses_the_open_file() -> std::io::Result<()> {
+        let fixture = Fixture::new("cache")?;
+        let files = ServeFiles::new(fixture.root.clone());
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(async {
+                let Some((_, file, metadata, cached)) = files.open("ok.txt") else {
+                    panic!("第一次应当打开成功");
+                };
+                assert!(cached.is_none(), "第一次不该命中");
+                let named = NamedFile::builder(fixture.root.join("ok.txt"))
+                    .preload_threshold(0)
+                    .build_from_file_with_metadata(file, metadata.clone())
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                files.cache.insert(
+                    "ok.txt",
+                    named.file(),
+                    metadata,
+                    named.content_type().clone(),
+                );
+                let Some((_, _, _, cached)) = files.open("ok.txt") else {
+                    panic!("第二次应当打开成功");
+                };
+                assert!(cached.is_some(), "第二次应当命中并带上缓存的类型");
+                Ok::<(), std::io::Error>(())
+            })
     }
 }

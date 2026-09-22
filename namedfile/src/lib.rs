@@ -368,7 +368,7 @@ impl NamedFileBuilder {
 
     /// Build a new [`NamedFile`].
     pub async fn build(self) -> Result<NamedFile> {
-        self.build_inner(None).await
+        self.build_inner(None, None).await
     }
 
     /// Build a new [`NamedFile`] from an already-opened file.
@@ -378,11 +378,29 @@ impl NamedFileBuilder {
     /// caller has already opened the file — for example after resolving it with
     /// `openat2` — so that build does not open it a second time.
     pub async fn build_from_file(self, file: File) -> Result<NamedFile> {
-        self.build_inner(Some(file)).await
+        self.build_inner(Some(file), None).await
     }
 
-    /// Shared implementation of [`Self::build`] and [`Self::build_from_file`].
-    async fn build_inner(self, file: Option<File>) -> Result<NamedFile> {
+    /// Build a new [`NamedFile`] from an already-opened file and its metadata.
+    ///
+    /// `metadata` must describe that same open file, so that build skips the
+    /// `fstat` an ordinary build performs. Callers that cached an earlier
+    /// `fstat` of the same descriptor — and revalidated it against the current
+    /// path — can pass it here.
+    pub async fn build_from_file_with_metadata(
+        self,
+        file: File,
+        metadata: Metadata,
+    ) -> Result<NamedFile> {
+        self.build_inner(Some(file), Some(metadata)).await
+    }
+
+    /// Shared implementation of [`Self::build`] and the `build_from_file*` variants.
+    async fn build_inner(
+        self,
+        file: Option<File>,
+        metadata: Option<Metadata>,
+    ) -> Result<NamedFile> {
         let Self {
             path,
             content_type,
@@ -446,7 +464,12 @@ impl NamedFileBuilder {
                 Some(file) => file,
                 None => File::open(&path)?,
             };
-            let metadata = file.metadata()?;
+            // 调用方可能已经 fstat 过同一个描述符（并把结果缓存下来做了校验），那就直接用，
+            // 省掉这次 fstat。它必须描述的就是这个已打开的文件。
+            let metadata = match metadata {
+                Some(metadata) => metadata,
+                None => file.metadata()?,
+            };
             let file_size = metadata.len();
 
             // For small files (size <= preload_threshold), read the entire content now.
