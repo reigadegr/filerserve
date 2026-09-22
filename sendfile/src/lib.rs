@@ -87,7 +87,7 @@ pub fn upgrade_response(req: &Request, res: &mut Response, file: Arc<File>) -> b
         return false;
     };
     let offset = header_str(res, CONTENT_RANGE)
-        .and_then(|value| range_start(&value))
+        .and_then(range_start)
         .unwrap_or(0);
     let Some(body) = slot.arm(file, offset, len) else {
         return false;
@@ -96,11 +96,11 @@ pub fn upgrade_response(req: &Request, res: &mut Response, file: Arc<File>) -> b
     true
 }
 
-fn header_str(res: &Response, name: salvo::http::header::HeaderName) -> Option<String> {
+/// 借出响应头里的字符串，不复制：调用方要么立刻解析成数字，要么马上解析成偏移量。
+fn header_str(res: &Response, name: salvo::http::header::HeaderName) -> Option<&str> {
     res.headers()
         .get(name)
         .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string)
 }
 
 fn header_u64(res: &Response, name: salvo::http::header::HeaderName) -> Option<u64> {
