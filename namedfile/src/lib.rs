@@ -364,6 +364,21 @@ impl NamedFileBuilder {
 
     /// Build a new [`NamedFile`].
     pub async fn build(self) -> Result<NamedFile> {
+        self.build_inner(None).await
+    }
+
+    /// Build a new [`NamedFile`] from an already-opened file.
+    ///
+    /// The path still names the file: it supplies the extension used for MIME
+    /// inference and the name used in `Content-Disposition`. Use this when the
+    /// caller has already opened the file — for example after resolving it with
+    /// `openat2` — so that build does not open it a second time.
+    pub async fn build_from_file(self, file: File) -> Result<NamedFile> {
+        self.build_inner(Some(file)).await
+    }
+
+    /// Shared implementation of [`Self::build`] and [`Self::build_from_file`].
+    async fn build_inner(self, file: Option<File>) -> Result<NamedFile> {
         let Self {
             path,
             content_type,
@@ -421,7 +436,12 @@ impl NamedFileBuilder {
             detection_sample: Option<Vec<u8>>,
         }
         let info = (|| -> std::io::Result<FileInfo> {
-            let mut file = File::open(&path)?;
+            // 调用方可能已经打开过这个文件（例如用 openat2 解析过路径），那就直接用它，
+            // 不要再按路径打开一次。
+            let mut file = match file {
+                Some(file) => file,
+                None => File::open(&path)?,
+            };
             let metadata = file.metadata()?;
             let file_size = metadata.len();
 
