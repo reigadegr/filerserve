@@ -172,6 +172,48 @@ async fn files_endpoint_serves_file() {
     assert_eq!(res.take_string().await.unwrap(), "hello world");
 }
 
+/// 第二次请求同一个文件会走命中缓存的路径：缓存里复用的 `ETag` 与 `Content-Disposition`
+/// 必须与未命中时现算的一模一样，带回这个 `ETag` 再请求也必须仍然是 304
+#[tokio::test]
+async fn files_cache_hit_sends_the_same_headers() {
+    use salvo::http::header::{
+        CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED,
+    };
+
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let url = "http://127.0.0.1:5800/files/hello.txt";
+
+    let missed = TestClient::get(url).send(Arc::clone(&router)).await;
+    assert_eq!(missed.status_code, Some(StatusCode::OK));
+    let hit = TestClient::get(url).send(Arc::clone(&router)).await;
+    assert_eq!(hit.status_code, Some(StatusCode::OK));
+
+    for name in [
+        ETAG,
+        CONTENT_DISPOSITION,
+        CONTENT_TYPE,
+        LAST_MODIFIED,
+        CONTENT_LENGTH,
+    ] {
+        let missed = missed.headers().get(&name);
+        assert!(missed.is_some(), "未命中的响应应当带上 {name}");
+        assert_eq!(
+            missed,
+            hit.headers().get(&name),
+            "命中与未命中的 {name} 必须一致"
+        );
+    }
+
+    let etag = missed.headers().get(ETAG).unwrap().clone();
+    let conditional = TestClient::get(url)
+        .add_header("if-none-match", etag, true)
+        .send(router)
+        .await;
+    assert_eq!(conditional.status_code, Some(StatusCode::NOT_MODIFIED));
+}
+
 #[tokio::test]
 async fn files_endpoint_returns_404_for_missing_file() {
     let dir = TestDir::new();

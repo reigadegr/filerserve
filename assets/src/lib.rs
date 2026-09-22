@@ -11,7 +11,7 @@ use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, Advice, Mode, OFlags, ResolveFlags};
 use salvo::{
-    http::Method,
+    http::{HeaderValue, Method, header::CONTENT_DISPOSITION, headers::ETag},
     prelude::*,
     routing::{Filter, filters},
     serve_static::static_embed,
@@ -26,6 +26,21 @@ use file_cache::FileCache;
 #[derive(RustEmbed)]
 #[folder = "static/"]
 pub struct Asset;
+
+/// 缓存里可以跨请求复用的那一部分：解析好的类型与已经编码好的响应头。
+///
+/// 这几项只由（路径, 元数据）决定，而缓存命中又要求元数据逐项一致，所以命中时直接拿来用就是
+/// 对的：`ETag` 省掉每请求一次 `format!` 加解析，`Content-Disposition` 省掉每请求一次的转义
+/// 与拼接。缓存只在 Linux/Android 上启用，其他平台上这个类型只会以 `None` 出现。
+#[derive(Clone)]
+struct CachedHeaders {
+    /// 解析出来的 `Content-Type`（需要时已带上 `charset=`），命中时省掉嗅探的那次 `pread`
+    content_type: Mime,
+    /// 已经编码好的 `ETag`（文件时间早于 epoch 时没有）
+    etag: Option<ETag>,
+    /// 已经编码好的 `Content-Disposition`
+    disposition: Option<HeaderValue>,
+}
 
 struct ServeFiles {
     root: PathBuf,
@@ -63,13 +78,14 @@ impl ServeFiles {
     /// 打开请求路径对应的文件，且必须位于 root 之内（防目录穿越）。
     ///
     /// 先用 `symlink_metadata` 判断类型，符号链接不会被当作文件服务；这一步同时用来校验
-    /// 缓存是否还有效。命中时直接给出缓存里的 fd、它的元数据与解析好的 `Content-Type`
-    /// （第四个元素为 `Some`）。未命中才真正去解析路径：让内核用一次
-    /// `openat2(RESOLVE_BENEATH)` 同时完成路径解析、越界检查与打开，省掉 `canonicalize`
-    /// 对每一层路径各一次的 `readlink`。装了 seccomp filter 的环境（Android）根本不调用
-    /// `openat2`（调用会被 SIGSYS 杀掉进程，见 [`seccomp_filter_installed`]），旧内核上它
-    /// 会返回错误，两种情况都回退到 canonicalize，因此对外行为与改动前一致。
-    fn open(&self, sub: &str) -> Option<(PathBuf, Arc<File>, Metadata, Option<Mime>)> {
+    /// 缓存是否还有效。命中时直接给出缓存里的 fd、它的元数据以及解析好的 `Content-Type`
+    /// 与已经编码好的 `ETag`、`Content-Disposition`（第四个元素为 `Some`）。未命中才真正去
+    /// 解析路径：让内核用一次 `openat2(RESOLVE_BENEATH)` 同时完成路径解析、越界检查与打开，
+    /// 省掉 `canonicalize` 对每一层路径各一次的 `readlink`。装了 seccomp filter 的环境
+    /// （Android）根本不调用 `openat2`（调用会被 SIGSYS 杀掉进程，见
+    /// [`seccomp_filter_installed`]），旧内核上它会返回错误，两种情况都回退到 canonicalize，
+    /// 因此对外行为与改动前一致。
+    fn open(&self, sub: &str) -> Option<(PathBuf, Arc<File>, Metadata, Option<CachedHeaders>)> {
         let joined = self.root.join(sub);
         let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
             // 路径已经不存在了，顺手把缓存里占着的 fd 放掉
@@ -81,8 +97,8 @@ impl ServeFiles {
             return None;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some((file, metadata, content_type)) = self.cache.get(sub, &metadata) {
-            return Some((joined, file, metadata, Some(content_type)));
+        if let Some((file, metadata, headers)) = self.cache.get(sub, &metadata) {
+            return Some((joined, file, metadata, Some(headers)));
         }
         let file = self.open_uncached(sub, &joined)?;
         // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
@@ -170,43 +186,72 @@ impl ServeFiles {
         // 路径解析直接在 worker 上做：只有 lstat + openat2，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
-        let Some((path, file, metadata, cached_type)) = self.open(sub) else {
+        let Some((path, file, metadata, cached)) = self.open(sub) else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
+        let missed = cached.is_none();
 
         // 关闭 NamedFile 的小文件预读：预读会把内容读进用户态，而 sendfile 直接从页缓存发，
         // 那次读纯属浪费；关掉后所有响应体都交给 sendfile，HEAD 本来也不需要预读
         let mut builder = NamedFile::builder(path).preload_threshold(0);
-        let missed = cached_type.is_none();
         // 缓存命中时把上次解析好的类型直接交给它：需要 charset 的类型因此不必再读一次样本
-        if let Some(content_type) = cached_type {
-            builder = builder.content_type(content_type);
+        if let Some(cached) = &cached {
+            builder = builder.content_type(cached.content_type.clone());
         }
         // 元数据跟着缓存一起给出来（未命中时是刚 fstat 的），所以这里不必再 fstat 一次
-        let Ok(named_file) = builder
+        let Ok(mut named_file) = builder
             .build_from_file_with_metadata(Arc::clone(&file), metadata.clone())
             .await
         else {
             res.render(StatusError::internal_server_error().brief("read file failed"));
             return;
         };
-        // 未命中：把 fd、它的元数据和刚解析出来的类型一起存进缓存
+        // 命中时连 ETag 与 Content-Disposition 也一起复用：这两项同样只由（路径, 元数据,
+        // 类型）决定，命中既然要求元数据逐项一致，缓存里那份就是这次该发的那份。
+        // 未命中则在这里按同一份元数据算一次 ETag 交给它，既省掉它在 send 里再算一遍，
+        // 也留一份给下面写缓存，不必再从响应头里解析回来
+        let etag = match &cached {
+            Some(cached) => cached.etag.clone(),
+            None => named_file.etag(),
+        };
+        if let Some(etag) = etag.clone() {
+            named_file.set_etag(etag);
+        }
+        if let Some(disposition) = cached
+            .as_ref()
+            .and_then(|cached| cached.disposition.clone())
+        {
+            named_file.set_content_disposition(disposition);
+        }
+        // send 会消费掉 named_file，未命中时要写进缓存的那份类型得先取出来
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let resolved_type = named_file.content_type().clone();
+        let head_only = req.method() == Method::HEAD;
+        if head_only {
+            named_file.send_head(req.headers(), res).await;
+        } else {
+            named_file.send(req.headers(), res).await;
+        }
+
+        // 未命中：把 fd、它的元数据、刚解析出来的类型，以及刚编码好的 ETag 与
+        // Content-Disposition 一起存进缓存，下次命中就不必再算一遍
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if missed {
             self.cache.insert(
                 sub,
                 Arc::clone(&file),
                 metadata,
-                named_file.content_type().clone(),
+                CachedHeaders {
+                    content_type: resolved_type,
+                    etag,
+                    disposition: res.headers().get(CONTENT_DISPOSITION).cloned(),
+                },
             );
         }
-        if req.method() == Method::HEAD {
-            named_file.send_head(req.headers(), res).await;
+        if head_only {
             return;
         }
-
-        named_file.send(req.headers(), res).await;
 
         // 命中条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
         // 这里不再 dup：响应体直接共享缓存里那个 fd（sendfile 带显式 offset，共享描述符是安全的）
@@ -339,7 +384,8 @@ mod tests {
         Ok(())
     }
 
-    /// 缓存命中时 `open` 要把 fd、元数据与类型一起给出来，构建时不再 fstat、也不再读嗅探样本
+    /// 缓存命中时 `open` 要把 fd、元数据与已经编码好的响应头一起给出来：构建时不再 fstat、
+    /// 不再读嗅探样本，也不再重算 `ETag` 与 `Content-Disposition`
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn cache_hit_reuses_the_open_file() -> std::io::Result<()> {
@@ -357,13 +403,33 @@ mod tests {
                     .build_from_file_with_metadata(Arc::clone(&file), metadata.clone())
                     .await
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                files
-                    .cache
-                    .insert("ok.txt", file, metadata, named.content_type().clone());
+                let Ok(etag) = "\"ok-1\"".parse::<ETag>() else {
+                    unreachable!("写死的 ETag 应当能解析");
+                };
+                let disposition = HeaderValue::from_static("inline");
+                files.cache.insert(
+                    "ok.txt",
+                    file,
+                    metadata,
+                    CachedHeaders {
+                        content_type: named.content_type().clone(),
+                        etag: Some(etag.clone()),
+                        disposition: Some(disposition.clone()),
+                    },
+                );
                 let Some((_, _, _, cached)) = files.open("ok.txt") else {
                     panic!("第二次应当打开成功");
                 };
-                assert!(cached.is_some(), "第二次应当命中并带上缓存的类型");
+                let Some(cached) = cached else {
+                    panic!("第二次应当命中");
+                };
+                assert_eq!(cached.content_type, *named.content_type());
+                assert_eq!(cached.etag, Some(etag), "命中时 ETag 也从缓存来");
+                assert_eq!(
+                    cached.disposition,
+                    Some(disposition),
+                    "命中时 Content-Disposition 也从缓存来"
+                );
                 Ok::<(), std::io::Error>(())
             })
     }

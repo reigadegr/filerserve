@@ -194,6 +194,9 @@ pub struct NamedFile {
     content_encoding: Option<HeaderValue>,
     /// Pre-read content for small files, avoiding ChunkedFile + spawn_blocking overhead.
     preread: Option<Bytes>,
+    /// 调用方已经算好的 `ETag`：命中缓存时由 [`NamedFile::set_etag`] 给出，
+    /// 这样每请求就不必再 `format!` 一次再解析回来。
+    etag_override: Option<ETag>,
 }
 
 /// Builder for constructing [`NamedFile`] instances with custom configuration.
@@ -572,6 +575,7 @@ impl NamedFileBuilder {
             buffer_size: buf_size,
             flags,
             preread,
+            etag_override: None,
         })
     }
 }
@@ -874,6 +878,15 @@ impl NamedFile {
         }
     }
 
+    /// 复用调用方已经算好的 `ETag`。
+    ///
+    /// `ETag` 只由元数据（inode、长度、mtime）决定，调用方按同一份元数据把它缓存下来之后，
+    /// 命中时就不必每请求再格式化一次再解析回来。传入的值必须与这份元数据一致。
+    #[inline]
+    pub fn set_etag(&mut self, etag: ETag) {
+        self.etag_override = Some(etag);
+    }
+
     /// Get last modified value.
     #[inline]
     pub fn last_modified(&self) -> Option<SystemTime> {
@@ -917,8 +930,9 @@ impl NamedFile {
     }
 
     async fn send_inner(mut self, req_headers: &HeaderMap, res: &mut Response, send_body: bool) {
+        // 调用方给了算好的 ETag 就用它，否则按这份元数据现算
         let etag = if self.flags.contains(Flag::Etag) {
-            self.etag()
+            self.etag_override.take().or_else(|| self.etag())
         } else {
             None
         };
@@ -1568,6 +1582,35 @@ mod tests {
                 .starts_with("text/plain")
         );
         assert!(res.body.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_etag_is_sent_instead_of_the_computed_one() {
+        use salvo::http::header::ETAG;
+        use salvo::http::{HeaderMap, Response};
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("hello.txt");
+        std::fs::write(&path, b"hello").expect("write file");
+
+        let mut named = NamedFile::builder(&path)
+            .preload_threshold(0)
+            .build()
+            .await
+            .expect("build named file");
+        let computed = named.etag().expect("regular file has an etag");
+        let reused = "\"cached-1\"".parse::<ETag>().expect("parse etag");
+        named.set_etag(reused.clone());
+        let mut res = Response::new();
+        named.send_head(&HeaderMap::new(), &mut res).await;
+
+        assert_ne!(computed, reused, "复用的 ETag 得与现算的不一样才有意义");
+        assert_eq!(
+            res.headers().typed_get::<ETag>(),
+            Some(reused),
+            "调用方给的 ETag 必须盖掉现算的那个"
+        );
+        assert_eq!(res.headers().get(ETAG).unwrap(), "\"cached-1\"");
     }
 
     #[tokio::test]
