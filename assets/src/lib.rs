@@ -26,6 +26,9 @@ struct ServeFiles {
     /// root 的目录 fd：`openat2` 相对它解析路径，越界由内核直接拦下
     #[cfg(any(target_os = "linux", target_os = "android"))]
     root_fd: Option<Arc<OwnedFd>>,
+    /// 是否允许调用 `openat2`：装了 seccomp filter 的环境里它不在白名单，调用即被 SIGSYS 杀死
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    openat2_allowed: bool,
 }
 
 impl ServeFiles {
@@ -40,6 +43,8 @@ impl ServeFiles {
             )
             .ok()
             .map(Arc::new),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            openat2_allowed: !seccomp_filter_installed(),
             root,
         }
     }
@@ -48,9 +53,10 @@ impl ServeFiles {
     ///
     /// 先用 `symlink_metadata` 判断类型，符号链接不会被当作文件服务；
     /// 再让内核用一次 `openat2(RESOLVE_BENEATH)` 同时完成路径解析、越界检查与打开，
-    /// 省掉 `canonicalize` 对每一层路径各一次的 `readlink`。`openat2` 不可用时
-    /// （旧内核、被 SELinux/seccomp 拦截等）回退到原来的 canonicalize 逻辑，
-    /// 因此对外行为与改动前一致。
+    /// 省掉 `canonicalize` 对每一层路径各一次的 `readlink`。装了 seccomp filter 的环境
+    /// （Android）根本不调用 `openat2`（调用会被 SIGSYS 杀掉进程，见
+    /// [`seccomp_filter_installed`]），旧内核上它会返回错误，两种情况都回退到
+    /// canonicalize，因此对外行为与改动前一致。
     fn open(&self, sub: &str) -> Option<(PathBuf, File)> {
         let joined = self.root.join(sub);
         let metadata = std::fs::symlink_metadata(&joined).ok()?;
@@ -58,7 +64,9 @@ impl ServeFiles {
             return None;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(file) = self.root_fd.as_ref().and_then(|fd| open_beneath(fd, sub)) {
+        if self.openat2_allowed
+            && let Some(file) = self.root_fd.as_ref().and_then(|fd| open_beneath(fd, sub))
+        {
             return Some((joined, file));
         }
         open_via_canonicalize(&self.root, &joined).map(|file| (joined, file))
@@ -89,6 +97,29 @@ fn open_via_canonicalize(root: &Path, joined: &Path) -> Option<File> {
         return None;
     }
     File::open(canonical).ok()
+}
+
+/// 判断当前进程是否装了 seccomp filter（`SECCOMP_MODE_FILTER`）。
+///
+/// Android 的 `untrusted_app` 域由 zygote 装一个系统调用白名单 filter，不在白名单里的调用
+/// 会被 `SECCOMP_RET_TRAP` 处理：内核直接发 SIGSYS 杀掉进程，而不是返回错误码——手机上实测
+/// `openat2` 就是这样（`si_code=1` 即 `SYS_SECCOMP`，进程立即终止），"失败就回退"来不及生效。
+/// 读不到状态时按"装了"处理：猜错的代价是进程被杀。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn seccomp_filter_installed() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return true;
+    };
+    has_seccomp_filter(&status)
+}
+
+/// `/proc/self/status` 里 `Seccomp:` 为 2 即 `SECCOMP_MODE_FILTER`
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn has_seccomp_filter(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.strip_prefix("Seccomp:")
+            .is_some_and(|value| value.trim() == "2")
+    })
 }
 
 #[handler]
@@ -218,6 +249,18 @@ mod tests {
             "回退路径必须能打开普通文件"
         );
         Ok(())
+    }
+
+    /// 手机上实测的 /proc/self/status 片段：`Seccomp:` 为 2 表示装了 filter，必须放弃 openat2
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn detects_seccomp_filter() {
+        assert!(has_seccomp_filter(
+            "Name:\tlanfile\nSeccomp:\t2\nSeccomp_filters:\t1\n"
+        ));
+        assert!(!has_seccomp_filter("Name:\tlanfile\nSeccomp:\t0\n"));
+        // 只有 `Seccomp:` 字段本身算数，`Seccomp_filters:` 不算
+        assert!(!has_seccomp_filter("Seccomp_filters:\t1\n"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
