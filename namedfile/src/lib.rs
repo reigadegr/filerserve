@@ -72,7 +72,7 @@ use salvo::http::mime::{detect_text_mime, fill_mime_charset_if_need, is_charset_
 use salvo::http::{HttpRange, Response, StatusCode, StatusError};
 use salvo::{Error, Result};
 
-use crate::chunked_file::{ChunkedFile, ChunkedState};
+use crate::chunked_file::{ChunkedFile, ChunkedState, LazyFile};
 
 const CHUNK_SIZE: u64 = 1024 * 1024;
 const PRELOAD_THRESHOLD: u64 = 1024 * 1024;
@@ -1077,16 +1077,12 @@ impl NamedFile {
                 let start = cmp::min(offset as usize, end);
                 res.replace_body(ResBody::Once(preread.slice(start..end)));
             } else {
-                // 回退到普通响应体：它要独占句柄并按偏移 seek，只有这条路才复制一份
-                let Ok(file) = self.file.try_clone() else {
-                    res.render(StatusError::internal_server_error());
-                    return;
-                };
+                // 回退到普通响应体。句柄按需惰性复制：走 sendfile 时这次 dup 不会发生
                 let reader = ChunkedFile {
                     offset,
                     total_size,
                     read_size: 0,
-                    state: ChunkedState::File(Some(file)),
+                    state: ChunkedState::File(Some(LazyFile::new(Arc::clone(&self.file)))),
                     buffer_size: self.buffer_size,
                 };
                 res.stream(reader);
@@ -1104,14 +1100,10 @@ impl NamedFile {
             if let Some(preread) = self.preread.take() {
                 res.replace_body(ResBody::Once(preread));
             } else {
-                // 回退到普通响应体：它要独占句柄并按偏移 seek，只有这条路才复制一份
-                let Ok(file) = self.file.try_clone() else {
-                    res.render(StatusError::internal_server_error());
-                    return;
-                };
+                // 回退到普通响应体。句柄按需惰性复制：走 sendfile 时这次 dup 不会发生
                 let reader = ChunkedFile {
                     offset,
-                    state: ChunkedState::File(Some(file)),
+                    state: ChunkedState::File(Some(LazyFile::new(Arc::clone(&self.file)))),
                     total_size: length,
                     read_size: 0,
                     buffer_size: self.buffer_size,

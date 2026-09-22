@@ -1,7 +1,9 @@
 use std::cmp;
 use std::fmt::{self, Debug, Formatter};
+use std::fs::File;
 use std::io::{self, Error as IoError, ErrorKind, Read, Result as IoResult, Seek};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
@@ -57,6 +59,46 @@ pub struct ChunkedFile<T> {
     pub(crate) offset: u64,
     pub(crate) state: ChunkedState<T>,
 }
+/// 惰性复制句柄：只有真正开始读文件时才 `dup`。
+///
+/// `/files` 的正常路径会把响应体整个换成 `sendfile`，此时 `ChunkedFile` 一次都不会被 poll，
+/// 也就不该为它先付一次 `dup` + `close`。
+pub(crate) struct LazyFile {
+    source: Option<Arc<File>>,
+    owned: Option<File>,
+}
+
+impl LazyFile {
+    pub(crate) fn new(file: Arc<File>) -> Self {
+        Self {
+            source: Some(file),
+            owned: None,
+        }
+    }
+
+    fn owned(&mut self) -> IoResult<&mut File> {
+        if let Some(source) = self.source.take() {
+            self.owned = Some(source.try_clone()?);
+        }
+        match self.owned.as_mut() {
+            Some(file) => Ok(file),
+            None => Err(IoError::other("`LazyFile` has no handle")),
+        }
+    }
+}
+
+impl Read for LazyFile {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        self.owned()?.read(buf)
+    }
+}
+
+impl Seek for LazyFile {
+    fn seek(&mut self, pos: io::SeekFrom) -> IoResult<u64> {
+        self.owned()?.seek(pos)
+    }
+}
+
 impl<T> Debug for ChunkedFile<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ChunkedFile")
@@ -112,5 +154,34 @@ where
                 Poll::Ready(Some(Ok(bytes)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn lazy_file_duplicates_only_when_it_starts_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lazy.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let shared = Arc::new(File::open(&path).unwrap());
+        let mut lazy = LazyFile::new(Arc::clone(&shared));
+        assert!(lazy.owned.is_none(), "构造时不应复制句柄");
+
+        let mut text = String::new();
+        lazy.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "hello");
+        assert!(lazy.owned.is_some(), "开始读之后才复制句柄");
+
+        // 复制出来的句柄共享同一个 file description，偏移量可以独立设置
+        assert_eq!(lazy.seek(io::SeekFrom::Start(1)).unwrap(), 1);
+        let mut rest = String::new();
+        lazy.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "ello");
     }
 }
