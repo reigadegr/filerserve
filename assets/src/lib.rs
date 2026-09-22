@@ -163,12 +163,14 @@ fn has_seccomp_filter(status: &str) -> bool {
 impl ServeFiles {
     #[allow(clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        let sub = req.param::<String>("path").unwrap_or_default();
+        // 直接从路由参数里借一个 &str：`param::<String>` 会为每个请求分配一个 String，
+        // 再走一遍 serde 反序列化；通配参数就在这里，借出来就够了
+        let sub = req.params().get("path").map_or("", String::as_str);
 
         // 路径解析直接在 worker 上做：只有 lstat + openat2，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
-        let Some((path, file, metadata, cached_type)) = self.open(&sub) else {
+        let Some((path, file, metadata, cached_type)) = self.open(sub) else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
@@ -193,7 +195,7 @@ impl ServeFiles {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if missed {
             self.cache.insert(
-                &sub,
+                sub,
                 Arc::clone(&file),
                 metadata,
                 named_file.content_type().clone(),
