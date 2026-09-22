@@ -85,8 +85,17 @@ impl ServeFiles {
     /// （Android）根本不调用 `openat2`（调用会被 SIGSYS 杀掉进程，见
     /// [`seccomp_filter_installed`]），旧内核上它会返回错误，两种情况都回退到 canonicalize，
     /// 因此对外行为与改动前一致。
+    ///
+    /// 校验结果在 `REVALIDATE_MILLIS`（1 秒）内直接复用：这段时间里连上面那次
+    /// `symlink_metadata` 都不做，所以文件被改写、替换或删除后，最长 1 秒内仍按上一次校验过的
+    /// 元数据与 fd 响应。
     fn open(&self, sub: &str) -> Option<(PathBuf, Arc<File>, Metadata, Option<CachedHeaders>)> {
         let joined = self.root.join(sub);
+        // 有效期内的快路径：连 `symlink_metadata` 都省掉（本机 1.03 µs，占每请求 CPU 的 3%）
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some((file, metadata, headers)) = self.cache.get_fresh(sub) {
+            return Some((joined, file, metadata, Some(headers)));
+        }
         let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
             // 路径已经不存在了，顺手把缓存里占着的 fd 放掉
             #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -6,9 +6,17 @@
 //! 一次 `dup`：手机上每请求能省下 8 次系统调用（见 target/bench-lock.md 第 20 节）。
 //!
 //! 缓存里存的是 **fd 而不是内容**，读到的永远是文件当前的内容；命中要求 `(ino, size, mtime)`
-//! 与请求时 `lstat` 到的元数据完全一致，所以文件被改动、替换或删除都会立刻未命中并重新解析。
-//! 因此缓存不会让响应变旧：`Content-Length`、`Last-Modified`、`ETag` 都取自这份元数据，
-//! 而它正是命中时那个 fd 自己的 `fstat` 结果。
+//! 与请求时 `lstat` 到的元数据完全一致，所以文件被改动、替换或删除都会未命中并重新解析。
+//! `Content-Length`、`Last-Modified`、`ETag` 都取自这份元数据，而它正是命中时那个 fd 自己的
+//! `fstat` 结果。
+//!
+//! 那次校验用的 `lstat` 是每请求一次系统调用，在这台没有 TSC 的机器上要 1.03 µs（占每请求
+//! CPU 的 3%）。所以校验结果带一个 [`REVALIDATE_MILLIS`] 的时间戳：这段时间内同一路径直接
+//! 返回缓存，连 `lstat` 都不做；过期后第一个请求重新校验并把时间戳刷新回来。代价是最多这么长
+//! 的陈旧窗口——文件被原地改写或被 rename 替换后，最长这段时间内仍按旧元数据与旧 fd 响应。
+//! 其中"原地改写"会让 `Content-Length` 与正文长度对不上：文件在有效期内被截断时，客户端会
+//! 收到一个短正文并看到连接被关闭。校验与发送之间本来就有同类竞态，TTL 只是把这个窗口从微秒
+//! 级拉宽到最长 1 秒。
 //!
 //! 并发上用 [`SHARDS`] 把一把全局锁拆成多把：路径按哈希固定落在其中一片，请求只在这一片上
 //! 竞争，锁里只做查找与拷贝。条目与响应体共享同一个 fd（`Arc<File>`），命中与写入都不再
@@ -33,6 +41,23 @@ const SHARDS: usize = 16;
 /// 每片的条目上限（总数 512 不变）：fd 数量必须有硬上限
 const CAPACITY_PER_SHARD: usize = 32;
 
+/// 校验结果的有效期（毫秒）：这段时间内同一路径不再 `lstat`。
+///
+/// 每请求一次 `statx` 在这台机器上要 1.03 µs，而下面这个 coarse 时钟只要 3 ns，所以只要一个
+/// 文件在有效期内被请求两次以上，省下的就远多于多读一次时钟。取 1 秒是"陈旧窗口"与"校验
+/// 频率"的折中：热文件每秒校验一次，与访问频率无关（NFS 默认的属性缓存是 3~60 秒）。
+const REVALIDATE_MILLIS: i64 = 1000;
+
+/// 单调粗时钟的毫秒值。
+///
+/// 必须用 coarse 变体：这台机器没有 TSC，非 coarse 的 `clock_gettime` 走不了 vDSO 的快路径
+/// （实测 1.2 µs，比它要省掉的那次 `statx` 还贵），coarse 变体直接读 vvar（实测 3 ns）。
+/// 单调时钟不会被改表，时间戳只会前进，两次读之间的差不会为负。
+fn now_millis() -> i64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicCoarse);
+    now.tv_sec * 1000 + now.tv_nsec / 1_000_000
+}
+
 struct Entry {
     /// 与响应体共享的 fd：命中时只克隆 `Arc`，不再 `dup`
     file: Arc<File>,
@@ -41,6 +66,9 @@ struct Entry {
     headers: CachedHeaders,
     /// 最近一次被用到的序号，淘汰时取最小的那条
     used: u64,
+    /// 最近一次校验（[`FileCache::get`]）或写入（[`FileCache::insert`]）的时刻，
+    /// 用来判断这个条目是否还在 [`REVALIDATE_MILLIS`] 的有效期内
+    validated_at: i64,
 }
 
 /// 一片：条目表 + 该片自己的 LRU 序号（片内单调递增，不需要原子操作）
@@ -63,14 +91,43 @@ fn shard_index(path: &str) -> usize {
     (hasher.finish() as usize) % SHARDS
 }
 
+/// 从命中的条目里取出要交出去的三样东西，并刷新它的 LRU 序号
+fn take(entry: &mut Entry, clock: u64) -> (Arc<File>, Metadata, CachedHeaders) {
+    entry.used = clock;
+    // 锁里只做拷贝：克隆 Arc、元数据与已经编码好的响应头，没有任何系统调用
+    (
+        Arc::clone(&entry.file),
+        entry.metadata.clone(),
+        entry.headers.clone(),
+    )
+}
+
 impl FileCache {
     fn shard(&self, path: &str) -> &Mutex<Shard> {
         &self.shards[shard_index(path)]
     }
 
+    /// 还在有效期内就直接命中：连 `lstat` 都不做，省掉每请求一次系统调用。
+    ///
+    /// 这里**不刷新**时间戳：否则持续被请求的热文件永远等不到复校验，陈旧窗口就成了无界。
+    /// 复校验由 [`Self::get`] 做，它命中时会把时间戳刷新到当前时刻。
+    #[must_use]
+    pub fn get_fresh(&self, path: &str) -> Option<(Arc<File>, Metadata, CachedHeaders)> {
+        let mut shard = self.shard(path).lock().ok()?;
+        shard.clock += 1;
+        let clock = shard.clock;
+        let entry = shard.entries.get_mut(path)?;
+        if now_millis() - entry.validated_at >= REVALIDATE_MILLIS {
+            return None;
+        }
+        let hit = take(entry, clock);
+        drop(shard);
+        Some(hit)
+    }
+
     /// 命中时返回独立的 fd、它的元数据与已经编码好的响应头，调用方会把 fd 交给 `NamedFile` 消费掉。
     ///
-    /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中。
+    /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中；命中即刷新有效期。
     #[must_use]
     pub fn get(
         &self,
@@ -88,12 +145,10 @@ impl FileCache {
         {
             return None;
         }
-        entry.used = clock;
-        // 锁里只做拷贝：克隆 Arc、元数据与已经编码好的响应头，没有任何系统调用
-        let file = Arc::clone(&entry.file);
-        let (metadata, headers) = (entry.metadata.clone(), entry.headers.clone());
+        entry.validated_at = now_millis();
+        let hit = take(entry, clock);
         drop(shard);
-        Some((file, metadata, headers))
+        Some(hit)
     }
 
     /// 未命中时把刚打开并已 `fstat` 的文件放进缓存：缓存自己留一份 fd，调用方那份继续用。
@@ -125,6 +180,7 @@ impl FileCache {
                 metadata,
                 headers,
                 used: clock,
+                validated_at: now_millis(),
             },
         );
     }
@@ -331,6 +387,46 @@ mod tests {
         cache.insert("file.txt", Arc::new(file), metadata, headers());
         cache.remove("file.txt");
         assert!(cache.get("file.txt", &fixture.lstat()?).is_none());
+        Ok(())
+    }
+
+    /// 有效期内不再校验；过期后回到逐次校验，而校验命中会把有效期刷新回来
+    #[test]
+    fn revalidates_at_most_once_per_interval() -> std::io::Result<()> {
+        let fixture = Fixture::new("ttl")?;
+        let cache = FileCache::default();
+        let (file, metadata) = fixture.open()?;
+        let path = "file.txt";
+        cache.insert(path, Arc::new(file), metadata, headers());
+
+        assert!(
+            cache.get_fresh(path).is_some(),
+            "刚写入的条目应当在有效期内"
+        );
+        assert!(cache.get_fresh("other.txt").is_none(), "路径不同不该命中");
+
+        // 把时间戳往回拨到有效期的另一侧，等价于"1 秒过去了"
+        let Some(mut shard) = cache.shard(path).lock().ok() else {
+            unreachable!("锁不会中毒");
+        };
+        let Some(entry) = shard.entries.get_mut(path) else {
+            unreachable!("刚插入的条目必须还在");
+        };
+        entry.validated_at -= REVALIDATE_MILLIS;
+        drop(shard);
+
+        assert!(
+            cache.get_fresh(path).is_none(),
+            "过了有效期就不该再走快路径"
+        );
+        assert!(
+            cache.get(path, &fixture.lstat()?).is_some(),
+            "元数据没变，逐次校验应当命中"
+        );
+        assert!(
+            cache.get_fresh(path).is_some(),
+            "校验命中应当把有效期刷新回来"
+        );
         Ok(())
     }
 
