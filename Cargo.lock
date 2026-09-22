@@ -881,6 +881,7 @@ dependencies = [
  "lanfile-list",
  "lanfile-sendfile",
  "mimalloc",
+ "rustix",
  "salvo",
  "serde_json",
  "tokio",
