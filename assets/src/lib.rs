@@ -215,8 +215,8 @@ impl ServeFiles {
             Some(cached) => cached.etag.clone(),
             None => named_file.etag(),
         };
-        if let Some(etag) = etag.clone() {
-            named_file.set_etag(etag);
+        if let Some(etag) = &etag {
+            named_file.set_etag(etag.clone());
         }
         if let Some(disposition) = cached
             .as_ref()
