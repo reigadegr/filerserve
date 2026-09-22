@@ -9,42 +9,75 @@
 //! 与请求时 `lstat` 到的元数据完全一致，所以文件被改动、替换或删除都会立刻未命中并重新解析。
 //! 因此缓存不会让响应变旧：`Content-Length`、`Last-Modified`、`ETag` 都取自这份元数据，
 //! 而它正是命中时那个 fd 自己的 `fstat` 结果。
+//!
+//! 并发上用 [`SHARDS`] 把一把全局锁拆成多把：路径按哈希固定落在其中一片，请求只在这一片上
+//! 竞争；片内的 `dup` 是系统调用，一律挪到锁外，锁里只做查找与拷贝。
+//!
+//! 淘汰按 LRU：每片记一个自增序号，命中时刷新该条的序号，满了就淘汰序号最小的那条。每片只有
+//! [`CAPACITY_PER_SHARD`] 条，线性扫一遍比维护链表简单得多；也避免了"满了全清"把热文件一起
+//! 丢掉——下载大量不同文件时，全清会让命中率归零，缓存反而比不缓存慢（见第 23 节）。
 
 use std::{
     collections::HashMap,
     fs::{File, Metadata},
+    hash::{Hash, Hasher},
     os::unix::fs::MetadataExt,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use lanfile_sendfile::duplicate_file;
 use mime::Mime;
 
-/// 条目上限，超过就整体清空：fd 数量必须有硬上限，宁可全部丢弃也不能耗光描述符。
-const CAPACITY: usize = 512;
+/// 分片数：把一把全局锁拆成 16 把
+const SHARDS: usize = 16;
+/// 每片的条目上限（总数 512 不变）：fd 数量必须有硬上限
+const CAPACITY_PER_SHARD: usize = 32;
 
 struct Entry {
-    file: File,
+    /// 缓存自己持有的一份 fd；命中时克隆这个 `Arc`，`dup` 在锁外做
+    file: Arc<File>,
     /// 这个 fd 自己的 `fstat` 结果，命中时直接交给 `NamedFile`，省掉每请求一次 `fstat`
     metadata: Metadata,
     /// 解析出来的 `Content-Type`（需要时已带上 `charset=`），命中时省掉嗅探的那次 `pread`
     content_type: Mime,
+    /// 最近一次被用到的序号，淘汰时取最小的那条
+    used: u64,
 }
 
-/// 请求路径 -> 已打开的文件。
+/// 一片：条目表 + 该片自己的 LRU 序号（片内单调递增，不需要原子操作）
+#[derive(Default)]
+struct Shard {
+    entries: HashMap<Box<str>, Entry>,
+    clock: u64,
+}
+
+/// 请求路径 -> 已打开的文件。分片后每片一把锁。
 #[derive(Default)]
 pub struct FileCache {
-    entries: Mutex<HashMap<Box<str>, Entry>>,
+    shards: [Mutex<Shard>; SHARDS],
+}
+
+/// 路径落在哪一片：同一路径永远落在同一片
+fn shard_index(path: &str) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    (hasher.finish() as usize) % SHARDS
 }
 
 impl FileCache {
+    fn shard(&self, path: &str) -> &Mutex<Shard> {
+        &self.shards[shard_index(path)]
+    }
+
     /// 命中时返回独立的 fd 及它的元数据与 `Content-Type`，调用方会把 fd 交给 `NamedFile` 消费掉。
     ///
     /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中。
     #[must_use]
     pub fn get(&self, path: &str, metadata: &Metadata) -> Option<(File, Metadata, Mime)> {
-        let entries = self.entries.lock().ok()?;
-        let entry = entries.get(path)?;
+        let mut shard = self.shard(path).lock().ok()?;
+        shard.clock += 1;
+        let clock = shard.clock;
+        let entry = shard.entries.get_mut(path)?;
         if entry.metadata.ino() != metadata.ino()
             || entry.metadata.len() != metadata.len()
             || (entry.metadata.mtime(), entry.metadata.mtime_nsec())
@@ -52,9 +85,12 @@ impl FileCache {
         {
             return None;
         }
-        let file = duplicate_file(&entry.file)?;
+        entry.used = clock;
+        // 锁里只做拷贝，`dup` 是系统调用，放到锁外
+        let file = Arc::clone(&entry.file);
         let (metadata, content_type) = (entry.metadata.clone(), entry.content_type.clone());
-        drop(entries);
+        drop(shard);
+        let file = duplicate_file(&file)?;
         Some((file, metadata, content_type))
     }
 
@@ -63,30 +99,52 @@ impl FileCache {
     /// `metadata` 必须是这个 fd 自己的 `fstat` 结果（而不是路径的 `lstat`）：命中时它会被
     /// 直接当作文件的元数据使用，两者必须是同一个 inode 的属性。
     pub fn insert(&self, path: &str, file: &File, metadata: Metadata, content_type: Mime) {
-        let Ok(mut entries) = self.entries.lock() else {
-            return;
-        };
-        if entries.len() >= CAPACITY {
-            entries.clear();
-        }
+        // `dup` 是系统调用，放在锁外
         let Some(cached) = duplicate_file(file) else {
             return;
         };
-        entries.insert(
+        let Ok(mut shard) = self.shard(path).lock() else {
+            return;
+        };
+        shard.clock += 1;
+        let clock = shard.clock;
+        // 满了就淘汰最久没被用到的那条，而不是把整片清空
+        if shard.entries.len() >= CAPACITY_PER_SHARD && !shard.entries.contains_key(path) {
+            let oldest = shard
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                shard.entries.remove(&oldest);
+            }
+        }
+        shard.entries.insert(
             path.into(),
             Entry {
-                file: cached,
+                file: Arc::new(cached),
                 metadata,
                 content_type,
+                used: clock,
             },
         );
     }
 
     /// 路径已经不存在了，顺手把占着的 fd 放掉。
     pub fn remove(&self, path: &str) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(path);
+        if let Ok(mut shard) = self.shard(path).lock() {
+            shard.entries.remove(path);
         }
+    }
+
+    /// 总条目数，只有测试用得到
+    #[cfg(test)]
+    fn total_len(&self) -> usize {
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.lock().ok())
+            .map(|shard| shard.entries.len())
+            .sum()
     }
 }
 
@@ -223,6 +281,67 @@ mod tests {
         cache.insert("file.txt", &file, metadata, text_plain());
         cache.remove("file.txt");
         assert!(cache.get("file.txt", &fixture.lstat()?).is_none());
+        Ok(())
+    }
+
+    /// 路径数量远超容量时，条目总数必须有硬上限，且最后插入的那条仍然在
+    #[test]
+    fn stays_bounded_under_many_paths() -> std::io::Result<()> {
+        let fixture = Fixture::new("bound")?;
+        let cache = FileCache::default();
+        let (file, metadata) = fixture.open()?;
+        for i in 0..2000 {
+            cache.insert(&format!("path-{i}"), &file, metadata.clone(), text_plain());
+        }
+        assert!(
+            cache.total_len() <= SHARDS * CAPACITY_PER_SHARD,
+            "条目总数不能超过上限"
+        );
+        assert!(
+            cache.get("path-1999", &fixture.lstat()?).is_some(),
+            "最后插入的那条必须还在"
+        );
+        Ok(())
+    }
+
+    /// 淘汰的是最久没被用到的那条，而不是把整片清空
+    #[test]
+    fn evicts_the_least_recently_used() -> std::io::Result<()> {
+        let fixture = Fixture::new("lru")?;
+        let cache = FileCache::default();
+        let (file, metadata) = fixture.open()?;
+        // 凑够同一片里的 CAPACITY_PER_SHARD + 1 条路径，把这一片填满
+        let shard = shard_index("same-shard-0");
+        let mut paths = Vec::new();
+        let mut i = 0;
+        while paths.len() <= CAPACITY_PER_SHARD {
+            let path = format!("same-shard-{i}");
+            if shard_index(&path) == shard {
+                paths.push(path);
+            }
+            i += 1;
+        }
+        let target = paths[0].clone();
+        let Some(extra) = paths.pop() else {
+            unreachable!("至少有一条用于触发淘汰");
+        };
+        for path in &paths {
+            cache.insert(path, &file, metadata.clone(), text_plain());
+        }
+        assert!(
+            cache.get(&target, &fixture.lstat()?).is_some(),
+            "刚插入的应当命中"
+        );
+
+        cache.insert(&extra, &file, metadata, text_plain());
+        assert!(
+            cache.get(&target, &fixture.lstat()?).is_some(),
+            "刚用过的不能被淘汰"
+        );
+        assert!(
+            cache.get(&paths[1], &fixture.lstat()?).is_none(),
+            "最久没被用到的应当被淘汰"
+        );
         Ok(())
     }
 }
