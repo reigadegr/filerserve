@@ -90,8 +90,11 @@ impl ServeFiles {
         let metadata = file.metadata().ok()?;
         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回。
         // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以只在未命中时调一次。
+        // 一页以内的文件整个读完也只有一页，预读窗口开多大结果都一样，这次系统调用可以省掉。
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
+        if metadata.len() > 4096 {
+            let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
+        }
         Some((joined, Arc::new(file), metadata, None))
     }
 
