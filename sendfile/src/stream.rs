@@ -132,7 +132,9 @@ pub struct SendfileStream<S> {
     /// Head bytes taken from Hyper but not yet accepted by the socket.
     owed: Vec<u8>,
     plan: Option<Plan>,
-    conn: ConnKey,
+    /// `Some` 时 `Drop` 会从 registry 注销；快路径直接握着槽位，从不查 registry，
+    /// 用 `None` 跳过 register/unregister 的两次 Mutex 锁。
+    conn: Option<ConnKey>,
 }
 
 impl<S> SendfileStream<S> {
@@ -145,14 +147,32 @@ impl<S> SendfileStream<S> {
             state: State::Idle,
             owed: Vec::new(),
             plan: None,
-            conn,
+            conn: Some(conn),
+        }
+    }
+
+    /// 构造不注册到全局 registry 的流。
+    ///
+    /// 快路径在 `FastService` 里直接握着 `SendfileSlot`，从不走 `slot_for` 查 registry，
+    /// 所以注册条目永远不会被查到，register/unregister 的两次 Mutex 锁是纯浪费。
+    #[must_use]
+    pub const fn new_unregistered(inner: S, slot: Arc<SendfileSlot>) -> Self {
+        Self {
+            inner,
+            slot,
+            state: State::Idle,
+            owed: Vec::new(),
+            plan: None,
+            conn: None,
         }
     }
 }
 
 impl<S> Drop for SendfileStream<S> {
     fn drop(&mut self) {
-        registry::unregister(self.conn);
+        if let Some(conn) = self.conn {
+            registry::unregister(conn);
+        }
     }
 }
 

@@ -298,7 +298,10 @@ impl ServeFiles {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let resolved_type = cached.is_none().then(|| named_file.content_type());
         let head_only = req.method() == Method::HEAD;
-        if head_only {
+        // 有 sendfile 槽位时只写响应头，不构造 ChunkedFile 响应体：
+        // upgrade_response_with_slot 会立刻用 SendfileBody 替换它，构造了也是丢掉。
+        // 非 Linux/Android 上 arm() 恒返回 None，仍需 send() 留下回退响应体。
+        if head_only || (slot.is_some() && cfg!(any(target_os = "linux", target_os = "android"))) {
             named_file.send_head(req.headers(), res).await;
         } else {
             named_file.send(req.headers(), res).await;

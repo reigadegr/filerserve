@@ -14,7 +14,7 @@
 use std::{borrow::Cow, future::Future, io, path::PathBuf, pin::Pin, sync::Arc};
 
 use lanfile_assets::ServeFiles;
-use lanfile_sendfile::{SendfileSlot, SendfileStream, conn_key};
+use lanfile_sendfile::{SendfileSlot, SendfileStream};
 use salvo::{
     Depot, Request, Response, Router, Service,
     catcher::Catcher,
@@ -134,9 +134,8 @@ pub async fn serve(
         // 第二次写，直到对端的 delayed ACK 超时（Linux 约 40ms），小响应因此每个都平白多出
         // 40ms。Go 的 net 包默认就打开 TCP_NODELAY，这里对齐。
         conn.set_nodelay(true)?;
-        let key = conn_key(&local_addr, &remote_addr);
         let slot = Arc::new(SendfileSlot::new());
-        let stream = SendfileStream::new(conn, Arc::clone(&slot), key);
+        let stream = SendfileStream::new_unregistered(conn, Arc::clone(&slot));
         let io = StraightStream::new(stream, None, ConnCtrl::new(), None);
         let handler = service.hyper_handler(
             local_addr.clone(),
