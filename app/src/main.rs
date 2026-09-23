@@ -5,15 +5,13 @@ use std::{
     fmt::{self, Write as _},
     io::{self, IsTerminal},
     path::PathBuf,
-    sync::{Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread,
     time::Duration,
 };
 
 use chrono::Local;
-use lanfile::{AccessLine, AccessLog, build_router, render_line};
-use lanfile_sendfile::SendfileListener;
-use salvo::prelude::{Listener, Server, TcpListener};
+use lanfile::{AccessLine, AccessLog, build_router, render_line, serve};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{format::Writer, time::FormatTime},
@@ -227,10 +225,20 @@ async fn main() {
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("serving {} on http://{addr}", root.display());
-    let router = build_router(root, port, access_log(is_terminal));
+    let access_log = Arc::new(access_log(is_terminal));
+    let router = build_router(root.clone(), port, Arc::clone(&access_log));
 
-    let acceptor = SendfileListener::new(TcpListener::new(addr)).bind().await;
-    Server::new(acceptor).serve(router).await;
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("无法监听 {addr}: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = serve(listener, root, access_log, router).await {
+        eprintln!("监听 {addr} 出错: {error}");
+        std::process::exit(1);
+    }
     // 退出前把最后一批日志写出去
     let _ = SINK.flush(&mut std::io::stdout());
 }

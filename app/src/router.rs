@@ -2,6 +2,7 @@ use std::{
     fmt::{self, Write as _},
     net::IpAddr,
     path::PathBuf,
+    sync::Arc,
 };
 
 use lanfile_assets::static_routes;
@@ -10,6 +11,11 @@ use salvo::{
     http::{Version, header::CONTENT_LENGTH},
     prelude::*,
 };
+
+#[path = "fast.rs"]
+mod fast;
+
+pub use fast::serve;
 
 /// 访问日志的 target。`tracing` 默认取模块路径，这个文件就是 lib 的根，所以是 `lanfile`。
 pub const ACCESS_LOG_TARGET: &str = module_path!();
@@ -78,7 +84,7 @@ pub fn render_line(line: &AccessLine<'_>, out: &mut String) -> fmt::Result {
 /// 用结构体而不是自由函数，是为了把出口挂在 handler 上；塞进 `Depot` 的话每请求都要多一次
 /// 类型查找。
 struct AccessLogHandler {
-    access_log: AccessLog,
+    access_log: Arc<AccessLog>,
 }
 
 #[handler]
@@ -91,39 +97,46 @@ impl AccessLogHandler {
         ctrl: &mut FlowCtrl,
     ) {
         ctrl.call_next(req, depot, res).await;
+        log_access(&self.access_log, req, res);
+    }
+}
 
-        let method = req.method().as_str();
-        let path = req.uri().path();
-        let ip = req.remote_addr().ip();
-        let version = req.version();
-        let status = res.status_code.map_or(200_u16, |c| c.as_u16());
-        let size = res
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-");
+/// 记一条访问日志。salvo 的 hoop 与 hyper 快路径共用这一个出口。
+pub fn log_access(access_log: &AccessLog, req: &Request, res: &Response) {
+    if matches!(access_log, AccessLog::Off) {
+        return;
+    }
+    let method = req.method().as_str();
+    let path = req.uri().path();
+    let ip = req.remote_addr().ip();
+    let version = req.version();
+    let status = res.status_code.map_or(200_u16, |c| c.as_u16());
+    let size = res
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
 
-        let line = AccessLine {
-            ip,
-            method,
-            path,
-            version,
-            status,
-            size,
-        };
-        if let AccessLog::Direct(write) = &self.access_log {
-            write(&line);
-        } else {
-            tracing::info!("{line}");
-        }
+    let line = AccessLine {
+        ip,
+        method,
+        path,
+        version,
+        status,
+        size,
+    };
+    if let AccessLog::Direct(write) = access_log {
+        write(&line);
+    } else {
+        tracing::info!("{line}");
     }
 }
 
 #[must_use]
-pub fn build_router(root: PathBuf, port: u16, access_log: AccessLog) -> Router {
+pub fn build_router(root: PathBuf, port: u16, access_log: Arc<AccessLog>) -> Router {
     // 日志关掉时连 hoop 都不挂：hoop 是 `#[async_trait]`，每请求要装箱一个 future 再
     // 动态分发一次，而它在 `Off` 下什么都不做。挂上与否的语义完全相同。
-    let router = if matches!(access_log, AccessLog::Off) {
+    let router = if matches!(*access_log, AccessLog::Off) {
         Router::new()
     } else {
         Router::new().hoop(AccessLogHandler { access_log })

@@ -44,7 +44,7 @@ struct CachedHeaders {
     disposition: Option<HeaderValue>,
 }
 
-struct ServeFiles {
+pub struct ServeFiles {
     root: PathBuf,
     /// root 的目录 fd：`openat2` 相对它解析路径，越界由内核直接拦下
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -59,7 +59,7 @@ struct ServeFiles {
 
 impl ServeFiles {
     #[must_use]
-    fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         Self {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             root_fd: rfs::open(
@@ -218,23 +218,12 @@ fn has_seccomp_filter(status: &str) -> bool {
     })
 }
 
-#[handler]
 impl ServeFiles {
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        // 方法判断从路由过滤器挪到这里：salvo 的过滤器是 `#[async_trait]`，挂在路由上的
-        // 每个过滤器每请求都要装箱一个 future 并动态分发一次（实测 `Or<Method, Method>`
-        // 每请求两次分配），而在 handler 里只是一次比较。
-        // 语义不变：非 GET/HEAD 依旧是 404，空响应体交给 catcher 补错误页
-        if req.method() != Method::GET && req.method() != Method::HEAD {
-            res.status_code(StatusCode::NOT_FOUND);
-            return;
-        }
-
-        // 直接从路由参数里借一个 &str：`param::<String>` 会为每个请求分配一个 String，
-        // 再走一遍 serde 反序列化；通配参数就在这里，借出来就够了
-        let sub = req.params().get("path").map_or("", String::as_str);
-
+    /// `/files` 的实际实现，`sub` 是已经解码好的子路径。
+    ///
+    /// salvo 的 handler 与 hyper 快路径共用这一个入口：两条路唯一的差别是错误页由谁补
+    /// （salvo 侧是 catcher，快路径自己渲染），响应本身完全一致。找不到时只设状态码。
+    pub async fn serve(&self, sub: &str, req: &Request, res: &mut Response) {
         // 路径解析直接在 worker 上做：只有 lstat + openat2，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
@@ -309,6 +298,26 @@ impl ServeFiles {
         // 命中条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
         // 这里不再 dup：响应体直接共享缓存里那个 fd（sendfile 带显式 offset，共享描述符是安全的）
         upgrade_response(req, res, file);
+    }
+}
+
+#[handler]
+impl ServeFiles {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        // 方法判断从路由过滤器挪到这里：salvo 的过滤器是 `#[async_trait]`，挂在路由上的
+        // 每个过滤器每请求都要装箱一个 future 并动态分发一次（实测 `Or<Method, Method>`
+        // 每请求两次分配），而在 handler 里只是一次比较。
+        // 语义不变：非 GET/HEAD 依旧是 404，空响应体交给 catcher 补错误页
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        }
+
+        // 直接从路由参数里借一个 &str：`param::<String>` 会为每个请求分配一个 String，
+        // 再走一遍 serde 反序列化；通配参数就在这里，借出来就够了
+        let sub = req.params().get("path").map_or("", String::as_str);
+        self.serve(sub, req, res).await;
     }
 }
 

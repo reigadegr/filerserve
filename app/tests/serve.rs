@@ -42,7 +42,7 @@ impl Drop for TestDir {
 }
 
 fn api_router(root: PathBuf) -> Arc<Router> {
-    Arc::new(build_router(root, 8000, AccessLog::Tracing))
+    Arc::new(build_router(root, 8000, Arc::new(AccessLog::Tracing)))
 }
 
 // ---- JSON API tests ----
