@@ -64,7 +64,7 @@ use mime::Mime;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use salvo::http::body::ResBody;
 use salvo::http::header::{
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, IF_NONE_MATCH, RANGE,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, IF_NONE_MATCH, RANGE,
     X_CONTENT_TYPE_OPTIONS,
 };
 use salvo::http::headers::*;
@@ -1079,21 +1079,30 @@ impl NamedFile {
         // the disposition from the type the client will actually receive, not
         // necessarily the type detected for the file on disk. Treat an invalid
         // pre-existing value conservatively as opaque binary data.
-        let effective_content_type = if res.headers().contains_key(CONTENT_TYPE) {
-            res.content_type().unwrap_or(mime::APPLICATION_OCTET_STREAM)
+        // 这里只借用、不克隆：`mime::Mime` 的 `Clone` 会深拷贝它内部的 `String`
+        // （mime 0.3 的 `Source` 就是 `String`），每请求一次堆分配
+        let content_disposition = if self.flags.contains(Flag::ContentDisposition) {
+            self.content_disposition.take()
         } else {
-            self.content_type.clone()
+            None
+        };
+        let borrowed_content_type;
+        let effective_content_type = if res.headers().contains_key(CONTENT_TYPE) {
+            borrowed_content_type = res.content_type().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+            &borrowed_content_type
+        } else {
+            &self.content_type
         };
 
         if self.flags.contains(Flag::ContentDisposition) {
-            if let Some(content_disposition) = self.content_disposition.take() {
+            if let Some(content_disposition) = content_disposition {
                 res.headers_mut()
                     .insert(CONTENT_DISPOSITION, content_disposition);
             } else if !res.headers().contains_key(CONTENT_DISPOSITION) {
                 // skip to set CONTENT_DISPOSITION header if it is already set.
                 match build_content_disposition(
                     disposition_name_source(self.disposition_name.as_deref(), &self.path),
-                    &effective_content_type,
+                    effective_content_type,
                     None,
                     None,
                 ) {
@@ -1108,8 +1117,10 @@ impl NamedFile {
             }
         }
         if !res.headers().contains_key(CONTENT_TYPE) {
-            res.headers_mut()
-                .typed_insert(ContentType::from(self.content_type.clone()));
+            // 同上：只要类型的字符串形式，不必克隆整个 `Mime`
+            if let Ok(value) = HeaderValue::from_str(self.content_type.as_ref()) {
+                res.headers_mut().insert(CONTENT_TYPE, value);
+            }
         }
         if self.flags.contains(Flag::ContentTypeOptions)
             && !res.headers().contains_key(X_CONTENT_TYPE_OPTIONS)
@@ -1123,7 +1134,8 @@ impl NamedFile {
         if let Some(etag) = etag {
             res.headers_mut().typed_insert(etag);
         }
-        res.headers_mut().typed_insert(AcceptRanges::bytes());
+        res.headers_mut()
+            .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
         let mut length = self.metadata.len();
         if let Some(content_encoding) = &self.content_encoding {

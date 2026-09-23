@@ -275,9 +275,11 @@ impl ServeFiles {
         {
             named_file.set_content_disposition(disposition);
         }
-        // send 会消费掉 named_file，未命中时要写进缓存的那份类型得先取出来
+        // send 会消费掉 named_file，未命中时要写进缓存的那份类型得先取出来。
+        // 命中时这份类型根本用不到，而 `Mime` 的 Clone 会深拷贝它内部的 `String`，
+        // 所以只在未命中时取，让命中路径省掉一次堆分配
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let resolved_type = named_file.content_type().clone();
+        let resolved_type = cached.is_none().then(|| named_file.content_type().clone());
         let head_only = req.method() == Method::HEAD;
         if head_only {
             named_file.send_head(req.headers(), res).await;
@@ -288,7 +290,7 @@ impl ServeFiles {
         // 未命中：把 fd、它的元数据、刚解析出来的类型，以及刚编码好的 ETag 与
         // Content-Disposition 一起存进缓存，下次命中就不必再算一遍
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if cached.is_none() {
+        if let Some(resolved_type) = resolved_type {
             self.cache.insert(
                 sub,
                 Arc::clone(&file),
