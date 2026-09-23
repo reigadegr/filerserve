@@ -136,14 +136,38 @@ impl FileMeta {
     }
 
     /// 从 [`std::fs::Metadata`] 转换，供拿不到 fd 的场景使用。
+    ///
+    /// 非 unix 平台没有 `MetadataExt`：inode 与 [`NamedFile::etag`] 的非 unix 分支一样取 0，
+    /// mtime 改用 [`Metadata::modified`] 换算，换算结果与 [`Self::modified`] 严格互逆。
     #[must_use]
     pub fn from_metadata(metadata: &Metadata) -> Self {
-        Self::from_raw(
-            metadata.len(),
-            metadata.ino(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-        )
+        #[cfg(unix)]
+        {
+            Self::from_raw(
+                metadata.len(),
+                metadata.ino(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            // 以 i128 纳秒为单位取欧几里得商余：1970 年之前的文件也会落回 [0, 1e9) 的纳秒
+            // 区间，负的 mtime 因此仍能被上层（跳过 Last-Modified 与 ETag）识别出来
+            let offset = match metadata.modified() {
+                Ok(modified) => match modified.duration_since(UNIX_EPOCH) {
+                    Ok(elapsed) => elapsed.as_nanos() as i128,
+                    Err(before) => -(before.duration().as_nanos() as i128),
+                },
+                Err(_) => 0,
+            };
+            Self::from_raw(
+                metadata.len(),
+                0,
+                offset.div_euclid(1_000_000_000) as i64,
+                offset.rem_euclid(1_000_000_000) as i64,
+            )
+        }
     }
 
     /// 文件长度（字节）。
