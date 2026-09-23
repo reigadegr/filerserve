@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use lanfile::build_router;
+use lanfile::{AccessLog, build_router};
 use lanfile_sendfile::SendfileListener;
 use salvo::{
     prelude::*,
@@ -42,7 +42,7 @@ impl Drop for TestDir {
 }
 
 fn api_router(root: PathBuf) -> Arc<Router> {
-    Arc::new(build_router(root, 8000))
+    Arc::new(build_router(root, 8000, AccessLog::Tracing))
 }
 
 // ---- JSON API tests ----

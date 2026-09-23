@@ -11,7 +11,7 @@ use std::{
 };
 
 use chrono::Local;
-use lanfile::build_router;
+use lanfile::{AccessLine, AccessLog, build_router, render_line};
 use lanfile_sendfile::SendfileListener;
 use salvo::prelude::{Listener, Server, TcpListener};
 use tracing_subscriber::{
@@ -31,6 +31,9 @@ thread_local! {
     /// second off the coarse clock also avoids the timezone conversion that
     /// `Local::now` does on every call, without paying for a real clock read.
     static STAMP: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) };
+
+    /// 直写访问日志时拼行用的缓冲，按线程复用，省掉每请求一次分配。
+    static LINE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// The current second, used to tell whether the cached timestamp is stale.
@@ -162,11 +165,18 @@ impl LogSink {
     }
 }
 
-impl io::Write for &LogSink {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl LogSink {
+    /// 追加一段日志；攒够一批就叫醒写线程。
+    fn push(&self, buf: &[u8]) {
         if self.append(buf) {
             self.ready.notify_one();
         }
+    }
+}
+
+impl io::Write for &LogSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.push(buf);
         Ok(buf.len())
     }
 
@@ -209,12 +219,43 @@ async fn main() {
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("serving {} on http://{addr}", root.display());
-    let router = build_router(root, port);
+    let router = build_router(root, port, access_log(is_terminal, &sink));
 
     let acceptor = SendfileListener::new(TcpListener::new(addr)).bind().await;
     Server::new(acceptor).serve(router).await;
     // 退出前把最后一批日志写出去
     let _ = sink.flush(&mut std::io::stdout());
+}
+
+/// 访问日志的出口。
+///
+/// 必须在 `tracing_subscriber::fmt()` 装好之后调用，否则 [`AccessLog::enabled`] 问不到过滤器。
+fn access_log(is_terminal: bool, sink: &Arc<LogSink>) -> AccessLog {
+    if !AccessLog::enabled() {
+        return AccessLog::Off;
+    }
+    if is_terminal {
+        // 终端下要 `tracing` 上 ANSI 颜色，格式也归它管
+        return AccessLog::Tracing;
+    }
+    // 非终端直写：绕开 `tracing` 的分发与 fmt 层，每请求省约 1.2 µs 用户态
+    let sink = Arc::clone(sink);
+    AccessLog::Direct(Box::new(move |line: &AccessLine<'_>| {
+        LINE.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            if LoggerFormatter
+                .format_time(&mut Writer::new(&mut *buf))
+                .is_err()
+            {
+                return;
+            }
+            if render_line(line, &mut buf).is_err() {
+                return;
+            }
+            sink.push(buf.as_bytes());
+        });
+    }))
 }
 
 fn parse_args<I>(args: I) -> (u16, PathBuf)
