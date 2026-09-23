@@ -329,13 +329,17 @@ async fn serves_over_real_tcp() {
 
 // ---- sendfile tests ----
 
-/// 3 MiB of non-zero, non-repeating bytes.
+/// 9 MiB of non-zero, non-repeating bytes.
 ///
 /// A placeholder leak would surface as zeros, and a mis-ordered or duplicated
 /// range would surface as a byte mismatch, so an exact comparison proves the
 /// response really came from `sendfile(2)`.
+///
+/// The size has to exceed the placeholder buffer's frame length (4 MiB) so the
+/// body spans several frames: that is what exercises the stream's cross-frame
+/// offset and remaining-length accounting. Raise it whenever that buffer grows.
 fn sendfile_payload() -> Vec<u8> {
-    (0..3 * 1024 * 1024_u32)
+    (0..9 * 1024 * 1024_u32)
         .map(|index| (index % 251) as u8 + 1)
         .collect()
 }
@@ -486,7 +490,9 @@ async fn range_request_over_sendfile_returns_the_exact_slice() {
     std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
     let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
-    let (start, end) = (500_000_usize, 2_600_000_usize);
+    // 6 MiB wide, so the slice crosses a 4 MiB placeholder frame boundary and the
+    // stream's offset arithmetic is exercised across frames rather than within one.
+    let (start, end) = (1_000_000_usize, 7_000_000_usize);
     let (head, body) = download(
         addr,
         "big.bin",

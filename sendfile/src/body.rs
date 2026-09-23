@@ -4,7 +4,7 @@ use std::{
     fs::File,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -13,14 +13,29 @@ use std::{
 use bytes::Bytes;
 use salvo::http::body::{Body, Frame, SizeHint};
 
+/// Length of the placeholder buffer: the most a single `sendfile(2)` may move.
+const PHANTOM_LEN: usize = 4 * 1024 * 1024;
+
 /// Placeholder bytes the response body hands to Hyper in place of file content.
 ///
 /// Hyper insists on writing every response byte itself, so a handler cannot
 /// simply call `sendfile(2)`. Instead the body reports the file's exact length
 /// and yields this buffer, while [`crate::SendfileStream`] underneath Hyper
 /// recognises those bytes and issues the real `sendfile(2)` for the same length.
-/// Only the byte count matters, so one shared zero page serves every response.
-static PHANTOM: [u8; 256 * 1024] = [0; 256 * 1024];
+/// Only the byte count matters, so nothing on the sendfile path reads them and
+/// the pages stay untouched, costing no resident memory.
+///
+/// The buffer is allocated once, on first use, rather than being a `static`
+/// array: an immutable zero-filled array of this size lands in `.rodata`, which
+/// carries the whole buffer as zeros inside the binary itself.
+///
+/// The length is also how much of a file each trip round Hyper's write loop can
+/// cover: at 256 KiB a 41 MiB response takes 158 syscalls and 158 encoder
+/// passes, which shows up as per-request CPU. A frame large enough to cover a
+/// response in a handful of passes removes that per-frame overhead; `sendfile`
+/// still returns as soon as the socket fills, so the syscall count ends up
+/// bounded by the socket buffer rather than by this constant.
+static PHANTOM: LazyLock<Bytes> = LazyLock::new(|| Bytes::from(vec![0_u8; PHANTOM_LEN]));
 
 /// The file range a connection's next response must send with `sendfile(2)`.
 pub struct Plan {
@@ -68,7 +83,7 @@ impl SendfileSlot {
         drop(plan);
         self.armed.store(true, Ordering::Release);
         Some(SendfileBody {
-            phantom: Bytes::from_static(&PHANTOM),
+            phantom: PHANTOM.clone(),
             remaining: len,
         })
     }
