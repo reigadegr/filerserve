@@ -3,8 +3,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     cell::RefCell,
     fmt::{self, Write as _},
-    io::IsTerminal,
+    io::{self, IsTerminal},
     path::PathBuf,
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    thread,
+    time::Duration,
 };
 
 use chrono::Local;
@@ -69,27 +72,138 @@ impl FormatTime for LoggerFormatter {
     }
 }
 
+/// 日志缓冲攒够这么多字节就叫醒写线程，不必再等一个 [`LOG_INTERVAL`]。
+const LOG_BATCH: usize = 64 * 1024;
+
+/// 写线程的等待上限：即使没攒够一批，也要在这个时间内把已有的日志送出去。
+const LOG_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 缓冲的上限。写线程跟不上时（stdout 是慢终端之类）超出的日志直接丢掉：丢日志总好过
+/// 把内存吃光，也好过把 worker 卡在一个永远写不完的 stdout 上。
+const LOG_PENDING_MAX: usize = 4 * 1024 * 1024;
+
+/// 访问日志的落地缓冲。
+///
+/// `tracing` 仍然负责格式化与 `RUST_LOG` 过滤，只有"把字节送到 stdout"这一步换成了攒批：
+/// 日志先追加进来，攒够 [`LOG_BATCH`] 或等满 [`LOG_INTERVAL`] 才由写线程一次写出。
+///
+/// 换掉 `tracing_appender::non_blocking` 是因为它每行都往 channel 发一条消息，唤醒一个
+/// 阻塞在 `recv` 的后台线程再让它重新 park——每行两次 futex。访问日志每请求一行，手机上
+/// 实测这要花掉每请求约 10 µs CPU（其中约 8 µs 在内核态），9 字节小文件的吞吐因此只有
+/// Go 的三分之二。攒批之后每请求只剩一次加锁与一次 `memcpy`。
+struct LogSink {
+    /// 已经格式化好、还没写出去的字节。
+    pending: Mutex<Vec<u8>>,
+    /// 写线程睡着时用来叫醒它。
+    ready: Condvar,
+    /// 串行化"取出并写出"：同一时刻只有一个写出者，写出的顺序就是取出的顺序。
+    writing: Mutex<()>,
+}
+
+/// 取锁时忽略中毒。
+///
+/// 中毒只说明有线程在临界区里 panic 过，而临界区里只有一次 `Vec` 追加或一次取出，数据
+/// 仍然完整；日志不该因为一次 panic 就永久停摆，所以取回内部数据继续用。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl LogSink {
+    const fn new() -> Self {
+        Self {
+            pending: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+            writing: Mutex::new(()),
+        }
+    }
+
+    /// 追加一段日志，返回是否已经攒够一批（`true` 时调用方该叫醒写线程）。
+    ///
+    /// 缓冲已经到 [`LOG_PENDING_MAX`] 时这一行直接丢掉。
+    fn append(&self, buf: &[u8]) -> bool {
+        let mut pending = lock(&self.pending);
+        if pending.len() >= LOG_PENDING_MAX {
+            return false;
+        }
+        pending.extend_from_slice(buf);
+        pending.len() >= LOG_BATCH
+    }
+
+    /// 取出缓冲里的字节并一次写出；缓冲为空时什么也不做。
+    fn flush(&self, out: &mut impl io::Write) -> io::Result<()> {
+        // 取出与写出都在 `writing` 下完成：写出者只有一个，顺序即取出顺序。
+        // 只按 `writing` -> `pending` 的顺序取锁，`append` 只碰 `pending`，不会死锁。
+        let _writing = lock(&self.writing);
+        let batch = std::mem::take(&mut *lock(&self.pending));
+        if batch.is_empty() {
+            return Ok(());
+        }
+        out.write_all(&batch)
+    }
+
+    /// 写线程：攒够一批会被 [`Self::append`] 的调用方叫醒，否则最多等 [`LOG_INTERVAL`]。
+    fn run(&self, out: &mut impl io::Write) {
+        loop {
+            {
+                let mut pending = lock(&self.pending);
+                if pending.is_empty() {
+                    pending = self
+                        .ready
+                        .wait_timeout(pending, LOG_INTERVAL)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+            if self.flush(out).is_err() {
+                // stdout 已经写不动了（管道对端消失之类），再试也没有意义
+                break;
+            }
+        }
+    }
+}
+
+impl io::Write for &LogSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.append(buf) {
+            self.ready.notify_one();
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // 真正的写出交给写线程：这里若写出去，每个事件都会退化成一次系统调用
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let is_terminal = std::io::stdout().is_terminal();
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let sink = Arc::new(LogSink::new());
+    let writer = Arc::clone(&sink);
+    if let Err(error) = thread::Builder::new()
+        .name("access-log".to_owned())
+        .spawn(move || writer.run(&mut std::io::stdout()))
+    {
+        // 没有写线程，缓冲就只会涨；这里必须直接失败，不能带着一个永不落地的日志跑
+        eprintln!("无法启动日志写线程: {error}");
+        std::process::exit(1);
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_timer(LoggerFormatter)
         .with_ansi(is_terminal)
-        .with_writer(non_blocking)
+        .with_writer(Arc::clone(&sink))
         .init();
-
-    // guard keeps the non-blocking writer's background thread alive;
-    // bound it so the buffer is flushed on shutdown
-    let _guard = guard;
 
     let (port, dir) = parse_args(std::env::args().skip(1));
     let root = std::fs::canonicalize(&dir).unwrap_or_else(|error| {
         tracing::error!("无法访问目录 {:?}: {error}", dir);
+        // 进程马上退出，这一行不能留在缓冲里
+        let _ = sink.flush(&mut std::io::stdout());
         std::process::exit(1);
     });
 
@@ -99,6 +213,8 @@ async fn main() {
 
     let acceptor = SendfileListener::new(TcpListener::new(addr)).bind().await;
     Server::new(acceptor).serve(router).await;
+    // 退出前把最后一批日志写出去
+    let _ = sink.flush(&mut std::io::stdout());
 }
 
 fn parse_args<I>(args: I) -> (u16, PathBuf)
@@ -119,9 +235,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    #![allow(clippy::unwrap_used)]
 
-    use super::parse_args;
+    use std::{
+        io::{self, Write as _},
+        path::PathBuf,
+        sync::Arc,
+    };
+
+    use super::{LOG_BATCH, LOG_PENDING_MAX, LogSink, parse_args};
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(ToString::to_string).collect()
@@ -167,5 +289,81 @@ mod tests {
         let (port, dir) = parse_args(args(&["/srv/www", "/data"]));
         assert_eq!(port, 8000_u16);
         assert_eq!(dir, PathBuf::from("/data"));
+    }
+
+    /// 记下收到的字节，然后让第一次写出就报错，使 [`LogSink::run`] 的循环退出。
+    struct StopAfterFirstWrite(Vec<u8>);
+
+    impl io::Write for StopAfterFirstWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Err(io::Error::other("stop"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sink_keeps_lines_buffered_until_the_threshold() {
+        let sink = LogSink::new();
+        assert!(!sink.append(b"one\n"));
+        assert!(!sink.append(b"two\n"));
+
+        // 没攒够一批，所以一行都还没写出去；内容与顺序原样留着
+        let mut out = Vec::new();
+        sink.flush(&mut out).unwrap();
+        assert_eq!(out.as_slice(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn sink_asks_for_a_wakeup_once_a_batch_is_full() {
+        let sink = LogSink::new();
+        let almost = vec![b'x'; LOG_BATCH - 1];
+        assert!(!sink.append(&almost));
+        assert!(sink.append(b"x"));
+    }
+
+    #[test]
+    fn sink_writes_each_batch_only_once() {
+        let sink = LogSink::new();
+        let batch = vec![b'a'; LOG_BATCH];
+        sink.append(&batch);
+
+        let mut out = Vec::new();
+        sink.flush(&mut out).unwrap();
+        sink.flush(&mut out).unwrap();
+        assert_eq!(out.len(), LOG_BATCH);
+    }
+
+    #[test]
+    fn sink_drops_lines_once_the_buffer_is_full() {
+        let sink = LogSink::new();
+        let full = vec![b'x'; LOG_PENDING_MAX];
+        sink.append(&full);
+        assert!(!sink.append(b"dropped\n"));
+
+        let mut out = Vec::new();
+        sink.flush(&mut out).unwrap();
+        assert_eq!(out, full);
+    }
+
+    #[test]
+    fn sink_writer_thread_writes_a_full_batch() {
+        let sink = Arc::new(LogSink::new());
+        // 走 `io::Write` 才会叫醒写线程
+        let batch = vec![b'a'; LOG_BATCH];
+        let mut sink_writer: &LogSink = &sink;
+        sink_writer.write_all(&batch).unwrap();
+
+        let recorded = std::thread::spawn(move || {
+            let mut out = StopAfterFirstWrite(Vec::new());
+            sink.run(&mut out);
+            out.0
+        })
+        .join()
+        .unwrap();
+        assert_eq!(recorded, batch);
     }
 }
