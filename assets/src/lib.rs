@@ -10,8 +10,10 @@ use rust_embed::RustEmbed;
 use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, Advice, Mode, OFlags, ResolveFlags};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use salvo::http::header::CONTENT_DISPOSITION;
 use salvo::{
-    http::{HeaderValue, Method, header::CONTENT_DISPOSITION, headers::ETag},
+    http::{HeaderValue, Method, headers::ETag},
     prelude::*,
     routing::{Filter, filters},
     serve_static::static_embed,
@@ -124,6 +126,12 @@ impl ServeFiles {
     }
 
     /// 缓存未命中时真正去解析并打开文件（类型检查已由 [`Self::open`] 完成）。
+    ///
+    /// `sub` 只有 Linux/Android 的 `openat2` 快路径读得到，其他平台上它确实没人用。
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        allow(unused_variables)
+    )]
     fn open_uncached(&self, sub: &str, joined: &Path) -> Option<File> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.openat2_allowed
@@ -225,7 +233,6 @@ impl ServeFiles {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
-        let missed = cached.is_none();
 
         // 关闭 NamedFile 的小文件预读：预读会把内容读进用户态，而 sendfile 直接从页缓存发，
         // 那次读纯属浪费；关掉后所有响应体都交给 sendfile，HEAD 本来也不需要预读
@@ -272,7 +279,7 @@ impl ServeFiles {
         // 未命中：把 fd、它的元数据、刚解析出来的类型，以及刚编码好的 ETag 与
         // Content-Disposition 一起存进缓存，下次命中就不必再算一遍
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if missed {
+        if cached.is_none() {
             self.cache.insert(
                 sub,
                 Arc::clone(&file),
