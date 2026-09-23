@@ -1,4 +1,5 @@
 use std::{
+    io::Read as _,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -18,7 +19,6 @@ use salvo::{
     routing::filters,
 };
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
 
 mod ip;
 mod zip;
@@ -270,6 +270,26 @@ impl ListApi {
     }
 }
 
+/// zip 打包流水线里，阻塞遍历线程发往异步写线程的一条消息。
+///
+/// 文件内容由遍历线程自己 `read` 后分块发出，异步侧不再碰 `tokio::fs`：
+/// 每次读盘只花一次 `read`，不必再付一次 `spawn_blocking` 派发，
+/// 也不必让 tokio 先把数据读进自己的缓冲、再整块拷到调用方的缓冲。
+///
+/// 协议：`FileStart` 之后只会跟同一文件的若干 `Chunk`，直到 `FileEnd`。
+enum Item {
+    Dir { name: String },
+    FileStart { name: String },
+    Chunk(Vec<u8>),
+    FileEnd,
+}
+
+/// 每次读盘发送的字节数，也是流水线的拷贝粒度。
+const ZIP_CHUNK: usize = 262_144;
+
+/// 有界队列深度；内存上界约为 `ZIP_QUEUE * ZIP_CHUNK`（2 MiB）。
+const ZIP_QUEUE: usize = 8;
+
 struct ZipApi {
     root: PathBuf,
 }
@@ -315,22 +335,35 @@ impl ZipApi {
         }
 
         // 边遍历边流式打包，不先把整棵树攒进内存：
-        // - 阻塞遍历在 spawn_blocking 里，通过有界 channel 逐条发 Entry（有界 = 内存封顶）
-        // - 异步写 zip 在 tokio 里，逐条收 Entry 写入
-        let (entry_tx, mut entry_rx) = tokio::sync::mpsc::channel::<zip::Entry>(64);
+        // - 阻塞遍历线程自己读文件内容，通过有界 channel 逐块发 Item（有界 = 内存封顶）
+        // - 异步写 zip 在 tokio 里，逐条收 Item 写入
+        let (item_tx, mut item_rx) = tokio::sync::mpsc::channel::<Item>(ZIP_QUEUE);
         tokio::task::spawn_blocking(move || {
-            zip::walk(&canonical, &folder_name, &mut |entry| {
-                entry_tx.blocking_send(entry).is_ok()
+            zip::walk(&canonical, &folder_name, &mut |entry| match entry {
+                zip::Entry::Dir { name } => item_tx.blocking_send(Item::Dir { name }).is_ok(),
+                zip::Entry::File { abs, name } => {
+                    if item_tx.blocking_send(Item::FileStart { name }).is_err() {
+                        return false;
+                    }
+                    let Ok(mut f) = std::fs::File::open(&abs) else {
+                        // 打不开的文件仍留一个空条目，与原先 open 失败后立即 close 的行为一致
+                        return item_tx.blocking_send(Item::FileEnd).is_ok();
+                    };
+                    // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
+                    send_file_chunks(&item_tx, &mut f, ZIP_CHUNK)
+                        && item_tx.blocking_send(Item::FileEnd).is_ok()
+                }
             });
         });
 
         let tx = res.channel();
         tokio::spawn(async move {
             let mut writer = ZipFileWriter::with_tokio(tx);
-            let mut buf = vec![0u8; 262_144];
-            while let Some(entry) = entry_rx.recv().await {
-                match entry {
-                    zip::Entry::Dir { name } => {
+            while let Some(item) = item_rx.recv().await {
+                match item {
+                    Item::Dir { name } => {
                         // 目录条目：名字以 / 结尾、置 S_IFDIR 权限位，解压后保留空目录结构
                         let dir = ZipEntryBuilder::new(name.into(), Compression::Stored)
                             .unix_permissions(0o40755);
@@ -338,25 +371,24 @@ impl ZipApi {
                             return;
                         }
                     }
-                    zip::Entry::File { abs, name } => {
+                    Item::FileStart { name } => {
                         let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
                         let Ok(mut ew) = writer.write_entry_stream(entry).await else {
                             return;
                         };
-                        let Ok(mut f) = tokio::fs::File::open(&abs).await else {
-                            let _ = ew.close().await;
-                            continue;
-                        };
-                        // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
-                        #[cfg(any(target_os = "linux", target_os = "android"))]
-                        let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
-                        if copy_entry(&mut f, &mut ew, &mut buf).await.is_err() {
-                            return;
+                        // 遍历线程保证 FileStart 与 FileEnd 之间只会出现 Chunk；
+                        // 收到 FileEnd 或 channel 关闭（遍历线程已退出）都收尾
+                        while let Some(Item::Chunk(chunk)) = item_rx.recv().await {
+                            if ew.write_all(&chunk).await.is_err() {
+                                return;
+                            }
                         }
                         if ew.close().await.is_err() {
                             return;
                         }
                     }
+                    // 按协议不会单独出现：Chunk / FileEnd 已在上面就地消费
+                    Item::Chunk(_) | Item::FileEnd => {}
                 }
             }
             let _ = writer.close().await;
@@ -379,16 +411,23 @@ pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
         )
 }
 
-/// 顺序拷贝文件内容到 entry 流；读错视为跳过该文件，写错向上传播中断整个 zip。
-async fn copy_entry(
-    src: &mut (impl tokio::io::AsyncRead + Unpin),
-    dst: &mut (impl futures_lite::io::AsyncWrite + Unpin),
-    buf: &mut [u8],
-) -> std::io::Result<()> {
+/// 阻塞线程内顺序读文件，按 `chunk_size` 分块发往异步侧；返回 `false` 表示 channel 已关闭、应停止遍历。
+/// 读错与读到 EOF 同样收尾，与原先 `copy_entry` 的语义一致。
+fn send_file_chunks(
+    tx: &tokio::sync::mpsc::Sender<Item>,
+    file: &mut std::fs::File,
+    chunk_size: usize,
+) -> bool {
     loop {
-        match src.read(buf).await {
-            Ok(0) | Err(_) => return Ok(()),
-            Ok(n) => dst.write_all(&buf[..n]).await?,
+        let mut buf = vec![0u8; chunk_size];
+        match file.read(&mut buf) {
+            Ok(0) | Err(_) => return true,
+            Ok(n) => {
+                buf.truncate(n);
+                if tx.blocking_send(Item::Chunk(buf)).is_err() {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -397,32 +436,40 @@ async fn copy_entry(
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::{path::Path, time::Instant};
+    use std::{fs::File, io::Write as _, path::Path, time::Instant};
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
 
-    use super::copy_entry;
+    use super::{Item, ZIP_QUEUE, send_file_chunks};
 
     const FILE_SIZE: usize = 64 * 1024 * 1024;
 
-    async fn copy_throughput(buf_size: usize, path: &Path) -> f64 {
-        let mut src = tokio::fs::File::open(path).await.unwrap();
-        let mut dst = futures_lite::io::sink();
-        let mut buf = vec![0u8; buf_size];
+    /// 复刻流水线的读取侧：阻塞线程分块读文件 → 有界 channel → 异步侧丢弃。
+    /// 生产路径固定用 `ZIP_CHUNK`，这里开放 `chunk_size` 只为观察分块大小对吞吐的影响。
+    async fn copy_throughput(chunk_size: usize, path: &Path) -> f64 {
+        let (tx, mut rx) = mpsc::channel::<Item>(ZIP_QUEUE);
+        let path = path.to_path_buf();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut f = File::open(&path).unwrap();
+            let _ = send_file_chunks(&tx, &mut f, chunk_size);
+        });
+
         let start = Instant::now();
-        copy_entry(&mut src, &mut dst, &mut buf).await.unwrap();
+        while rx.recv().await.is_some() {}
         let elapsed = start.elapsed().as_secs_f64();
+        producer.await.unwrap();
+
         FILE_SIZE as f64 / (1024.0 * 1024.0) / elapsed
     }
 
     #[tokio::test]
     async fn zip_copy_throughput_by_buffer_size() {
         let path = std::env::temp_dir().join(format!("lanfile-perf-{}", std::process::id()));
-        let mut f = tokio::fs::File::create(&path).await.unwrap();
+        let mut f = File::create(&path).unwrap();
         let chunk = vec![0xABu8; 1024 * 1024];
         let mut remaining = FILE_SIZE;
         while remaining > 0 {
-            f.write_all(&chunk).await.unwrap();
+            f.write_all(&chunk).unwrap();
             remaining -= chunk.len();
         }
         drop(f);

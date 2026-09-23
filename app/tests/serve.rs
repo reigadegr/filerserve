@@ -577,6 +577,56 @@ async fn api_zip_streams_folder() {
     assert!(body.contains("sub/b.txt"));
 }
 
+/// 统计 `needle` 在 `haystack` 中出现的次数。
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// 分块流水线必须把每个文件的内容完整、连续地写进 zip。
+///
+/// 载荷大于单个读取分块（256 KiB），两段内容互不相同：内容被截断、分块串到别的
+/// 条目上、或条目整个丢失，都会让下面的断言失败。空文件走的是「只有 `FileStart` 与
+/// `FileEnd`、没有 `Chunk`」的路径，单独断言它的条目仍在。
+#[tokio::test]
+async fn api_zip_streams_each_file_intact() {
+    const CHUNKED_SIZE: usize = 3 * 512 * 1024;
+
+    let dir = TestDir::new();
+    let a: Vec<u8> = (0..CHUNKED_SIZE as u32)
+        .map(|index| (index % 251) as u8 + 1)
+        .collect();
+    let b: Vec<u8> = a.iter().map(|byte| byte.wrapping_add(100)).collect();
+    std::fs::write(dir.root().join("a.bin"), &a).unwrap();
+    std::fs::write(dir.root().join("b.bin"), &b).unwrap();
+    std::fs::write(dir.root().join("empty.bin"), b"").unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/zip")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let body = res.take_bytes(None).await.unwrap();
+
+    // Stored 压缩，文件内容原样落在 zip 流里
+    assert_eq!(
+        count_occurrences(&body, &a),
+        1,
+        "a.bin 的内容必须完整且只出现一次"
+    );
+    assert_eq!(
+        count_occurrences(&body, &b),
+        1,
+        "b.bin 的内容必须完整且只出现一次"
+    );
+    assert!(
+        count_occurrences(&body, b"empty.bin") >= 1,
+        "空文件也应当保留条目"
+    );
+}
+
 #[tokio::test]
 async fn api_zip_returns_404_for_missing() {
     let dir = TestDir::new();
