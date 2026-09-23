@@ -5,7 +5,7 @@ use std::{
     fmt::{self, Write as _},
     io::{self, IsTerminal},
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{Condvar, Mutex, MutexGuard, PoisonError},
     thread,
     time::Duration,
 };
@@ -103,6 +103,21 @@ struct LogSink {
     writing: Mutex<()>,
 }
 
+/// 进程唯一的日志出口。
+///
+/// 写线程、`tracing` 的 `MakeWriter` 和直写路径都借用同一个 `&'static` 引用，不必再为
+/// 三处共享包一层 `Arc`：`Mutex`、`Condvar` 与 `Vec` 的构造函数都是 `const fn`，整个
+/// 结构可以直接放进 `static`。
+static SINK: LogSink = LogSink::new();
+
+/// `tracing` 要的 `MakeWriter` 是一个能返回 `io::Write` 的 `Fn() -> W`。
+///
+/// 这里返回的 `&'static LogSink` 就是 [`LogSink`] 自己实现的那个 `io::Write`，因此
+/// `tracing` 的每个事件直接写进同一个攒批缓冲，不必再包 `Arc` 或 `Mutex`。
+fn sink_writer() -> &'static LogSink {
+    &SINK
+}
+
 /// 取锁时忽略中毒。
 ///
 /// 中毒只说明有线程在临界区里 panic 过，而临界区里只有一次 `Vec` 追加或一次取出，数据
@@ -132,10 +147,17 @@ impl LogSink {
         pending.len() >= LOG_BATCH
     }
 
+    /// 追加一段日志；攒够一批就叫醒写线程。
+    fn push(&self, buf: &[u8]) {
+        if self.append(buf) {
+            self.ready.notify_one();
+        }
+    }
+
     /// 取出缓冲里的字节并一次写出；缓冲为空时什么也不做。
     fn flush(&self, out: &mut impl io::Write) -> io::Result<()> {
         // 取出与写出都在 `writing` 下完成：写出者只有一个，顺序即取出顺序。
-        // 只按 `writing` -> `pending` 的顺序取锁，`append` 只碰 `pending`，不会死锁。
+        // 只按 `writing` -> `pending` 的顺序取锁，`push` 只碰 `pending`，不会死锁。
         let _writing = lock(&self.writing);
         let batch = std::mem::take(&mut *lock(&self.pending));
         if batch.is_empty() {
@@ -144,32 +166,20 @@ impl LogSink {
         out.write_all(&batch)
     }
 
-    /// 写线程：攒够一批会被 [`Self::append`] 的调用方叫醒，否则最多等 [`LOG_INTERVAL`]。
+    /// 写线程：攒够一批会被 [`Self::push`] 的调用方叫醒，否则最多等 [`LOG_INTERVAL`]。
     fn run(&self, out: &mut impl io::Write) {
         loop {
             {
-                let mut pending = lock(&self.pending);
+                let pending = lock(&self.pending);
                 if pending.is_empty() {
-                    pending = self
-                        .ready
-                        .wait_timeout(pending, LOG_INTERVAL)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0;
+                    // 锁在 `wait_timeout` 返回时已经释放；结果本身不重要，丢掉即可
+                    let _ = self.ready.wait_timeout(pending, LOG_INTERVAL);
                 }
             }
             if self.flush(out).is_err() {
                 // stdout 已经写不动了（管道对端消失之类），再试也没有意义
                 break;
             }
-        }
-    }
-}
-
-impl LogSink {
-    /// 追加一段日志；攒够一批就叫醒写线程。
-    fn push(&self, buf: &[u8]) {
-        if self.append(buf) {
-            self.ready.notify_one();
         }
     }
 }
@@ -191,11 +201,9 @@ async fn main() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let is_terminal = std::io::stdout().is_terminal();
-    let sink = Arc::new(LogSink::new());
-    let writer = Arc::clone(&sink);
     if let Err(error) = thread::Builder::new()
         .name("access-log".to_owned())
-        .spawn(move || writer.run(&mut std::io::stdout()))
+        .spawn(|| SINK.run(&mut std::io::stdout()))
     {
         // 没有写线程，缓冲就只会涨；这里必须直接失败，不能带着一个永不落地的日志跑
         eprintln!("无法启动日志写线程: {error}");
@@ -206,31 +214,31 @@ async fn main() {
         .with_env_filter(env_filter)
         .with_timer(LoggerFormatter)
         .with_ansi(is_terminal)
-        .with_writer(Arc::clone(&sink))
+        .with_writer(sink_writer as fn() -> &'static LogSink)
         .init();
 
     let (port, dir) = parse_args(std::env::args().skip(1));
     let root = std::fs::canonicalize(&dir).unwrap_or_else(|error| {
         tracing::error!("无法访问目录 {:?}: {error}", dir);
         // 进程马上退出，这一行不能留在缓冲里
-        let _ = sink.flush(&mut std::io::stdout());
+        let _ = SINK.flush(&mut std::io::stdout());
         std::process::exit(1);
     });
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("serving {} on http://{addr}", root.display());
-    let router = build_router(root, port, access_log(is_terminal, &sink));
+    let router = build_router(root, port, access_log(is_terminal));
 
     let acceptor = SendfileListener::new(TcpListener::new(addr)).bind().await;
     Server::new(acceptor).serve(router).await;
     // 退出前把最后一批日志写出去
-    let _ = sink.flush(&mut std::io::stdout());
+    let _ = SINK.flush(&mut std::io::stdout());
 }
 
 /// 访问日志的出口。
 ///
 /// 必须在 `tracing_subscriber::fmt()` 装好之后调用，否则 [`AccessLog::enabled`] 问不到过滤器。
-fn access_log(is_terminal: bool, sink: &Arc<LogSink>) -> AccessLog {
+fn access_log(is_terminal: bool) -> AccessLog {
     if !AccessLog::enabled() {
         return AccessLog::Off;
     }
@@ -239,8 +247,7 @@ fn access_log(is_terminal: bool, sink: &Arc<LogSink>) -> AccessLog {
         return AccessLog::Tracing;
     }
     // 非终端直写：绕开 `tracing` 的分发与 fmt 层，每请求省约 1.2 µs 用户态
-    let sink = Arc::clone(sink);
-    AccessLog::Direct(Box::new(move |line: &AccessLine<'_>| {
+    AccessLog::Direct(Box::new(|line: &AccessLine<'_>| {
         LINE.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
@@ -253,7 +260,7 @@ fn access_log(is_terminal: bool, sink: &Arc<LogSink>) -> AccessLog {
             if render_line(line, &mut buf).is_err() {
                 return;
             }
-            sink.push(buf.as_bytes());
+            SINK.push(buf.as_bytes());
         });
     }))
 }
