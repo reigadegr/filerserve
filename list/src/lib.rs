@@ -276,12 +276,27 @@ impl ListApi {
 /// 每次读盘只花一次 `read`，不必再付一次 `spawn_blocking` 派发，
 /// 也不必让 tokio 先把数据读进自己的缓冲、再整块拷到调用方的缓冲。
 ///
-/// 协议：`FileStart` 之后只会跟同一文件的若干 `Chunk`，直到 `FileEnd`。
-/// `Chunk.data` 始终保持 `ZIP_CHUNK` 满长（便于消费侧原样归还后复用），有效字节数是 `Chunk.len`。
+/// 协议：`FileStart` 之后只会跟同一文件的若干 `Chunk`，直到 `FileEnd`；装得下一块的文件
+/// 直接发一条自足的 `Whole`，不再走 `FileStart`/`Chunk`/`FileEnd` 三段。
+/// `Chunk` 与 `Whole` 的 `data` 始终保持 `ZIP_CHUNK` 满长（便于消费侧原样归还后复用），
+/// 有效字节数分别是 `Chunk.len` 与 `Whole.len`。
 enum Item {
-    Dir { name: String },
-    FileStart { name: String },
-    Chunk { data: Vec<u8>, len: usize },
+    Dir {
+        name: String,
+    },
+    /// 小于一块的文件：一次读全，异步侧走 `write_entry_whole`
+    Whole {
+        name: String,
+        data: Vec<u8>,
+        len: usize,
+    },
+    FileStart {
+        name: String,
+    },
+    Chunk {
+        data: Vec<u8>,
+        len: usize,
+    },
     FileEnd,
 }
 
@@ -352,20 +367,7 @@ impl ZipApi {
         tokio::task::spawn_blocking(move || {
             zip::walk(&canonical, &folder_name, &mut |entry| match entry {
                 zip::Entry::Dir { name } => item_tx.blocking_send(Item::Dir { name }).is_ok(),
-                zip::Entry::File { abs, name } => {
-                    if item_tx.blocking_send(Item::FileStart { name }).is_err() {
-                        return false;
-                    }
-                    let Ok(mut f) = std::fs::File::open(&abs) else {
-                        // 打不开的文件仍留一个空条目，与原先 open 失败后立即 close 的行为一致
-                        return item_tx.blocking_send(Item::FileEnd).is_ok();
-                    };
-                    // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
-                    send_file_chunks(&item_tx, &mut free_rx, &mut f, ZIP_CHUNK)
-                        && item_tx.blocking_send(Item::FileEnd).is_ok()
-                }
+                zip::Entry::File { abs, name } => send_one_file(&item_tx, &mut free_rx, &abs, name),
             });
         });
 
@@ -382,6 +384,14 @@ impl ZipApi {
                         if writer.write_entry_whole(dir, &[]).await.is_err() {
                             return;
                         }
+                    }
+                    Item::Whole { name, data, len } => {
+                        let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
+                        if writer.write_entry_whole(entry, &data[..len]).await.is_err() {
+                            return;
+                        }
+                        // 池满（消费快于生产）就丢弃，只是少一次复用，不影响正确性
+                        let _ = free_tx.try_send(data);
                     }
                     Item::FileStart { name } => {
                         let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
@@ -436,6 +446,71 @@ pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
 /// `alloc_zeroed`，实测 256 KiB 一次约 2.1 µs、其中 98% 是清零；归还的缓冲保持满长，
 /// 所以复用既省掉分配也省掉清零，且读入前不需要 `resize`（那等于把清零做回来）。
 /// 读错与读到 EOF 同样收尾，与原先 `copy_entry` 的语义一致。
+/// 发一个文件：装得下一块就走整条目写入，否则流式分块。返回是否应继续遍历。
+///
+/// 整条目写入把大小与 CRC 直接写进本地头，省掉流式那条数据描述符和收尾往返。
+fn send_one_file(
+    item_tx: &tokio::sync::mpsc::Sender<Item>,
+    free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    abs: &std::path::Path,
+    name: String,
+) -> bool {
+    let Ok(mut f) = std::fs::File::open(abs) else {
+        // 打不开的文件仍留一个空条目，与原先 open 失败后立即 close 的行为一致
+        return item_tx.blocking_send(Item::FileStart { name }).is_ok()
+            && item_tx.blocking_send(Item::FileEnd).is_ok();
+    };
+    // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
+    if f.metadata().map_or(usize::MAX, |m| m.len() as usize) < ZIP_CHUNK {
+        let (buf, len) = read_first_chunk(&mut f, free_rx);
+        if len < ZIP_CHUNK {
+            return item_tx
+                .blocking_send(Item::Whole {
+                    name,
+                    data: buf,
+                    len,
+                })
+                .is_ok();
+        }
+        // 读满说明文件在 fstat 之后长大了：已读那块先发出去再接着流式读完，
+        // 直接退回流式会把这一段丢掉
+        if item_tx.blocking_send(Item::FileStart { name }).is_err() {
+            return false;
+        }
+        if item_tx
+            .blocking_send(Item::Chunk { data: buf, len })
+            .is_err()
+        {
+            return false;
+        }
+    } else if item_tx.blocking_send(Item::FileStart { name }).is_err() {
+        return false;
+    }
+    send_file_chunks(item_tx, free_rx, &mut f, ZIP_CHUNK)
+        && item_tx.blocking_send(Item::FileEnd).is_ok()
+}
+
+/// 读第一块：从空闲池取一块满长缓冲，读到读满或读到 EOF 为止。
+///
+/// 返回的有效长度等于 `ZIP_CHUNK` 时说明文件一块装不下（或它在 `fstat` 之后长大了），
+/// 调用方应继续走流式路径。
+fn read_first_chunk(
+    file: &mut std::fs::File,
+    free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> (Vec<u8>, usize) {
+    let mut buf = free_rx.try_recv().unwrap_or_else(|_| vec![0u8; ZIP_CHUNK]);
+    let mut len = 0;
+    while len < ZIP_CHUNK {
+        match file.read(&mut buf[len..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => len += n,
+        }
+    }
+    (buf, len)
+}
+
 fn send_file_chunks(
     tx: &tokio::sync::mpsc::Sender<Item>,
     free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
