@@ -292,6 +292,13 @@ const ZIP_CHUNK: usize = 262_144;
 /// 消息队列最多压 `ZIP_QUEUE` 块，再加上生产、消费两侧各自手上的一块。
 const ZIP_QUEUE: usize = 8;
 
+/// 交给 channel 之前的攒批大小。
+///
+/// `async_zip` 写一个条目会按字段分成很多次小写（本地头、数据、数据描述符、中央目录…），
+/// 每次小写经 channel 都会变成一个 chunked 分帧加一次 `sendto`——实测一个 604 字节的
+/// 归档打出了 134 次 `sendto`，内核态因此占了 74%。先在内存里攒够再交出去。
+const ZIP_FLUSH: usize = 64 * 1024;
+
 struct ZipApi {
     root: PathBuf,
 }
@@ -364,7 +371,8 @@ impl ZipApi {
 
         let tx = res.channel();
         tokio::spawn(async move {
-            let mut writer = ZipFileWriter::with_tokio(tx);
+            let mut writer =
+                ZipFileWriter::with_tokio(tokio::io::BufWriter::with_capacity(ZIP_FLUSH, tx));
             while let Some(item) = item_rx.recv().await {
                 match item {
                     Item::Dir { name } => {
@@ -398,7 +406,11 @@ impl ZipApi {
                     Item::Chunk { .. } | Item::FileEnd => {}
                 }
             }
-            let _ = writer.close().await;
+            // `close` 把中央目录写完并把内部 writer 还回来，还得再 flush 一次，
+            // 否则攒在 `BufWriter` 里的尾巴会随任务结束一起丢掉
+            if let Ok(mut buffered) = writer.close().await {
+                let _ = futures_lite::AsyncWriteExt::flush(&mut buffered).await;
+            }
         });
     }
 }
