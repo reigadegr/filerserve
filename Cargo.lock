@@ -881,7 +881,7 @@ dependencies = [
  "lanfile-list",
  "lanfile-sendfile",
  "mimalloc",
- "rustix",
+ "rustix 1.1.5 (git+https://github.com/reigadegr/rustix)",
  "salvo",
  "serde_json",
  "tokio",
@@ -898,7 +898,7 @@ dependencies = [
  "lanfile-sendfile",
  "mime",
  "rust-embed",
- "rustix",
+ "rustix 1.1.5 (git+https://github.com/reigadegr/rustix)",
  "salvo",
  "tokio",
 ]
@@ -912,7 +912,7 @@ dependencies = [
  "chrono",
  "futures-lite",
  "if-addrs",
- "rustix",
+ "rustix 1.1.5 (git+https://github.com/reigadegr/rustix)",
  "salvo",
  "serde",
  "tokio",
@@ -940,7 +940,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "memchr",
- "rustix",
+ "rustix 1.1.5 (git+https://github.com/reigadegr/rustix)",
  "salvo",
  "tokio",
 ]
@@ -1376,6 +1376,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix"
+version = "1.1.5"
+source = "git+https://github.com/reigadegr/rustix#f095ac2685627d72de7c93420b9584faaf06b8d3"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1712,7 +1724,7 @@ dependencies = [
  "fastrand",
  "getrandom",
  "once_cell",
- "rustix",
+ "rustix 1.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "windows-sys",
 ]
 

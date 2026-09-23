@@ -16,10 +16,10 @@ async_zip = { version = "0.0.19", default-features = false, features = [
   "tokio",
 ] }
 futures-lite = { version = "2.6", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["rt", "sync", "fs", "io-util"] }
+tokio = { workspace = true, features = ["rt", "sync", "fs", "io-util"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros"] }
+tokio = { workspace = true, features = ["macros"] }

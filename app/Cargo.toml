@@ -15,14 +15,14 @@ lanfile-list = { path = "../list" }
 lanfile-sendfile = { path = "../sendfile" }
 salvo = { workspace = true, features = ["server", "http1"] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }
-tracing = "0.1.44"
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2"
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 chrono = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { version = "1.1.5", features = ["time"] }
+rustix = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 salvo = { workspace = true, features = ["test"] }

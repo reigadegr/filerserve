@@ -8,12 +8,12 @@ workspace = true
 
 [dependencies]
 salvo = { workspace = true, features = ["server", "http1"] }
-tokio = { version = "1", features = ["fs", "io-util", "net", "rt"] }
-bytes = "1"
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt"] }
+bytes = { workspace = true }
 memchr = "2"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { version = "1.1.5", features = ["fs", "net", "std"] }
+rustix = { workspace = true, features = ["fs", "net", "std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
