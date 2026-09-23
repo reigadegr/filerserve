@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lanfile_namedfile::{FileMeta, NamedFile};
-use lanfile_sendfile::upgrade_response;
+use lanfile_sendfile::{SendfileSlot, upgrade_response, upgrade_response_with_slot};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use mime::Mime;
 use rust_embed::RustEmbed;
@@ -239,7 +239,13 @@ impl ServeFiles {
     ///
     /// salvo 的 handler 与 hyper 快路径共用这一个入口：两条路唯一的差别是错误页由谁补
     /// （salvo 侧是 catcher，快路径自己渲染），响应本身完全一致。找不到时只设状态码。
-    pub async fn serve(&self, sub: &str, req: &Request, res: &mut Response) {
+    pub async fn serve(
+        &self,
+        sub: &str,
+        req: &Request,
+        res: &mut Response,
+        slot: Option<&SendfileSlot>,
+    ) {
         // 路径解析直接在 worker 上做：只有 lstat + openat2，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
@@ -321,7 +327,14 @@ impl ServeFiles {
 
         // 命中条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
         // 这里不再 dup：响应体直接共享缓存里那个 fd（sendfile 带显式 offset，共享描述符是安全的）
-        upgrade_response(req, res, file);
+        match slot {
+            Some(slot) => {
+                upgrade_response_with_slot(slot, res, file);
+            }
+            None => {
+                upgrade_response(req, res, file);
+            }
+        }
     }
 }
 
@@ -341,7 +354,7 @@ impl ServeFiles {
         // 直接从路由参数里借一个 &str：`param::<String>` 会为每个请求分配一个 String，
         // 再走一遍 serde 反序列化；通配参数就在这里，借出来就够了
         let sub = req.params().get("path").map_or("", String::as_str);
-        self.serve(sub, req, res).await;
+        self.serve(sub, req, res, None).await;
     }
 }
 

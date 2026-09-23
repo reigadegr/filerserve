@@ -80,10 +80,30 @@ pub fn upgrade_response(req: &Request, res: &mut Response, file: Arc<File>) -> b
     if status != Some(StatusCode::OK) && status != Some(StatusCode::PARTIAL_CONTENT) {
         return false;
     }
-    let Some(len) = header_u64(res, CONTENT_LENGTH) else {
+    // 顺序与以前一致：先确认 `Content-Length` 在，再查槽位
+    if header_u64(res, CONTENT_LENGTH).is_none() {
+        return false;
+    }
+    let Some(slot) = slot_for(req.local_addr(), req.remote_addr()) else {
         return false;
     };
-    let Some(slot) = slot_for(req.local_addr(), req.remote_addr()) else {
+    upgrade_response_with_slot(&slot, res, file)
+}
+
+/// 同 [`upgrade_response`]，但槽位由调用方直接给出。
+///
+/// 快路径在建连接时就握着这个槽位，用它省掉一次按 `(local, remote)` 的全局查找
+/// （分片互斥锁 + 哈希 + `Arc` 克隆）。
+pub fn upgrade_response_with_slot(
+    slot: &SendfileSlot,
+    res: &mut Response,
+    file: Arc<File>,
+) -> bool {
+    let status = res.status_code;
+    if status != Some(StatusCode::OK) && status != Some(StatusCode::PARTIAL_CONTENT) {
+        return false;
+    }
+    let Some(len) = header_u64(res, CONTENT_LENGTH) else {
         return false;
     };
     let offset = header_str(res, CONTENT_RANGE)

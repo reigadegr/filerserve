@@ -56,6 +56,8 @@ struct FastService {
     fallback: Box<dyn Fn(HyperRequest<Incoming>) -> BoxedFuture + Send + Sync>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
+    /// 本连接的 sendfile 槽位。直接握着它，`upgrade_response` 就不必回 registry 查一次
+    slot: Arc<SendfileSlot>,
 }
 
 impl HyperService<HyperRequest<Incoming>> for FastService {
@@ -64,12 +66,14 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
     type Future = BoxedFuture;
 
     fn call(&self, req: HyperRequest<Incoming>) -> Self::Future {
-        // 先只做判定，判完才把请求交出去：快路径要独占它，回退路径要原样还给 salvo
-        if files_sub_path(req.uri().path()).is_none() {
+        // 分流只看前缀，真正的解码留到下面做一次：`files_sub_path` 只在这个前缀缺席时返回
+        // `None`，所以这样判与判它等价，却省掉一次「去前缀 + 去斜杠 + 解码」
+        if !req.uri().path().starts_with("/files/") {
             return (self.fallback)(req);
         }
         let files = Arc::clone(&self.files);
         let access_log = Arc::clone(&self.access_log);
+        let slot = Arc::clone(&self.slot);
         let (local_addr, remote_addr) = (self.local_addr.clone(), self.remote_addr.clone());
         Box::pin(async move {
             let mut request = Request::from_hyper(req, Scheme::HTTP);
@@ -78,22 +82,25 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
             let mut res = Response::new();
             // 一次把容量留够：`HeaderMap` 逐个 insert 会反复扩容，实测每请求 4 次分配
             res.headers_mut().reserve(8);
-            let mut depot = Depot::new();
             // 借自 `request`，不再单独分配：`decode_url_path` 在没有 `%` 时就是借用
             let sub = files_sub_path(request.uri().path()).unwrap_or_default();
-            if request.method() == Method::GET || request.method() == Method::HEAD {
-                files.serve(&sub, &request, &mut res).await;
+            // 方法取一次，下面判 GET/HEAD 与补错误页都用它
+            let is_head = request.method() == Method::HEAD;
+            if is_head || request.method() == Method::GET {
+                files.serve(&sub, &request, &mut res, Some(&slot)).await;
             } else {
                 res.status_code(StatusCode::NOT_FOUND);
             }
             // 与 salvo 的 `Service` 完全一致地补错误页：状态码是 4xx/5xx 且没写出响应体时
             // 跑一遍 catcher（HEAD 不补体，RFC 9110 §9.3.2）
-            if request.method() != Method::HEAD
+            if !is_head
                 && (res.body.is_none() || res.body.is_error())
                 && res
                     .status_code
                     .is_some_and(|code| code.is_client_error() || code.is_server_error())
             {
+                // `Depot` 只有补错误页时才用得到，正常 200 路径不必每请求建一次
+                let mut depot = Depot::new();
                 Catcher::default()
                     .catch(&mut request, &mut depot, &mut res, ConnCtrl::new())
                     .await;
@@ -128,7 +135,8 @@ pub async fn serve(
         // 40ms。Go 的 net 包默认就打开 TCP_NODELAY，这里对齐。
         conn.set_nodelay(true)?;
         let key = conn_key(&local_addr, &remote_addr);
-        let stream = SendfileStream::new(conn, Arc::new(SendfileSlot::new()), key);
+        let slot = Arc::new(SendfileSlot::new());
+        let stream = SendfileStream::new(conn, Arc::clone(&slot), key);
         let io = StraightStream::new(stream, None, ConnCtrl::new(), None);
         let handler = service.hyper_handler(
             local_addr.clone(),
@@ -144,6 +152,7 @@ pub async fn serve(
             fallback: Box::new(move |req| handler.call(req)),
             local_addr,
             remote_addr,
+            slot,
         };
         let builder = Arc::clone(&builder);
         tokio::spawn(async move {
