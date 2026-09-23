@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use lanfile_namedfile::{FileMeta, NamedFile};
 use lanfile_sendfile::upgrade_response;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, Advice, Mode, OFlags, ResolveFlags};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use salvo::http::header::CONTENT_DISPOSITION;
+use salvo::http::header::{CONTENT_DISPOSITION, LAST_MODIFIED};
 use salvo::{
     http::{HeaderValue, Method, headers::ETag},
     prelude::*,
@@ -36,8 +36,12 @@ pub struct Asset;
 /// 与拼接。缓存只在 Linux/Android 上启用，其他平台上这个类型只会以 `None` 出现。
 #[derive(Clone)]
 struct CachedHeaders {
-    /// 解析出来的 `Content-Type`（需要时已带上 `charset=`），命中时省掉嗅探的那次 `pread`
-    content_type: Mime,
+    /// 解析出来的 `Content-Type`（需要时已带上 `charset=`）。必须交给 `NamedFileBuilder`：
+    /// 不给它的话，`NamedFile` 会自己 `pread` 一段文件样本去嗅探类型，那是一次系统调用
+    /// 用 `Arc` 共享：`Mime` 的 `Clone` 会深拷贝它内部的 `String`，命中路径上不该付这份钱
+    content_type: Arc<Mime>,
+    /// 已经编码好的 `Last-Modified`（文件时间早于 epoch 时没有），省掉每请求一次日期格式化
+    last_modified: Option<HeaderValue>,
     /// 已经编码好的 `ETag`（文件时间早于 epoch 时没有）
     etag: Option<ETag>,
     /// 已经编码好的 `Content-Disposition`
@@ -55,6 +59,17 @@ pub struct ServeFiles {
     /// 已打开文件的缓存：命中时省掉 openat、4 次 readlink 与 fadvise
     #[cfg(any(target_os = "linux", target_os = "android"))]
     cache: FileCache,
+}
+
+/// [`ServeFiles::open`] 的返回值：拼好的路径、fd、元数据，以及命中时已经编码好的响应头。
+type Opened = (Arc<Path>, Arc<File>, FileMeta, Option<Arc<CachedHeaders>>);
+
+/// 从已经写完响应头的 `Response` 里取回编码好的 `Last-Modified`。
+///
+/// 它是 `send_inner` 在发送时按同一份元数据写上去的，取回来存缓存即可，不必自己再编码。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn encoded_last_modified(res: &Response) -> Option<HeaderValue> {
+    res.headers().get(LAST_MODIFIED).cloned()
 }
 
 impl ServeFiles {
@@ -91,13 +106,14 @@ impl ServeFiles {
     /// 校验结果在 `REVALIDATE_MILLIS`（1 秒）内直接复用：这段时间里连上面那次
     /// `symlink_metadata` 都不做，所以文件被改写、替换或删除后，最长 1 秒内仍按上一次校验过的
     /// 元数据与 fd 响应。
-    fn open(&self, sub: &str) -> Option<(PathBuf, Arc<File>, FileMeta, Option<CachedHeaders>)> {
-        let joined = self.root.join(sub);
-        // 有效期内的快路径：连 `symlink_metadata` 都省掉（本机 1.03 µs，占每请求 CPU 的 3%）
+    fn open(&self, sub: &str) -> Option<Opened> {
+        // 有效期内的快路径：连 `symlink_metadata` 都省掉（本机 1.03 µs，占每请求 CPU 的 3%），
+        // 连路径也不必再拼——缓存里存着上次拼好的那一份
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some((file, metadata, headers)) = self.cache.get_fresh(sub) {
+        if let Some((joined, file, metadata, headers)) = self.cache.get_fresh(sub) {
             return Some((joined, file, metadata, Some(headers)));
         }
+        let joined = self.root.join(sub);
         let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
             // 路径已经不存在了，顺手把缓存里占着的 fd 放掉
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -108,7 +124,7 @@ impl ServeFiles {
             return None;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some((file, metadata, headers)) = self.cache.get(sub, &metadata) {
+        if let Some((joined, file, metadata, headers)) = self.cache.get(sub, &metadata) {
             return Some((joined, file, metadata, Some(headers)));
         }
         let file = self.open_uncached(sub, &joined)?;
@@ -122,7 +138,7 @@ impl ServeFiles {
         if metadata.len() > 4096 {
             let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
         }
-        Some((joined, Arc::new(file), metadata, None))
+        Some((Arc::from(joined), Arc::new(file), metadata, None))
     }
 
     /// 缓存未命中时真正去解析并打开文件（类型检查已由 [`Self::open`] 完成）。
@@ -233,11 +249,19 @@ impl ServeFiles {
         };
 
         // 关闭 NamedFile 的小文件预读：预读会把内容读进用户态，而 sendfile 直接从页缓存发，
-        // 那次读纯属浪费；关掉后所有响应体都交给 sendfile，HEAD 本来也不需要预读
-        let mut builder = NamedFile::builder(path).preload_threshold(0);
-        // 缓存命中时把上次解析好的类型直接交给它：需要 charset 的类型因此不必再读一次样本
+        // 那次读纯属浪费；关掉后所有响应体都交给 sendfile，HEAD 本来也不需要预读。
+        // 路径走共享的 `Arc<Path>`：命中时它来自缓存，不必每请求再拼一次
+        let mut builder = NamedFile::builder_shared(Arc::clone(&path)).preload_threshold(0);
+        // 命中时做两件事：类型交给 builder（否则它会自己去 pread 样本嗅探，那是系统调用），
+        // 编码好的 `Last-Modified` 直接塞进响应头——`send_inner` 见到已经存在就不会再格式化。
+        // 这里**不能**预置 `Content-Type`：`send_inner` 见到它就会走 `res.content_type()`，
+        // 把头部重新解析成一个 `Mime`，比它省掉的那次 `from_str` 贵得多
         if let Some(cached) = &cached {
             builder = builder.content_type(cached.content_type.clone());
+            if let Some(last_modified) = &cached.last_modified {
+                res.headers_mut()
+                    .insert(LAST_MODIFIED, last_modified.clone());
+            }
         }
         // 元数据跟着缓存一起给出来（未命中时是刚 fstat 的），所以这里不必再 fstat 一次
         let Ok(mut named_file) = builder
@@ -264,11 +288,9 @@ impl ServeFiles {
         {
             named_file.set_content_disposition(disposition);
         }
-        // send 会消费掉 named_file，未命中时要写进缓存的那份类型得先取出来。
-        // 命中时这份类型根本用不到，而 `Mime` 的 Clone 会深拷贝它内部的 `String`，
-        // 所以只在未命中时取，让命中路径省掉一次堆分配
+        // send 会消费掉 named_file，未命中时要写进缓存的那份类型得先取出来
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let resolved_type = cached.is_none().then(|| named_file.content_type().clone());
+        let resolved_type = cached.is_none().then(|| named_file.content_type());
         let head_only = req.method() == Method::HEAD;
         if head_only {
             named_file.send_head(req.headers(), res).await;
@@ -276,19 +298,21 @@ impl ServeFiles {
             named_file.send(req.headers(), res).await;
         }
 
-        // 未命中：把 fd、它的元数据、刚解析出来的类型，以及刚编码好的 ETag 与
-        // Content-Disposition 一起存进缓存，下次命中就不必再算一遍
+        // 未命中：编码好的头 `send` 已经写进 `res` 了，直接取回来存缓存，存下来的就是这次
+        // 真正发出去的那一份；类型得在 send 之前取，因为 send 会消费掉 named_file
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(resolved_type) = resolved_type {
+        if let Some(content_type) = resolved_type {
             self.cache.insert(
                 sub,
+                Arc::clone(&path),
                 Arc::clone(&file),
                 metadata,
-                CachedHeaders {
-                    content_type: resolved_type,
+                Arc::new(CachedHeaders {
+                    content_type,
+                    last_modified: encoded_last_modified(res),
                     etag,
                     disposition: res.headers().get(CONTENT_DISPOSITION).cloned(),
-                },
+                }),
             );
         }
         if head_only {
@@ -457,7 +481,7 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(async {
-                let Some((_, file, metadata, cached)) = files.open("ok.txt") else {
+                let Some((joined, file, metadata, cached)) = files.open("ok.txt") else {
                     panic!("第一次应当打开成功");
                 };
                 assert!(cached.is_none(), "第一次不该命中");
@@ -472,13 +496,15 @@ mod tests {
                 let disposition = HeaderValue::from_static("inline");
                 files.cache.insert(
                     "ok.txt",
+                    joined,
                     file,
                     metadata,
-                    CachedHeaders {
-                        content_type: named.content_type().clone(),
+                    Arc::new(CachedHeaders {
+                        content_type: named.content_type(),
+                        last_modified: None,
                         etag: Some(etag.clone()),
                         disposition: Some(disposition.clone()),
-                    },
+                    }),
                 );
                 let Some((_, _, _, cached)) = files.open("ok.txt") else {
                     panic!("第二次应当打开成功");
@@ -486,7 +512,7 @@ mod tests {
                 let Some(cached) = cached else {
                     panic!("第二次应当命中");
                 };
-                assert_eq!(cached.content_type, *named.content_type());
+                assert_eq!(cached.content_type, named.content_type());
                 assert_eq!(cached.etag, Some(etag), "命中时 ETag 也从缓存来");
                 assert_eq!(
                     cached.disposition,

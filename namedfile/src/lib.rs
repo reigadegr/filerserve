@@ -64,8 +64,8 @@ use mime::Mime;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use salvo::http::body::ResBody;
 use salvo::http::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, IF_NONE_MATCH, RANGE,
-    X_CONTENT_TYPE_OPTIONS,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, IF_NONE_MATCH,
+    LAST_MODIFIED, RANGE, X_CONTENT_TYPE_OPTIONS,
 };
 use salvo::http::headers::*;
 use salvo::http::mime::{detect_text_mime, fill_mime_charset_if_need, is_charset_required_mime};
@@ -285,7 +285,7 @@ impl FileMeta {
 /// [`use_last_modified()`](NamedFile::use_last_modified).
 #[derive(Debug)]
 pub struct NamedFile {
-    path: PathBuf,
+    path: Arc<Path>,
     /// Overrides the name `Content-Disposition` reports, when the bytes come from
     /// a different path than the requested resource.
     disposition_name: Option<String>,
@@ -296,7 +296,7 @@ pub struct NamedFile {
     buffer_size: u64,
     metadata: FileMeta,
     flags: BitFlags<Flag>,
-    content_type: mime::Mime,
+    content_type: Arc<Mime>,
     content_disposition: Option<HeaderValue>,
     content_encoding: Option<HeaderValue>,
     /// Pre-read content for small files, avoiding ChunkedFile + spawn_blocking overhead.
@@ -333,11 +333,11 @@ pub struct NamedFile {
 /// ```
 #[derive(Clone, Debug)]
 pub struct NamedFileBuilder {
-    path: PathBuf,
+    path: Arc<Path>,
     attached_name: Option<String>,
     disposition_name: Option<String>,
     disposition_type: Option<String>,
-    content_type: Option<mime::Mime>,
+    content_type: Option<Arc<Mime>>,
     content_encoding: Option<String>,
     buffer_size: Option<u64>,
     preload_threshold: Option<u64>,
@@ -387,7 +387,7 @@ impl NamedFileBuilder {
     /// Sets content type and returns `Self`.
     #[inline]
     #[must_use]
-    pub fn content_type(mut self, content_type: mime::Mime) -> Self {
+    pub fn content_type(mut self, content_type: Arc<Mime>) -> Self {
         self.content_type = Some(content_type);
         self
     }
@@ -545,7 +545,7 @@ impl NamedFileBuilder {
         // Determine what charset detection is needed before the blocking call.
         let inferred_mime = content_type
             .clone()
-            .or_else(|| mime_infer::from_path(&path).first());
+            .or_else(|| mime_infer::from_path(&path).first().map(Arc::new));
         // When a content encoding is set, the on-disk bytes are the *encoded*
         // (e.g. gzip) payload of a precompressed sidecar file. Sniffing a charset
         // or text mime from those compressed bytes yields a bogus result (the
@@ -637,17 +637,21 @@ impl NamedFileBuilder {
         let file = info.file;
 
         // Resolve content type, using preread bytes for charset detection if needed.
-        let content_type = if let Some(mut mime) = inferred_mime {
+        // 只有需要补 charset 时才克隆一份出来改，其余情况直接共享缓存里那个 `Arc`
+        let content_type = if let Some(mime) = inferred_mime {
             if needs_charset {
+                let mut mime = (*mime).clone();
                 let sample = info.detection_sample.as_deref().unwrap_or(&[]);
                 fill_mime_charset_if_need(&mut mime, sample);
+                Arc::new(mime)
+            } else {
+                mime
             }
-            mime
         } else if needs_detect {
             let sample = info.detection_sample.as_deref().unwrap_or(&[]);
-            detect_text_mime(sample).unwrap_or(mime::APPLICATION_OCTET_STREAM)
+            Arc::new(detect_text_mime(sample).unwrap_or(mime::APPLICATION_OCTET_STREAM))
         } else {
-            mime::APPLICATION_OCTET_STREAM
+            Arc::new(mime::APPLICATION_OCTET_STREAM)
         };
 
         let preread = info.preread.map(Bytes::from);
@@ -824,8 +828,16 @@ impl NamedFile {
     /// Creates a new [`NamedFileBuilder`].
     #[inline]
     pub fn builder(path: impl Into<PathBuf>) -> NamedFileBuilder {
+        Self::builder_shared(Arc::from(path.into()))
+    }
+
+    /// Creates a new [`NamedFileBuilder`] from an already shared path.
+    ///
+    /// 路径来自缓存的 `Arc<Path>` 时用它：命中路径上不必再拷贝一次路径。
+    #[inline]
+    pub fn builder_shared(path: Arc<Path>) -> NamedFileBuilder {
         NamedFileBuilder {
-            path: path.into(),
+            path,
             attached_name: None,
             disposition_name: None,
             disposition_type: None,
@@ -864,19 +876,19 @@ impl NamedFile {
     /// Retrieve the path of this file.
     #[inline]
     pub fn path(&self) -> &Path {
-        self.path.as_path()
+        &self.path
     }
 
     /// Get content type value.
     #[inline]
-    pub fn content_type(&self) -> &mime::Mime {
-        &self.content_type
+    pub fn content_type(&self) -> Arc<Mime> {
+        Arc::clone(&self.content_type)
     }
     /// Sets the MIME Content-Type for serving this file. By default
     /// the Content-Type is inferred from the filename extension.
     #[inline]
     pub fn set_content_type(&mut self, content_type: mime::Mime) {
-        self.content_type = content_type;
+        self.content_type = Arc::new(content_type);
     }
 
     /// Get Content-Disposition value.
@@ -1118,7 +1130,7 @@ impl NamedFile {
         }
         if !res.headers().contains_key(CONTENT_TYPE) {
             // 同上：只要类型的字符串形式，不必克隆整个 `Mime`
-            if let Ok(value) = HeaderValue::from_str(self.content_type.as_ref()) {
+            if let Ok(value) = HeaderValue::from_str(AsRef::<str>::as_ref(&*self.content_type)) {
                 res.headers_mut().insert(CONTENT_TYPE, value);
             }
         }
@@ -1129,7 +1141,9 @@ impl NamedFile {
                 .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         }
         if let Some(lm) = last_modified.and_then(|lm| self.encodable_last_modified(lm)) {
-            res.headers_mut().typed_insert(LastModified::from(lm));
+            if !res.headers().contains_key(LAST_MODIFIED) {
+                res.headers_mut().typed_insert(LastModified::from(lm));
+            }
         }
         if let Some(etag) = etag {
             res.headers_mut().typed_insert(etag);
@@ -1468,7 +1482,7 @@ mod tests {
             .expect("build named file");
         // The file must be recognised *as* an SVG, otherwise this test would also
         // pass on an unidentified file falling back to `application/octet-stream`.
-        assert_eq!(named.content_type(), &mime::IMAGE_SVG);
+        assert_eq!(*named.content_type(), mime::IMAGE_SVG);
 
         let mut res = Response::new();
         named.send(&HeaderMap::new(), &mut res).await;
@@ -1544,7 +1558,7 @@ mod tests {
             .build()
             .await
             .expect("build named file");
-        assert_eq!(named.content_type(), &mime::IMAGE_SVG);
+        assert_eq!(*named.content_type(), mime::IMAGE_SVG);
 
         let mut res = Response::new();
         res.headers_mut()
@@ -1576,7 +1590,7 @@ mod tests {
         file.flush().expect("flush");
 
         let named = NamedFile::builder(file.path())
-            .content_type("text/javascript".parse().expect("parse mime"))
+            .content_type(Arc::new("text/javascript".parse().expect("parse mime")))
             .content_encoding("gzip")
             .build()
             .await
@@ -1681,7 +1695,7 @@ mod tests {
         std::fs::write(&path, b"hello").expect("write file");
 
         let named = NamedFile::builder(&path)
-            .content_type(mime::TEXT_PLAIN)
+            .content_type(Arc::new(mime::TEXT_PLAIN))
             .preload_threshold(0)
             .build()
             .await
@@ -1909,7 +1923,7 @@ mod tests {
             .await
             .expect("build named file");
 
-        assert_eq!(named.content_type(), &mime::IMAGE_SVG);
+        assert_eq!(*named.content_type(), mime::IMAGE_SVG);
         assert_eq!(
             named.content_encoding().map(|v| v.to_str().unwrap()),
             Some("gzip")

@@ -26,6 +26,7 @@
 //! [`CAPACITY_PER_SHARD`] 条，线性扫一遍比维护链表简单得多；也避免了"满了全清"把热文件一起
 //! 丢掉——下载大量不同文件时，全清会让命中率归零，缓存反而比不缓存慢（见第 23 节）。
 
+use std::path::Path;
 use std::{
     collections::HashMap,
     fs::{File, Metadata},
@@ -65,7 +66,10 @@ struct Entry {
     file: Arc<File>,
     /// 这个 fd 自己的 `fstat` 结果，命中时直接交给 `NamedFile`，省掉每请求一次 `fstat`
     metadata: FileMeta,
-    headers: CachedHeaders,
+    /// 已经编码好的响应头。装一层 `Arc`：命中时只加一次引用计数，不再深拷贝 `Mime` 里的 `String`
+    headers: Arc<CachedHeaders>,
+    /// 拼好的绝对路径。它是 (root, sub) 的纯函数，存下来命中时就不必每请求再拼一次
+    joined: Arc<Path>,
     /// 最近一次被用到的序号，淘汰时取最小的那条
     used: u64,
     /// 最近一次校验（[`FileCache::get`]）或写入（[`FileCache::insert`]）的时刻，
@@ -93,14 +97,18 @@ fn shard_index(path: &str) -> usize {
     (hasher.finish() as usize) % SHARDS
 }
 
-/// 从命中的条目里取出要交出去的三样东西，并刷新它的 LRU 序号
-fn take(entry: &mut Entry, clock: u64) -> (Arc<File>, FileMeta, CachedHeaders) {
+/// 一次命中交出去的四样东西：拼好的路径、fd、元数据、已经编码好的响应头。
+type Hit = (Arc<Path>, Arc<File>, FileMeta, Arc<CachedHeaders>);
+
+/// 从命中的条目里取出要交出去的东西，并刷新它的 LRU 序号
+fn take(entry: &mut Entry, clock: u64) -> Hit {
     entry.used = clock;
-    // 锁里只做拷贝：克隆 Arc、元数据与已经编码好的响应头，没有任何系统调用
+    // 锁里只做拷贝：克隆三个 `Arc` 加一份纯数据的元数据，没有系统调用，也没有堆分配
     (
+        Arc::clone(&entry.joined),
         Arc::clone(&entry.file),
         entry.metadata.clone(),
-        entry.headers.clone(),
+        Arc::clone(&entry.headers),
     )
 }
 
@@ -114,7 +122,7 @@ impl FileCache {
     /// 这里**不刷新**时间戳：否则持续被请求的热文件永远等不到复校验，陈旧窗口就成了无界。
     /// 复校验由 [`Self::get`] 做，它命中时会把时间戳刷新到当前时刻。
     #[must_use]
-    pub fn get_fresh(&self, path: &str) -> Option<(Arc<File>, FileMeta, CachedHeaders)> {
+    pub fn get_fresh(&self, path: &str) -> Option<Hit> {
         let mut shard = self.shard(path).lock().ok()?;
         shard.clock += 1;
         let clock = shard.clock;
@@ -131,11 +139,7 @@ impl FileCache {
     ///
     /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中；命中即刷新有效期。
     #[must_use]
-    pub fn get(
-        &self,
-        path: &str,
-        metadata: &Metadata,
-    ) -> Option<(Arc<File>, FileMeta, CachedHeaders)> {
+    pub fn get(&self, path: &str, metadata: &Metadata) -> Option<Hit> {
         let mut shard = self.shard(path).lock().ok()?;
         shard.clock += 1;
         let clock = shard.clock;
@@ -158,7 +162,14 @@ impl FileCache {
     /// `metadata` 必须是这个 fd 自己的 `fstat` 结果（而不是路径的 `lstat`）：命中时它会被
     /// 直接当作文件的元数据使用，两者必须是同一个 inode 的属性。`headers` 里的 `ETag` 与
     /// `Content-Disposition` 必须是从同一份元数据算出来的，否则命中时会给出错的响应头。
-    pub fn insert(&self, path: &str, file: Arc<File>, metadata: FileMeta, headers: CachedHeaders) {
+    pub fn insert(
+        &self,
+        path: &str,
+        joined: Arc<Path>,
+        file: Arc<File>,
+        metadata: FileMeta,
+        headers: Arc<CachedHeaders>,
+    ) {
         let Ok(mut shard) = self.shard(path).lock() else {
             return;
         };
@@ -181,6 +192,7 @@ impl FileCache {
                 file,
                 metadata,
                 headers,
+                joined,
                 used: clock,
                 validated_at: now_millis(),
             },
@@ -212,20 +224,21 @@ mod tests {
     use salvo::http::{HeaderValue, headers::ETag};
     use std::io::Read as _;
 
-    fn text_plain() -> Mime {
-        match "text/plain; charset=utf-8".parse() {
+    fn text_plain() -> Arc<Mime> {
+        Arc::new(match "text/plain; charset=utf-8".parse() {
             Ok(mime) => mime,
             Err(_) => unreachable!("写死的类型应当能解析"),
-        }
+        })
     }
 
     /// 测试用：只带类型，ETag 与 Content-Disposition 留空
-    fn headers() -> CachedHeaders {
-        CachedHeaders {
+    fn headers() -> Arc<CachedHeaders> {
+        Arc::new(CachedHeaders {
             content_type: text_plain(),
+            last_modified: None,
             etag: None,
             disposition: None,
-        }
+        })
     }
 
     /// 测试用：写死的 ETag（解析不了就说明测试自己写错了）
@@ -283,10 +296,16 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
 
-        cache.insert("file.txt", Arc::new(file), metadata, headers());
+        cache.insert(
+            "file.txt",
+            Arc::from(Path::new("file.txt")),
+            Arc::new(file),
+            metadata,
+            headers(),
+        );
         let cached = cache.get("file.txt", &fixture.lstat()?);
         assert!(cached.is_some(), "元数据没变就应该命中");
-        if let Some((file, metadata, headers)) = cached {
+        if let Some((_, file, metadata, headers)) = cached {
             assert_eq!(read_all(&file)?, "hello");
             assert_eq!(metadata.len(), 5, "命中时给出的元数据就是那个 fd 的");
             assert_eq!(headers.content_type, text_plain(), "命中时类型也从缓存来");
@@ -303,7 +322,13 @@ mod tests {
         let fixture = Fixture::new("change")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
-        cache.insert("file.txt", Arc::new(file), metadata, headers());
+        cache.insert(
+            "file.txt",
+            Arc::from(Path::new("file.txt")),
+            Arc::new(file),
+            metadata,
+            headers(),
+        );
 
         std::fs::write(&fixture.path, b"hello, world")?;
         assert!(
@@ -320,7 +345,13 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
         let original = fixture.lstat()?;
-        cache.insert("file.txt", Arc::new(file), metadata, headers());
+        cache.insert(
+            "file.txt",
+            Arc::from(Path::new("file.txt")),
+            Arc::new(file),
+            metadata,
+            headers(),
+        );
 
         let replacement = fixture.dir.join("replacement.txt");
         std::fs::write(&replacement, b"world")?;
@@ -360,16 +391,18 @@ mod tests {
         let disposition = HeaderValue::from_static("inline");
         cache.insert(
             "file.txt",
+            Arc::from(Path::new("file.txt")),
             Arc::new(file),
             metadata,
-            CachedHeaders {
+            Arc::new(CachedHeaders {
                 content_type: text_plain(),
+                last_modified: None,
                 etag: Some(etag.clone()),
                 disposition: Some(disposition.clone()),
-            },
+            }),
         );
 
-        let Some((_, _, cached)) = cache.get("file.txt", &fixture.lstat()?) else {
+        let Some((_, _, _, cached)) = cache.get("file.txt", &fixture.lstat()?) else {
             panic!("元数据没变就应该命中");
         };
         assert_eq!(cached.etag, Some(etag), "命中时应当给出缓存里的 ETag");
@@ -386,7 +419,13 @@ mod tests {
         let fixture = Fixture::new("remove")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
-        cache.insert("file.txt", Arc::new(file), metadata, headers());
+        cache.insert(
+            "file.txt",
+            Arc::from(Path::new("file.txt")),
+            Arc::new(file),
+            metadata,
+            headers(),
+        );
         cache.remove("file.txt");
         assert!(cache.get("file.txt", &fixture.lstat()?).is_none());
         Ok(())
@@ -399,7 +438,13 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
         let path = "file.txt";
-        cache.insert(path, Arc::new(file), metadata, headers());
+        cache.insert(
+            path,
+            Arc::from(Path::new(path)),
+            Arc::new(file),
+            metadata,
+            headers(),
+        );
 
         assert!(
             cache.get_fresh(path).is_some(),
@@ -440,8 +485,10 @@ mod tests {
         let (file, metadata) = fixture.open()?;
         let file = Arc::new(file);
         for i in 0..2000 {
+            let path = format!("path-{i}");
             cache.insert(
-                &format!("path-{i}"),
+                &path,
+                Arc::from(Path::new(&path)),
                 Arc::clone(&file),
                 metadata.clone(),
                 headers(),
@@ -481,14 +528,26 @@ mod tests {
             unreachable!("至少有一条用于触发淘汰");
         };
         for path in &paths {
-            cache.insert(path, Arc::clone(&file), metadata.clone(), headers());
+            cache.insert(
+                path,
+                Arc::from(Path::new(path)),
+                Arc::clone(&file),
+                metadata.clone(),
+                headers(),
+            );
         }
         assert!(
             cache.get(&target, &fixture.lstat()?).is_some(),
             "刚插入的应当命中"
         );
 
-        cache.insert(&extra, Arc::clone(&file), metadata, headers());
+        cache.insert(
+            &extra,
+            Arc::from(Path::new(&extra)),
+            Arc::clone(&file),
+            metadata,
+            headers(),
+        );
         assert!(
             cache.get(&target, &fixture.lstat()?).is_some(),
             "刚用过的不能被淘汰"
