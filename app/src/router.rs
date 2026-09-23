@@ -92,9 +92,6 @@ impl AccessLogHandler {
     ) {
         ctrl.call_next(req, depot, res).await;
 
-        if matches!(self.access_log, AccessLog::Off) {
-            return;
-        }
         let method = req.method().as_str();
         let path = req.uri().path();
         let ip = req.remote_addr().ip();
@@ -124,8 +121,14 @@ impl AccessLogHandler {
 
 #[must_use]
 pub fn build_router(root: PathBuf, port: u16, access_log: AccessLog) -> Router {
-    Router::new()
-        .hoop(AccessLogHandler { access_log })
+    // 日志关掉时连 hoop 都不挂：hoop 是 `#[async_trait]`，每请求要装箱一个 future 再
+    // 动态分发一次，而它在 `Off` 下什么都不做。挂上与否的语义完全相同。
+    let router = if matches!(access_log, AccessLog::Off) {
+        Router::new()
+    } else {
+        Router::new().hoop(AccessLogHandler { access_log })
+    };
+    router
         .push(static_routes(root.clone()))
         .push(list_routes(root, port))
 }

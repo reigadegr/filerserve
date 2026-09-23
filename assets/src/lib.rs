@@ -15,7 +15,7 @@ use salvo::http::header::CONTENT_DISPOSITION;
 use salvo::{
     http::{HeaderValue, Method, headers::ETag},
     prelude::*,
-    routing::{Filter, filters},
+    routing::filters,
     serve_static::static_embed,
 };
 
@@ -222,6 +222,15 @@ fn has_seccomp_filter(status: &str) -> bool {
 impl ServeFiles {
     #[allow(clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        // 方法判断从路由过滤器挪到这里：salvo 的过滤器是 `#[async_trait]`，挂在路由上的
+        // 每个过滤器每请求都要装箱一个 future 并动态分发一次（实测 `Or<Method, Method>`
+        // 每请求两次分配），而在 handler 里只是一次比较。
+        // 语义不变：非 GET/HEAD 依旧是 404，空响应体交给 catcher 补错误页
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        }
+
         // 直接从路由参数里借一个 &str：`param::<String>` 会为每个请求分配一个 String，
         // 再走一遍 serde 反序列化；通配参数就在这里，借出来就够了
         let sub = req.params().get("path").map_or("", String::as_str);
@@ -304,11 +313,7 @@ impl ServeFiles {
 #[must_use]
 pub fn static_routes(root: PathBuf) -> Router {
     Router::new()
-        .push(
-            Router::with_path("/files/{**path}")
-                .filter(filters::get().or(filters::head()))
-                .goal(ServeFiles::new(root)),
-        )
+        .push(Router::with_path("/files/{**path}").goal(ServeFiles::new(root)))
         .push(
             Router::new()
                 .filter(filters::get())
