@@ -28,7 +28,6 @@
 
 use std::path::Path;
 use std::{
-    collections::HashMap,
     fs::{File, Metadata},
     hash::{Hash, Hasher},
     os::unix::fs::MetadataExt,
@@ -36,6 +35,7 @@ use std::{
 };
 
 use lanfile_namedfile::FileMeta;
+use rustc_hash::FxHashMap;
 
 use crate::CachedHeaders;
 
@@ -80,7 +80,7 @@ struct Entry {
 /// 一片：条目表 + 该片自己的 LRU 序号（片内单调递增，不需要原子操作）
 #[derive(Default)]
 struct Shard {
-    entries: HashMap<Box<str>, Entry>,
+    entries: FxHashMap<Box<str>, Entry>,
     clock: u64,
 }
 
@@ -90,9 +90,20 @@ pub struct FileCache {
     shards: [Mutex<Shard>; SHARDS],
 }
 
-/// 路径落在哪一片：同一路径永远落在同一片
+/// 路径落在哪一片：同一路径永远落在同一片。
+///
+/// 这里和片内的 `HashMap` 都用 `FxHash` 而不是 `SipHash`。理由不是「LAN 不怕 DoS」，而是
+/// 这套缓存的容量上界让碰撞 `DoS` 根本不成立：
+/// - 条目总数硬上限是 `SHARDS * CAPACITY_PER_SHARD`（每片 `CAPACITY_PER_SHARD` 条）。
+///   即使最坏情况整片同桶，也只是这几十个条目的线性扫描，没有 n² 退化。
+/// - 能进缓存的路径必须是 `root` 下真实存在的文件：`open` 里 `symlink_metadata` 失败会
+///   直接 `remove` 并返回，不会插入。要填满这张表，攻击者得先让这些文件真的存在。
+/// - 分片索引这一侧更无从攻击：落错片只降低命中率，不拉长任何一次查找。
+///
+/// 注意：若把 `FileCache` 挪去缓存**用户可控且不要求文件存在**的键，上面两条前提即不成立，
+/// 那时必须换回抗碰撞的哈希。
 fn shard_index(path: &str) -> usize {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = rustc_hash::FxHasher::default();
     path.hash(&mut hasher);
     (hasher.finish() as usize) % SHARDS
 }
