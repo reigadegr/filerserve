@@ -143,13 +143,17 @@ pub async fn serve(
         conn.set_nodelay(true)?;
         let slot = Arc::new(SendfileSlot::new());
         let stream = SendfileStream::new_unregistered(conn, Arc::clone(&slot));
-        let io = StraightStream::new(stream, None, ConnCtrl::new(), None);
+        // 一条连接只建一份 `ConnCtrl`，与 salvo 的 `TcpAcceptor` 一样：`HyperHandler` 会把它
+        // 插进每个请求的 extensions，handler 拿到的必须就是驱动这条连接的那一份，
+        // `abort()`/`graceful_shutdown()`/`relax_timeouts()` 才会真的作用到这条连接上
+        let conn_ctrl = ConnCtrl::new();
+        let io = StraightStream::new(stream, None, conn_ctrl.clone(), None);
         let handler = service.hyper_handler(
             local_addr.clone(),
             remote_addr.clone(),
             Scheme::HTTP,
             None,
-            ConnCtrl::new(),
+            conn_ctrl.clone(),
             None,
         );
         let fast = FastService {
@@ -163,7 +167,7 @@ pub async fn serve(
         let builder = Arc::clone(&builder);
         tokio::spawn(async move {
             if let Err(error) = builder
-                .serve_connection(io, fast, None, ConnCtrl::new(), None)
+                .serve_connection(io, fast, None, conn_ctrl, None)
                 .await
             {
                 tracing::debug!("连接出错: {error}");
