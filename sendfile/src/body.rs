@@ -121,7 +121,10 @@ impl SendfileBody {
         self.remaining
     }
 
-    /// Always false: an armed plan is never empty.
+    /// Whether every placeholder byte has been handed over.
+    ///
+    /// An armed plan is never empty to begin with, so this only becomes true
+    /// after the last frame has been taken.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.remaining == 0

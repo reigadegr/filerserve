@@ -438,12 +438,6 @@ pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
         )
 }
 
-/// 阻塞线程内顺序读文件，按 `chunk_size` 分块发往异步侧；返回 `false` 表示 channel 已关闭、应停止遍历。
-///
-/// 缓冲优先取 `free_rx` 里消费侧归还的空缓冲，取不到才新建。`vec![0u8; n]` 走
-/// `alloc_zeroed`，实测 256 KiB 一次约 2.1 µs、其中 98% 是清零；归还的缓冲保持满长，
-/// 所以复用既省掉分配也省掉清零，且读入前不需要 `resize`（那等于把清零做回来）。
-/// 读错与读到 EOF 同样收尾，与原先 `copy_entry` 的语义一致。
 /// 发一个文件：装得下一块就走整条目写入，否则流式分块。返回是否应继续遍历。
 ///
 /// 整条目写入把大小与 CRC 直接写进本地头，省掉流式那条数据描述符和收尾往返。
@@ -509,6 +503,12 @@ fn read_first_chunk(
     (buf, len)
 }
 
+/// 阻塞线程内顺序读文件，按 `chunk_size` 分块发往异步侧；返回 `false` 表示 channel 已关闭、应停止遍历。
+///
+/// 缓冲优先取 `free_rx` 里消费侧归还的空缓冲，取不到才新建。`vec![0u8; n]` 走
+/// `alloc_zeroed`，实测 256 KiB 一次约 2.1 µs、其中 98% 是清零；归还的缓冲保持满长，
+/// 所以复用既省掉分配也省掉清零，且读入前不需要 `resize`（那等于把清零做回来）。
+/// 读错与读到 EOF 都按读完了收尾（返回 `true`），不再继续遍历。
 fn send_file_chunks(
     tx: &tokio::sync::mpsc::Sender<Item>,
     free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,

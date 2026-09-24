@@ -219,6 +219,8 @@ impl AccessLogHandler {
 
 /// 记一条访问日志。salvo 的 hoop 与 hyper 快路径共用这一个出口。
 pub fn log_access(access_log: &AccessLog, req: &Request, res: &Response) {
+    // `Off` 时 salvo 侧根本不挂这个 hoop，所以这道早退只可能由快路径走到：快路径没有
+    // `tracing` 的过滤器兜底，少了它就会在 `RUST_LOG=off` 时照样拼行、照样写日志
     if matches!(access_log, AccessLog::Off) {
         return;
     }

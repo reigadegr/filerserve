@@ -176,10 +176,13 @@ impl<S> Drop for SendfileStream<S> {
     }
 }
 
-/// Moves `len` placeholder bytes to the socket as file content.
+/// Moves up to `len` placeholder bytes to the socket as file content, stopping
+/// early when the transport is momentarily full.
 ///
-/// Returns the number of bytes actually transferred, which is zero when the
-/// socket is momentarily full — the waker is registered in that case.
+/// Returns how many bytes were transferred, which can be less than `len` (zero
+/// included) on a full transport. No waker is registered here:
+/// [`SendfileTarget::poll_writable`] is called by `write_placeholders` before it
+/// parks, while `write_head` reports the short write so Hyper retries at once.
 fn transfer(target: &impl SendfileTarget, plan: &mut Plan, len: usize) -> io::Result<usize> {
     let mut done = 0;
     while done < len {

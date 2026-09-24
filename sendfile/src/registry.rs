@@ -1,10 +1,13 @@
 //! Connection slot registry.
 //!
-//! Salvo builds the per-request `Request` inside Hyper, and `HyperHandler` is not
-//! reachable from outside `salvo_core`, so a crate outside Salvo cannot install a
-//! service wrapper that puts the connection's [`SendfileSlot`] into the request
-//! extensions. The slot is therefore published under the connection's address
-//! pair, which the transport stream and the handler can both observe.
+//! `HyperHandler` cannot be named (`salvo_core::service` is a private module), but
+//! a crate outside Salvo can still take over the connection and implement
+//! `HyperService` itself — this project's fast path does exactly that and hands
+//! the [`SendfileSlot`] straight to the handler, never consulting this registry.
+//! It exists for the path where Salvo still produces the response
+//! ([`SendfileListener`](crate::SendfileListener)): the slot is published under
+//! the connection's address pair, which the transport stream and the handler can
+//! both observe.
 
 use std::{
     collections::HashMap,
@@ -27,8 +30,9 @@ static SLOTS: LazyLock<[Shard; SHARDS]> =
 
 /// Number of independently locked maps.
 ///
-/// Every file response looks its connection's slot up here, so a single map would
-/// put one lock — and one cache line — in the way of all worker threads at once.
+/// Responses that go through [`upgrade_response`](crate::upgrade_response) look
+/// their connection's slot up here, so a single map would put one lock — and one
+/// cache line — in the way of all worker threads at once.
 const SHARDS: usize = 16;
 
 /// One shard of the registry.

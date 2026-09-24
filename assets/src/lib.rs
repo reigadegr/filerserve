@@ -38,7 +38,7 @@ pub struct Asset;
 #[derive(Clone)]
 struct CachedHeaders {
     /// 解析出来的 `Content-Type`（需要时已带上 `charset=`）。必须交给 `NamedFileBuilder`：
-    /// 不给它的话，`NamedFile` 会自己 `pread` 一段文件样本去嗅探类型，那是一次系统调用
+    /// 不给它的话，`NamedFile` 会自己 `pread` 一段文件样本去嗅探类型，那是一次系统调用。
     /// 用 `Arc` 共享：`Mime` 的 `Clone` 会深拷贝它内部的 `String`，命中路径上不该付这份钱
     content_type: Arc<Mime>,
     /// 已经编码好的 `Last-Modified`（文件时间早于 epoch 时没有），省掉每请求一次日期格式化
@@ -329,7 +329,7 @@ impl ServeFiles {
             return;
         }
 
-        // 命中条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
+        // 满足 sendfile 条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
         // 这里不再 dup：响应体直接共享缓存里那个 fd（sendfile 带显式 offset，共享描述符是安全的）
         match slot {
             Some(slot) => {

@@ -178,7 +178,8 @@ mod tests {
         assert_eq!(text, "hello");
         assert!(lazy.owned.is_some(), "开始读之后才复制句柄");
 
-        // 复制出来的句柄共享同一个 file description，偏移量可以独立设置
+        // `dup(2)` 出来的句柄与源句柄共享同一个 file description，偏移量并不独立：共用同一个
+        // 缓存 fd 的两个响应会互相搬动偏移量（sendfile 那侧带显式 offset，才不受影响）
         assert_eq!(lazy.seek(io::SeekFrom::Start(1)).unwrap(), 1);
         let mut rest = String::new();
         lazy.read_to_string(&mut rest).unwrap();

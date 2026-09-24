@@ -11,6 +11,10 @@
 //! 3. The stream recognises those placeholders and issues `sendfile(2)` for the
 //!    same length, so the file never enters userspace.
 //!
+//! A caller that owns the service wrapper can skip the listener and the registry:
+//! [`SendfileStream::new_unregistered`] plus [`upgrade_response_with_slot`] hand
+//! the slot straight to the handler, which is what this project's fast path does.
+//!
 //! Framing is untouched: the placeholder byte count equals the `Content-Length`
 //! Hyper was given, so keep-alive, range responses and Hyper's own accounting
 //! behave exactly as they do for an ordinary body.

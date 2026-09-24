@@ -1,12 +1,19 @@
 //! Vendored copy of `salvo_core::fs::NamedFile` without the blocking-pool hop.
 //!
-//! 本 crate 是 `salvo_core-0.96.0/src/fs/named_file.rs`（以及 `fs.rs` 里的
-//! `ChunkedFile`）的拷贝，只做了一处行为改动：把内部两处 `spawn_blocking`
-//! 换成同步调用。
+//! 本 crate 是 `salvo_core-1.0.0/src/fs/named_file.rs`（以及 `fs.rs` 里的
+//! `ChunkedFile`）的拷贝。行为改动是内部两处 `spawn_blocking` 换成同步调用；
+//! 在此之上为本项目加了几处接口（[`FileMeta`]、`Arc<File>`/`Arc<Path>` 共享、
+//! `build_from_file_with_metadata`、[`NamedFile::set_etag`]、`builder_shared`、
+//! `content_type()` 返回 `Arc<Mime>`），这些行与上游不再逐行一致，其余是上游
+//! 的逻辑。
 //!
-//! This crate is a copy of `salvo_core-0.96.0/src/fs/named_file.rs` (plus the
-//! `ChunkedFile` type from `fs.rs`) with exactly one behavioural change: both
-//! internal `spawn_blocking` calls become synchronous calls.
+//! This crate is a copy of `salvo_core-1.0.0/src/fs/named_file.rs` (plus the
+//! `ChunkedFile` type from `fs.rs`). The behavioural change is that both
+//! internal `spawn_blocking` calls become synchronous; on top of that this
+//! project added a few interfaces ([`FileMeta`], `Arc<File>`/`Arc<Path>`
+//! sharing, `build_from_file_with_metadata`, [`NamedFile::set_etag`],
+//! `builder_shared`, and `content_type()` returning `Arc<Mime>`), so those lines
+//! no longer match upstream while the rest is upstream's logic.
 //!
 //! 上游 `build()` 把 open/metadata/预读放进 `spawn_blocking`，`send_inner()`
 //! 又用 `File::into_std().await` 拿回 `std::fs::File` 去构造 `ChunkedFile`。
@@ -22,15 +29,15 @@
 //! blocking they avoid.
 //!
 //! 因此 [`NamedFile`] 直接持有 `std::fs::File`，不再包一层 `tokio::fs::File`，
-//! 也不再实现 `Writer`/`Deref`。上游其余行为（ETag、Last-Modified、
-//! Content-Disposition、Range/206、304、MIME 与字符集嗅探）逐行保留。
+//! 也不再实现 `Writer`/`Deref`；其余行为（ETag、Last-Modified、
+//! Content-Disposition、Range/206、304、MIME 与字符集嗅探）与上游一致。
 //!
 //! [`NamedFile`] therefore holds a `std::fs::File` directly instead of wrapping
 //! a `tokio::fs::File`, and no longer implements `Writer`/`Deref`. Everything
 //! else upstream does (ETag, Last-Modified, Content-Disposition, Range/206,
-//! 304, MIME and charset sniffing) is preserved line for line.
+//! 304, MIME and charset sniffing) is unchanged.
 
-// 本 crate 是 salvo 源码的逐行拷贝，不按本项目的 clippy 规则整改：
+// 本 crate 绝大部分是 salvo 源码的拷贝，不按本项目的 clippy 规则整改：
 // 一旦逐条修 lint 就无法再和上游逐行比对，以后同步上游改动会变得不可靠。
 #![allow(
     clippy::all,
@@ -1091,13 +1098,13 @@ impl NamedFile {
         // the disposition from the type the client will actually receive, not
         // necessarily the type detected for the file on disk. Treat an invalid
         // pre-existing value conservatively as opaque binary data.
-        // 这里只借用、不克隆：`mime::Mime` 的 `Clone` 会深拷贝它内部的 `String`
-        // （mime 0.3 的 `Source` 就是 `String`），每请求一次堆分配
         let content_disposition = if self.flags.contains(Flag::ContentDisposition) {
             self.content_disposition.take()
         } else {
             None
         };
+        // 这里只借用、不克隆：`mime::Mime` 的 `Clone` 会深拷贝它内部的 `String`
+        // （mime 0.3 的 `Source` 就是 `String`），每请求一次堆分配
         let borrowed_content_type;
         let effective_content_type = if res.headers().contains_key(CONTENT_TYPE) {
             borrowed_content_type = res.content_type().unwrap_or(mime::APPLICATION_OCTET_STREAM);
