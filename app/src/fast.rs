@@ -120,10 +120,14 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
     }
 }
 
+/// accept 出错后的退避时间，取值与 salvo 的 `Server` 一致。
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// 跑 accept 循环，把每条连接交给 [`FastService`]。
 ///
 /// 取代原来的 `Server::new(acceptor).serve(router)`。连接本身仍按 sendfile 的要求包装
-/// （`TCP_NODELAY`、槽位 key），否则零拷贝体没有槽位可用。
+/// （`TCP_NODELAY`、槽位 key），否则零拷贝体没有槽位可用。accept 与单条连接的准备出错都只
+/// 影响那一条连接（照 `Server` 的做法退避重试），不会像 `?` 那样把整个进程带走。
 pub async fn serve(
     listener: TcpListener,
     root: PathBuf,
@@ -134,13 +138,32 @@ pub async fn serve(
     let service = Service::new(router);
     let files = Arc::new(ServeFiles::new(root));
     loop {
-        let (conn, remote_addr) = listener.accept().await?;
-        let local_addr: SocketAddr = conn.local_addr()?.into();
+        let (conn, remote_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // 瞬时错误不该带走整个服务，最典型的是 fd 耗尽（`FileCache` 最多占 512 个）
+                tracing::error!(error = ?error, "接受连接失败");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
+        let local_addr: SocketAddr = match conn.local_addr() {
+            Ok(local_addr) => local_addr.into(),
+            // 已经 accept 到的连接取不到本地地址很反常，同样退避后继续，避免忙等
+            Err(error) => {
+                tracing::error!(error = ?error, "取本地地址失败");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
         let remote_addr: SocketAddr = remote_addr.into();
         // HTTP/1.1 把一个响应写成「响应头」+「body」两次写。body 小于 MSS 时 Nagle 会压住
         // 第二次写，直到对端的 delayed ACK 超时（Linux 约 40ms），小响应因此每个都平白多出
         // 40ms。Go 的 net 包默认就打开 TCP_NODELAY，这里对齐。
-        conn.set_nodelay(true)?;
+        if let Err(error) = conn.set_nodelay(true) {
+            // 丢的只是这条连接的延迟优化：Nagle 设不上不影响正确性，连接照样服务
+            tracing::debug!(error = ?error, "设置 TCP_NODELAY 失败");
+        }
         let slot = Arc::new(SendfileSlot::new());
         let stream = SendfileStream::new_unregistered(conn, Arc::clone(&slot));
         // 一条连接只建一份 `ConnCtrl`，与 salvo 的 `TcpAcceptor` 一样：`HyperHandler` 会把它
