@@ -339,16 +339,14 @@ impl ZipApi {
         })
         .await;
 
-        let canonical = match resolved {
-            Ok(Some(canonical)) => canonical,
-            Ok(None) => {
-                res.status_code(StatusCode::NOT_FOUND);
-                return;
-            }
-            Err(_) => {
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                return;
-            }
+        // 拆成两次 let-else：500 与 404 两条分支彼此独立，比原来的三分支 match 更直白
+        let Ok(resolved) = resolved else {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        };
+        let Some(canonical) = resolved else {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
         };
 
         let folder_name = zip::folder_name(&canonical);

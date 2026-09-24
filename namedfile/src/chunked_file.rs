@@ -80,10 +80,10 @@ impl LazyFile {
         if let Some(source) = self.source.take() {
             self.owned = Some(source.try_clone()?);
         }
-        match self.owned.as_mut() {
-            Some(file) => Ok(file),
-            None => Err(IoError::other("`LazyFile` has no handle")),
-        }
+        // 与其手写 Some/None 两条分支，不如让 `Option::ok_or_else` 收口
+        self.owned
+            .as_mut()
+            .ok_or_else(|| IoError::other("`LazyFile` has no handle"))
     }
 }
 
