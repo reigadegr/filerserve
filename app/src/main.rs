@@ -14,7 +14,9 @@ use std::{
 };
 
 use chrono::Local;
-use lanfile::{AccessLine, AccessLog, build_router, render_line, serve};
+use lanfile::{
+    AccessLine, AccessLog, LINE_STACK, build_router, render_line, render_line_stack, serve,
+};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{format::Writer, time::FormatTime},
@@ -33,7 +35,7 @@ thread_local! {
     /// `Local::now` does on every call, without paying for a real clock read.
     static STAMP: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) };
 
-    /// 直写访问日志时拼行用的缓冲，按线程复用，省掉每请求一次分配。
+    /// 直写访问日志退回 `String` 拼行（快路径在栈上）时用的缓冲，按线程复用，省掉每请求一次分配。
     static LINE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
@@ -59,20 +61,26 @@ fn current_second() -> i64 {
         })
 }
 
+/// 当前秒的时间戳文本，每秒只格式化一次，同一秒内的请求直接复用缓存。
+fn with_stamp<R>(use_stamp: impl FnOnce(&str) -> R) -> R {
+    let second = current_second();
+    STAMP.with(|stamp| {
+        let mut stamp = stamp.borrow_mut();
+        if stamp.0 != second {
+            stamp.0 = second;
+            stamp.1.clear();
+            // 往 `String` 里写不会失败，真失败了也只是这一秒的时间戳空着。
+            let _ = write!(stamp.1, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+        }
+        use_stamp(&stamp.1)
+    })
+}
+
 struct LoggerFormatter;
 
 impl FormatTime for LoggerFormatter {
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
-        let second = current_second();
-        STAMP.with(|stamp| {
-            let mut stamp = stamp.borrow_mut();
-            if stamp.0 != second {
-                stamp.0 = second;
-                stamp.1.clear();
-                write!(stamp.1, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))?;
-            }
-            w.write_str(&stamp.1)
-        })
+        with_stamp(|stamp| w.write_str(stamp))
     }
 }
 
@@ -308,19 +316,23 @@ fn access_log(is_terminal: bool) -> AccessLog {
     }
     // 非终端直写：绕开 `tracing` 的分发与 fmt 层，每请求省约 1.2 µs 用户态
     AccessLog::Direct(Box::new(|line: &AccessLine<'_>| {
-        LINE.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            buf.clear();
-            if LoggerFormatter
-                .format_time(&mut Writer::new(&mut *buf))
-                .is_err()
-            {
+        with_stamp(|stamp| {
+            // 快路径：整行拼进栈缓冲，绕开 `fmt::Formatter` 的逐字段分发。
+            let mut stack = [0_u8; LINE_STACK];
+            if let Some(len) = render_line_stack(stamp, line, &mut stack) {
+                SINK.push(&stack[..len]);
                 return;
             }
-            if render_line(line, &mut buf).is_err() {
-                return;
-            }
-            SINK.push(buf.as_bytes());
+            // 长路径或 IPv6：退回 `String`，多长都能拼。
+            LINE.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.clear();
+                buf.push_str(stamp);
+                if render_line(line, &mut buf).is_err() {
+                    return;
+                }
+                SINK.push(buf.as_bytes());
+            });
         });
     }))
 }

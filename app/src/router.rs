@@ -79,6 +79,122 @@ pub fn render_line(line: &AccessLine<'_>, out: &mut String) -> fmt::Result {
     writeln!(out, "  INFO {ACCESS_LOG_TARGET}: {line}")
 }
 
+/// 直写快路径在栈上拼行用的缓冲大小。
+///
+/// 常见的 `/files/<相对路径>` 整行都在这之内；放不下（长路径）就退回 [`render_line`]。
+pub const LINE_STACK: usize = 256;
+
+/// 定长缓冲的写入器：越界即返回 `false`，由调用方退回 [`render_line`]。
+struct StackWriter<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl StackWriter<'_> {
+    fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+        let end = self.len + bytes.len();
+        if end > self.out.len() {
+            return false;
+        }
+        self.out[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        true
+    }
+
+    fn push_str(&mut self, text: &str) -> bool {
+        self.push_bytes(text.as_bytes())
+    }
+
+    const fn push_byte(&mut self, byte: u8) -> bool {
+        if self.len == self.out.len() {
+            return false;
+        }
+        self.out[self.len] = byte;
+        self.len += 1;
+        true
+    }
+
+    /// 十进制无符号整数，不经过 `fmt`。
+    fn push_uint(&mut self, mut value: u32) -> bool {
+        let mut digits = [0_u8; 10];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        self.push_bytes(&digits[at..])
+    }
+}
+
+/// `Option<IpAddr>` 的 `{:?}` 输出。
+///
+/// IPv6 的 RFC 5952 压缩不值得手写，遇到就返回 `false` 让整行走慢路径。
+fn push_ip(out: &mut StackWriter<'_>, ip: Option<IpAddr>) -> bool {
+    match ip {
+        None => out.push_str("None"),
+        Some(IpAddr::V4(addr)) => {
+            let octets = addr.octets();
+            out.push_str("Some(")
+                && out.push_uint(u32::from(octets[0]))
+                && out.push_byte(b'.')
+                && out.push_uint(u32::from(octets[1]))
+                && out.push_byte(b'.')
+                && out.push_uint(u32::from(octets[2]))
+                && out.push_byte(b'.')
+                && out.push_uint(u32::from(octets[3]))
+                && out.push_byte(b')')
+        }
+        Some(IpAddr::V6(_)) => false,
+    }
+}
+
+/// `Version` 的 `{:?}` 输出，与 `http` crate 的实现逐字节一致。未知版本退回慢路径。
+fn push_version(out: &mut StackWriter<'_>, version: Version) -> bool {
+    let text = if version == Version::HTTP_09 {
+        "HTTP/0.9"
+    } else if version == Version::HTTP_10 {
+        "HTTP/1.0"
+    } else if version == Version::HTTP_11 {
+        "HTTP/1.1"
+    } else if version == Version::HTTP_2 {
+        "HTTP/2.0"
+    } else if version == Version::HTTP_3 {
+        "HTTP/3.0"
+    } else {
+        return false;
+    };
+    out.push_str(text)
+}
+
+/// 直写快路径：把整行（含时间戳）直接拼进定长缓冲，绕开 `fmt::Formatter` 的逐字段分发。
+///
+/// 输出与 `tracing` 逐字节一致（`direct_line_matches_tracing` 把关）；放不下长路径、或碰上
+/// 不值得手写的字段（IPv6）时返回 `None`，由调用方退回 [`render_line`]。
+pub fn render_line_stack(stamp: &str, line: &AccessLine<'_>, out: &mut [u8]) -> Option<usize> {
+    let mut out = StackWriter { out, len: 0 };
+    let fits = out.push_str(stamp)
+        && out.push_str("  INFO ")
+        && out.push_str(ACCESS_LOG_TARGET)
+        && out.push_str(": access ip=")
+        && push_ip(&mut out, line.ip)
+        && out.push_str(" method=")
+        && out.push_str(line.method)
+        && out.push_str(" path=")
+        && out.push_str(line.path)
+        && out.push_str(" version=")
+        && push_version(&mut out, line.version)
+        && out.push_str(" status=")
+        && out.push_uint(u32::from(line.status))
+        && out.push_str(" size=")
+        && out.push_str(line.size)
+        && out.push_byte(b'\n');
+    fits.then_some(out.len)
+}
+
 /// 访问日志的 hoop。
 ///
 /// 用结构体而不是自由函数，是为了把出口挂在 handler 上；塞进 `Depot` 的话每请求都要多一次
@@ -158,7 +274,7 @@ mod tests {
     use salvo::http::Version;
     use tracing_subscriber::fmt::{MakeWriter, format::Writer, time::FormatTime};
 
-    use super::{ACCESS_LOG_TARGET, AccessLine, render_line};
+    use super::{ACCESS_LOG_TARGET, AccessLine, LINE_STACK, render_line, render_line_stack};
 
     /// 固定时间戳，好让直写与 `tracing` 的输出只差这个前缀。
     struct FixedStamp;
@@ -192,19 +308,9 @@ mod tests {
         }
     }
 
-    /// 直写快路径拼出来的字节必须和 `tracing` 写出来的一模一样，否则绕过它就等于悄悄改了
+    /// 直写快/慢两条路拼出来的字节必须和 `tracing` 写出来的一模一样，否则绕过它就等于悄悄改了
     /// 日志格式。`tracing` 升级导致格式漂移时这里会失败。
-    #[test]
-    fn direct_line_matches_tracing() {
-        let line = AccessLine {
-            ip: Some("127.0.0.1".parse().unwrap()),
-            method: "GET",
-            path: "/files/one.bin",
-            version: Version::HTTP_11,
-            status: 206,
-            size: "9",
-        };
-
+    fn assert_matches_tracing(line: &AccessLine<'_>) {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(Capture(Arc::clone(&captured)))
@@ -214,12 +320,69 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: ACCESS_LOG_TARGET, "{line}");
         });
-
         let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
-        let tail = text.strip_prefix("STAMP").unwrap();
+
+        let mut stack = [0_u8; LINE_STACK];
+        let len = render_line_stack("STAMP", line, &mut stack).unwrap();
+        assert_eq!(text.as_bytes(), &stack[..len], "栈上拼行与 tracing 不一致");
 
         let mut direct = String::new();
-        render_line(&line, &mut direct).unwrap();
-        assert_eq!(tail, direct);
+        render_line(line, &mut direct).unwrap();
+        assert_eq!(
+            text.strip_prefix("STAMP").unwrap(),
+            direct,
+            "String 拼行与 tracing 不一致"
+        );
+    }
+
+    #[test]
+    fn direct_line_matches_tracing() {
+        assert_matches_tracing(&AccessLine {
+            ip: Some("127.0.0.1".parse().unwrap()),
+            method: "GET",
+            path: "/files/one.bin",
+            version: Version::HTTP_11,
+            status: 206,
+            size: "9",
+        });
+        assert_matches_tracing(&AccessLine {
+            ip: None,
+            method: "POST",
+            path: "/api/zip/target",
+            version: Version::HTTP_2,
+            status: 200,
+            size: "-",
+        });
+    }
+
+    /// 长路径放不下时快路径必须认输，交给 `String` 那条路。
+    #[test]
+    fn stack_line_gives_up_when_full() {
+        let path = "a".repeat(LINE_STACK);
+        let line = AccessLine {
+            ip: Some("127.0.0.1".parse().unwrap()),
+            method: "GET",
+            path: &path,
+            version: Version::HTTP_11,
+            status: 200,
+            size: "1",
+        };
+        let mut stack = [0_u8; LINE_STACK];
+        assert!(render_line_stack("STAMP", &line, &mut stack).is_none());
+    }
+
+    /// IPv6 不手写，交给 `String` 那条路。
+    #[test]
+    fn stack_line_gives_up_on_ipv6() {
+        let line = AccessLine {
+            ip: Some("::1".parse().unwrap()),
+            method: "GET",
+            path: "/files/one.bin",
+            version: Version::HTTP_11,
+            status: 200,
+            size: "1",
+        };
+        let mut stack = [0_u8; LINE_STACK];
+        assert!(render_line_stack("STAMP", &line, &mut stack).is_none());
     }
 }
