@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io,
+    io::{self, IoSlice},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
@@ -404,6 +404,44 @@ impl<S: SendfileTarget> AsyncWrite for SendfileStream<S> {
         }
     }
 
+    /// 顺着 slice 走同一个状态机，一次调用能把 Hyper 攒下的多个 iovec 全部推进。
+    ///
+    /// 这里不做真正的 `writev`：占位字节必须逐个交给 `sendfile(2)`，状态机本来就是按字节流
+    /// 处理的，系统调用次数不会变。省下来的是 Hyper 的 flush 循环——`is_write_vectored()` 为
+    /// 真时它走 `Queue` 策略，只写第一个 slice 会让同一个响应多转一圈（`chunks_vectored`、
+    /// 零初始化的 iovec 数组、`advance` 各再来一遍），顺着写下去则一圈推到写不动为止。
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let mut written = 0;
+        for buf in bufs.iter().filter(|buf| !buf.is_empty()) {
+            let buf: &[u8] = buf;
+            match Pin::new(&mut *this).poll_write(cx, buf) {
+                Poll::Ready(Ok(count)) => {
+                    written += count;
+                    // 没吃满这个 slice：写不动了，后面的 slice 也一定写不动
+                    if count < buf.len() {
+                        break;
+                    }
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {
+                    // 一个字节都没写出去时必须原样返回 `Pending`（waker 已注册），
+                    // 谎报 `Ok(0)` 会让 Hyper 判成 `WriteZero`
+                    return if written == 0 {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(written))
+                    };
+                }
+            }
+        }
+        Poll::Ready(Ok(written))
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if let Err(error) = ready!(this.drain_owed(cx)) {
@@ -478,7 +516,7 @@ mod transport_tests {
     use std::{
         cell::{Cell, RefCell},
         fs::File,
-        io,
+        io::{self, IoSlice},
         net::IpAddr,
         os::unix::fs::FileExt,
         pin::Pin,
@@ -675,5 +713,58 @@ mod transport_tests {
             record.writable_polls.get() > 0,
             "a blocked sendfile parked the task without registering a wakeup"
         );
+    }
+
+    /// Hyper 的 `Queue` 策略会把响应头与紧随其后的占位字节攒进同一次
+    /// `poll_write_vectored`：一次调用必须把能写下去的 slice 全部推进。
+    #[tokio::test]
+    async fn a_vectored_write_covers_every_slice_it_can() {
+        let (record, mut stream, _) = armed_stream("vectored.bin");
+        let placeholders = vec![0_u8; 4096];
+        let bufs = [IoSlice::new(HEAD), IoSlice::new(&placeholders)];
+
+        let written =
+            std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_vectored(cx, &bufs))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            written,
+            HEAD.len() + placeholders.len(),
+            "the vectored write stopped after the first slice"
+        );
+        let out = record.out.borrow();
+        assert_eq!(&out[..HEAD.len()], HEAD);
+        assert_eq!(out.len(), HEAD.len() + placeholders.len());
+        assert!(record.sendfile_calls.get() > 0, "no sendfile was issued");
+    }
+
+    /// 一个字节都没写出去时必须原样返回 `Pending`（waker 已注册）：报 `Ok(0)` 会被 Hyper
+    /// 判成 `WriteZero`，连接会被掐断。
+    #[tokio::test]
+    async fn a_stalled_vectored_write_reports_pending() {
+        let (record, mut stream, _) = armed_stream("vectored-stall.bin");
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        // 第一次调用：响应头写不出去，被 `owed` 接管，所以这次调用仍然算“已消费”
+        record.stall_once.set(true);
+        let head_only = [IoSlice::new(HEAD)];
+        let first = Pin::new(&mut stream).poll_write_vectored(&mut cx, &head_only);
+        assert!(
+            matches!(first, Poll::Ready(Ok(count)) if count == HEAD.len()),
+            "a stalled head should be taken over, not reported as an error"
+        );
+        assert!(record.out.borrow().is_empty());
+
+        // 第二次调用：补写 `owed` 时又写不动，一个字节都没出去，必须是 `Pending`
+        record.stall_once.set(true);
+        let placeholders = vec![0_u8; 4096];
+        let next = [IoSlice::new(&placeholders)];
+        let second = Pin::new(&mut stream).poll_write_vectored(&mut cx, &next);
+        assert!(
+            second.is_pending(),
+            "a write that moved nothing must report `Pending`, not `Ok(0)`"
+        );
+        assert!(record.out.borrow().is_empty());
     }
 }
