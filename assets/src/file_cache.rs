@@ -135,7 +135,7 @@ fn take(entry: &mut Entry, clock: u64) -> Hit {
 }
 
 impl FileCache {
-    fn shard(&self, hash: u64) -> &Mutex<Shard> {
+    const fn shard(&self, hash: u64) -> &Mutex<Shard> {
         &self.shards[shard_index(hash)]
     }
 
