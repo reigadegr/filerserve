@@ -183,7 +183,14 @@ impl<S> Drop for SendfileStream<S> {
 /// included) on a full transport. No waker is registered here:
 /// [`SendfileTarget::poll_writable`] is called by `write_placeholders` before it
 /// parks, while `write_head` reports the short write so Hyper retries at once.
+///
+/// Errors if `len` exceeds the plan's remaining bytes, which would mean sending
+/// file bytes this response never promised.
 fn transfer(target: &impl SendfileTarget, plan: &mut Plan, len: usize) -> io::Result<usize> {
+    // 越界判定收在这里：两个调用点本来各判一次，收口之后不会再漏判
+    if len as u64 > plan.remaining {
+        return Err(io::Error::other("sendfile body exceeds its content length"));
+    }
     let mut done = 0;
     while done < len {
         match target.try_sendfile(&plan.file, plan.offset, len - done) {
@@ -286,16 +293,13 @@ impl<S: SendfileTarget> SendfileStream<S> {
         };
 
         let mut written = 0;
-        let mut blocked = false;
         while written < head_len {
             match Pin::new(&mut self.inner).poll_write_more(cx, &buf[written..head_len]) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(write_zero())),
                 Poll::Ready(Ok(count)) => written += count,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => {
-                    blocked = true;
-                    break;
-                }
+                // 唯一的提前退出：没写完就是被阻塞（循环跑完即 `written == head_len`）
+                Poll::Pending => break,
             }
         }
         if written < head_len {
@@ -318,7 +322,7 @@ impl<S: SendfileTarget> SendfileStream<S> {
         // `!found` 时 `head_len` 必然是 `buf.len()`（见上面 `find_head_end` 的
         // 取值），所以 `head_len == buf.len()` 已覆盖“还没找到结尾”。这里只剩两种
         // 情况需要早退：head 没写完（被阻塞），或本次调用已经没有 body 字节可发。
-        if blocked || head_len == buf.len() {
+        if written < head_len || head_len == buf.len() {
             return Poll::Ready(Ok(head_len));
         }
 
@@ -329,11 +333,6 @@ impl<S: SendfileTarget> SendfileStream<S> {
             let Some(plan) = self.plan.as_mut() else {
                 return Poll::Ready(Err(io::Error::other("sendfile plan disappeared")));
             };
-            if rest as u64 > plan.remaining {
-                return Poll::Ready(Err(io::Error::other(
-                    "sendfile body exceeds its content length",
-                )));
-            }
             match transfer(&self.inner, plan, rest) {
                 Ok(done) => done,
                 Err(error) => return Poll::Ready(Err(error)),
@@ -351,11 +350,6 @@ impl<S: SendfileTarget> SendfileStream<S> {
                 let Some(plan) = self.plan.as_mut() else {
                     return Poll::Ready(Err(io::Error::other("sendfile plan disappeared")));
                 };
-                if len as u64 > plan.remaining {
-                    return Poll::Ready(Err(io::Error::other(
-                        "sendfile body exceeds its content length",
-                    )));
-                }
                 match transfer(&self.inner, plan, len) {
                     Ok(done) => done,
                     Err(error) => return Poll::Ready(Err(error)),

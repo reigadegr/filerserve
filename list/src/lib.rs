@@ -242,11 +242,8 @@ impl ListApi {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
         let path = req.param::<String>("path").unwrap_or_default();
         let root = self.root.clone();
-        let display_path = if path.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{path}")
-        };
+        // 空路径时 `format!("/{path}")` 就是 `"/"`，不必再分一条分支
+        let display_path = format!("/{path}");
 
         // 目录枚举是阻塞的 fs 操作，整体放进阻塞线程池
         let Ok(listed) = tokio::task::spawn_blocking(move || list_directory(&root, &path)).await

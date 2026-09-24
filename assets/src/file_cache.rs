@@ -215,6 +215,8 @@ impl FileCache {
         headers: Arc<CachedHeaders>,
     ) {
         let hash = path_hash(path);
+        // 先把 key 分配好：`path.into()` 是这条路径上唯一一次堆分配，放在锁里会算进临界区
+        let key: Box<str> = path.into();
         let Ok(mut shard) = self.shard(hash).lock() else {
             return;
         };
@@ -235,7 +237,7 @@ impl FileCache {
         }
 
         shard.entries.insert(
-            path.into(),
+            key,
             Entry {
                 file,
                 metadata,

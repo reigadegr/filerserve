@@ -39,6 +39,12 @@ thread_local! {
     static LINE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+/// `LINE` 这份复用缓冲的保留上限。
+///
+/// 超长路径（hyper 允许约 400 KiB 的请求行）会把缓冲撑大，而 `clear` 只清长度、不还容量：
+/// 留着它就等于每个 worker 线程永久占住一块大内存，这种行宁愿丢掉缓冲重新分配。
+const LINE_KEEP_MAX: usize = 8 * 1024;
+
 /// The current second, used to tell whether the cached timestamp is stale.
 ///
 /// `SystemTime::now()` is a real `clock_gettime` system call on a machine whose
@@ -332,6 +338,9 @@ fn access_log(is_terminal: bool) -> AccessLog {
                     return;
                 }
                 SINK.push(buf.as_bytes());
+                if buf.capacity() > LINE_KEEP_MAX {
+                    *buf = String::new();
+                }
             });
         });
     }))
