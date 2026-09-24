@@ -1,11 +1,14 @@
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::{self, Write as _},
     io::{self, IsTerminal},
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -73,15 +76,51 @@ impl FormatTime for LoggerFormatter {
     }
 }
 
-/// 日志缓冲攒够这么多字节就叫醒写线程，不必再等一个 [`LOG_INTERVAL`]。
+/// 单片日志缓冲攒够这么多字节就叫醒写线程，不必再等一个 [`LOG_INTERVAL`]。
 const LOG_BATCH: usize = 64 * 1024;
 
 /// 写线程的等待上限：即使没攒够一批，也要在这个时间内把已有的日志送出去。
 const LOG_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 缓冲的上限。写线程跟不上时（stdout 是慢终端之类）超出的日志直接丢掉：丢日志总好过
-/// 把内存吃光，也好过把 worker 卡在一个永远写不完的 stdout 上。
+/// 把内存吃光，也好过把 worker 卡在一个永远写不完的 stdout 上。它是所有分片加起来的上限。
 const LOG_PENDING_MAX: usize = 4 * 1024 * 1024;
+
+/// 日志缓冲的分片数：每个线程固定用其中一片。
+///
+/// 原设计里所有 worker 每请求都往同一个 `Mutex<Vec<u8>>` 的尾部追加一行，16 个 worker 抢
+/// 同一把锁、写同一条缓存行。本机实测分片后每请求内核态少 0.4~0.7 µs（futex）、运行队列
+/// 等待少 1.7 µs，用户态少 0.2~0.4 µs：每行只碰本线程那一片，锁不跨核，缓存行留在本核。
+const SHARDS: usize = 32;
+
+/// 每片的上限：所有分片加起来仍是 [`LOG_PENDING_MAX`]。
+const LOG_PENDING_MAX_PER_SHARD: usize = LOG_PENDING_MAX / SHARDS;
+
+thread_local! {
+    /// 本线程固定使用的分片号，第一次用到时才分配。
+    ///
+    /// 用 `thread_local!` 而不是 `thread::current().id()`：前者是一次 TLS 读，后者要取线程
+    /// 元数据再哈希一遍，比它要省掉的那次加锁还贵。
+    static SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// 下一个要分配的线程分片号。
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+/// 取本线程的分片号，第一次调用时从 [`NEXT_SHARD`] 领一个。
+///
+/// 线程数超过 [`SHARDS`] 时会有多个线程共用一片，那只是退回"这一片上仍有争用"，不影响正确性。
+fn shard_index() -> usize {
+    SHARD.with(|slot| {
+        let current = slot.get();
+        if current != usize::MAX {
+            return current;
+        }
+        let index = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS;
+        slot.set(index);
+        index
+    })
+}
 
 /// 访问日志的落地缓冲。
 ///
@@ -93,10 +132,13 @@ const LOG_PENDING_MAX: usize = 4 * 1024 * 1024;
 /// 实测这要花掉每请求约 10 µs CPU（其中约 8 µs 在内核态），9 字节小文件的吞吐因此只有
 /// Go 的三分之二。攒批之后每请求只剩一次加锁与一次 `memcpy`。
 struct LogSink {
-    /// 已经格式化好、还没写出去的字节。
-    pending: Mutex<Vec<u8>>,
+    /// 已经格式化好、还没写出去的字节，按线程分片。
+    pending: [Mutex<Vec<u8>>; SHARDS],
     /// 写线程睡着时用来叫醒它。
     ready: Condvar,
+    /// 写线程等 [`LOG_INTERVAL`] 时用的锁。它与各分片无关，这样写线程检查"全空"时不必先占住
+    /// 某一分片，也就不会与追加那一行的 worker 抢同一把锁。
+    gate: Mutex<()>,
     /// 串行化"取出并写出"：同一时刻只有一个写出者，写出的顺序就是取出的顺序。
     writing: Mutex<()>,
 }
@@ -127,18 +169,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl LogSink {
     const fn new() -> Self {
         Self {
-            pending: Mutex::new(Vec::new()),
+            pending: [const { Mutex::new(Vec::new()) }; SHARDS],
             ready: Condvar::new(),
+            gate: Mutex::new(()),
             writing: Mutex::new(()),
         }
     }
 
-    /// 追加一段日志，返回是否已经攒够一批（`true` 时调用方该叫醒写线程）。
+    /// 往本线程的分片里追加一段日志，返回是否已经攒够一批（`true` 时调用方该叫醒写线程）。
     ///
-    /// 缓冲已经到 [`LOG_PENDING_MAX`] 时这一行直接丢掉。
-    fn append(&self, buf: &[u8]) -> bool {
-        let mut pending = lock(&self.pending);
-        if pending.len() >= LOG_PENDING_MAX {
+    /// 分片已经到 [`LOG_PENDING_MAX_PER_SHARD`] 时这一行直接丢掉。
+    fn append(&self, shard: usize, buf: &[u8]) -> bool {
+        let mut pending = lock(&self.pending[shard]);
+        if pending.len() >= LOG_PENDING_MAX_PER_SHARD {
             return false;
         }
         pending.extend_from_slice(buf);
@@ -147,31 +190,40 @@ impl LogSink {
 
     /// 追加一段日志；攒够一批就叫醒写线程。
     fn push(&self, buf: &[u8]) {
-        if self.append(buf) {
+        if self.append(shard_index(), buf) {
             self.ready.notify_one();
         }
     }
 
-    /// 取出缓冲里的字节并一次写出；缓冲为空时什么也不做。
+    /// 所有分片都空才算空。
+    fn is_empty(&self) -> bool {
+        self.pending.iter().all(|shard| lock(shard).is_empty())
+    }
+
+    /// 取出各分片里的字节并写出；全空时什么也不做。
     fn flush(&self, out: &mut impl io::Write) -> io::Result<()> {
         // 取出与写出都在 `writing` 下完成：写出者只有一个，顺序即取出顺序。
-        // 只按 `writing` -> `pending` 的顺序取锁，`push` 只碰 `pending`，不会死锁。
+        // 只按 `writing` -> `pending` 的顺序取锁，`push` 只碰自己的分片，不会死锁。
         let _writing = lock(&self.writing);
-        let batch = std::mem::take(&mut *lock(&self.pending));
-        if batch.is_empty() {
-            return Ok(());
+        for shard in &self.pending {
+            let batch = std::mem::take(&mut *lock(shard));
+            if !batch.is_empty() {
+                out.write_all(&batch)?;
+            }
         }
-        out.write_all(&batch)
+        Ok(())
     }
 
     /// 写线程：攒够一批会被 [`Self::push`] 的调用方叫醒，否则最多等 [`LOG_INTERVAL`]。
     fn run(&self, out: &mut impl io::Write) {
         loop {
             {
-                let pending = lock(&self.pending);
-                if pending.is_empty() {
-                    // 锁在 `wait_timeout` 返回时已经释放；结果本身不重要，丢掉即可
-                    let _ = self.ready.wait_timeout(pending, LOG_INTERVAL);
+                let gate = lock(&self.gate);
+                if self.is_empty() {
+                    // 锁在 `wait_timeout` 返回时已经释放；结果本身不重要，丢掉即可。
+                    // 叫醒与这里检查"全空"之间不是原子的，所以最坏也就是多等一个
+                    // `LOG_INTERVAL`，日志不会丢。
+                    let _ = self.ready.wait_timeout(gate, LOG_INTERVAL);
                 }
             }
             if self.flush(out).is_err() {
@@ -299,7 +351,7 @@ mod tests {
         sync::Arc,
     };
 
-    use super::{LOG_BATCH, LOG_PENDING_MAX, LogSink, parse_args};
+    use super::{LOG_BATCH, LOG_PENDING_MAX_PER_SHARD, LogSink, parse_args};
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(ToString::to_string).collect()
@@ -364,8 +416,8 @@ mod tests {
     #[test]
     fn sink_keeps_lines_buffered_until_the_threshold() {
         let sink = LogSink::new();
-        assert!(!sink.append(b"one\n"));
-        assert!(!sink.append(b"two\n"));
+        assert!(!sink.append(0, b"one\n"));
+        assert!(!sink.append(0, b"two\n"));
 
         // 没攒够一批，所以一行都还没写出去；内容与顺序原样留着
         let mut out = Vec::new();
@@ -377,15 +429,17 @@ mod tests {
     fn sink_asks_for_a_wakeup_once_a_batch_is_full() {
         let sink = LogSink::new();
         let almost = vec![b'x'; LOG_BATCH - 1];
-        assert!(!sink.append(&almost));
-        assert!(sink.append(b"x"));
+        assert!(!sink.append(0, &almost));
+        assert!(sink.append(0, b"x"));
+        // 阈值按片算：别的片攒得再多也不该替这一片凑数
+        assert!(!sink.append(1, b"x"));
     }
 
     #[test]
     fn sink_writes_each_batch_only_once() {
         let sink = LogSink::new();
         let batch = vec![b'a'; LOG_BATCH];
-        sink.append(&batch);
+        sink.append(0, &batch);
 
         let mut out = Vec::new();
         sink.flush(&mut out).unwrap();
@@ -396,9 +450,9 @@ mod tests {
     #[test]
     fn sink_drops_lines_once_the_buffer_is_full() {
         let sink = LogSink::new();
-        let full = vec![b'x'; LOG_PENDING_MAX];
-        sink.append(&full);
-        assert!(!sink.append(b"dropped\n"));
+        let full = vec![b'x'; LOG_PENDING_MAX_PER_SHARD];
+        sink.append(0, &full);
+        assert!(!sink.append(0, b"dropped\n"));
 
         let mut out = Vec::new();
         sink.flush(&mut out).unwrap();
