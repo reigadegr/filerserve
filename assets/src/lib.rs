@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 use lanfile_namedfile::{FileMeta, NamedFile};
 use lanfile_sendfile::{SendfileSlot, upgrade_response, upgrade_response_with_slot};
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, Advice, Mode, OFlags, ResolveFlags};
-use salvo::http::header::{CONTENT_DISPOSITION, LAST_MODIFIED};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use salvo::http::header::CONTENT_DISPOSITION;
+use salvo::http::header::LAST_MODIFIED;
 use salvo::{
     http::{HeaderValue, Method, headers::ETag},
     prelude::*,
