@@ -300,24 +300,30 @@ impl<S: SendfileTarget> SendfileStream<S> {
         }
 
         if found {
-            self.state = State::Sending;
-            self.plan = self.slot.take_plan();
-            if self.plan.is_none() {
+            // 拿到计划前先别碰 state：拿不到 plan 时这次调用以错误结束，状态机
+            // 仍停留在 `Head`，下一次调用从 carry 续上，不会有中间态泄漏到字段里。
+            let Some(plan) = self.slot.take_plan() else {
                 return Poll::Ready(Err(io::Error::other("sendfile plan disappeared")));
-            }
+            };
+            self.plan = Some(plan);
+            self.state = State::Sending;
         } else {
             let (next, len) = trailing(&carry[..carry_len], &buf[..head_len]);
             self.state = State::Head { carry: next, len };
         }
 
-        if !found || blocked || head_len == buf.len() {
+        // `!found` 时 `head_len` 必然是 `buf.len()`（见上面 `find_head_end` 的
+        // 取值），所以 `head_len == buf.len()` 已覆盖“还没找到结尾”。这里只剩两种
+        // 情况需要早退：head 没写完（被阻塞），或本次调用已经没有 body 字节可发。
+        if blocked || head_len == buf.len() {
             return Poll::Ready(Ok(head_len));
         }
 
         let rest = buf.len() - head_len;
         let done = {
-            let Self { inner, plan, .. } = self;
-            let Some(plan) = plan.as_mut() else {
+            // 只借 `plan` 一个字段，不再把整个 `self` 解构：`&self.inner` 与
+            // `&mut self.plan` 是不同字段，借用检查器允许同时存在。
+            let Some(plan) = self.plan.as_mut() else {
                 return Poll::Ready(Err(io::Error::other("sendfile plan disappeared")));
             };
             if rest as u64 > plan.remaining {
@@ -325,7 +331,7 @@ impl<S: SendfileTarget> SendfileStream<S> {
                     "sendfile body exceeds its content length",
                 )));
             }
-            match transfer(inner, plan, rest) {
+            match transfer(&self.inner, plan, rest) {
                 Ok(done) => done,
                 Err(error) => return Poll::Ready(Err(error)),
             }
@@ -339,8 +345,7 @@ impl<S: SendfileTarget> SendfileStream<S> {
         let len = buf.len();
         loop {
             let done = {
-                let Self { inner, plan, .. } = self;
-                let Some(plan) = plan.as_mut() else {
+                let Some(plan) = self.plan.as_mut() else {
                     return Poll::Ready(Err(io::Error::other("sendfile plan disappeared")));
                 };
                 if len as u64 > plan.remaining {
@@ -348,7 +353,7 @@ impl<S: SendfileTarget> SendfileStream<S> {
                         "sendfile body exceeds its content length",
                     )));
                 }
-                match transfer(inner, plan, len) {
+                match transfer(&self.inner, plan, len) {
                     Ok(done) => done,
                     Err(error) => return Poll::Ready(Err(error)),
                 }
