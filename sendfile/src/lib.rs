@@ -50,14 +50,6 @@ pub use conn::{SendfileAcceptor, SendfileListener};
 pub use registry::{ConnKey, conn_key, slot_for};
 pub use stream::{SendfileStream, SendfileTarget};
 
-/// Duplicates an open file so a later [`upgrade_response`] can serve it.
-///
-/// [`upgrade_response`] must be called after the response has been built, by
-/// which point the handler no longer owns the file. Duplicating the handle first
-/// is cheaper than re-opening the path: one `dup(2)` instead of a `stat` and an
-/// `open(2)`, and it guarantees the same file is served even if the path is
-/// replaced in between.
-///
 /// Replaces a file response body with a zero-copy `sendfile(2)` body.
 ///
 /// Call this after the response headers and body have been produced, passing the

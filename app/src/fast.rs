@@ -84,9 +84,10 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
             res.headers_mut().reserve(8);
             // 借自 `request`，不再单独分配：`decode_url_path` 在没有 `%` 时就是借用
             let sub = files_sub_path(request.uri().path()).unwrap_or_default();
-            // 方法取一次，下面判 GET/HEAD 与补错误页都用它
-            let is_head = request.method() == Method::HEAD;
-            if is_head || request.method() == Method::GET {
+            // 方法只取一次，下面判 GET/HEAD 与补错误页都用它
+            let method = request.method();
+            let is_head = method == Method::HEAD;
+            if is_head || method == Method::GET {
                 files.serve(&sub, &request, &mut res, Some(&slot)).await;
             } else {
                 res.status_code(StatusCode::NOT_FOUND);
