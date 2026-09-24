@@ -187,15 +187,15 @@ impl FileCache {
         shard.clock += 1;
         let clock = shard.clock;
         // 满了就淘汰最久没被用到的那条，而不是把整片清空
-        if shard.entries.len() >= CAPACITY_PER_SHARD && !shard.entries.contains_key(path) {
-            let oldest = shard
+        if shard.entries.len() >= CAPACITY_PER_SHARD
+            && !shard.entries.contains_key(path)
+            && let Some(oldest) = shard
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.used)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                shard.entries.remove(&oldest);
-            }
+                .map(|(key, _)| key.clone())
+        {
+            shard.entries.remove(&oldest);
         }
         shard.entries.insert(
             path.into(),
