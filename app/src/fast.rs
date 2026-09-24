@@ -94,12 +94,13 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
             }
             // 与 salvo 的 `Service` 完全一致地补错误页：状态码是 4xx/5xx 且没写出响应体时
             // 跑一遍 catcher（HEAD 不补体，RFC 9110 §9.3.2）
-            if !is_head
+            let should_render_error_page = !is_head
                 && (res.body.is_none() || res.body.is_error())
                 && res
                     .status_code
-                    .is_some_and(|code| code.is_client_error() || code.is_server_error())
-            {
+                    .is_some_and(|code| code.is_client_error() || code.is_server_error());
+
+            if should_render_error_page {
                 // `Depot` 只有补错误页时才用得到，正常 200 路径不必每请求建一次
                 let mut depot = Depot::new();
                 Catcher::default()
