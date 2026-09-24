@@ -74,7 +74,8 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
         let files = Arc::clone(&self.files);
         let access_log = Arc::clone(&self.access_log);
         let slot = Arc::clone(&self.slot);
-        let (local_addr, remote_addr) = (self.local_addr.clone(), self.remote_addr.clone());
+        let local_addr = self.local_addr.clone();
+        let remote_addr = self.remote_addr.clone();
         Box::pin(async move {
             let mut request = Request::from_hyper(req, Scheme::HTTP);
             *request.local_addr_mut() = local_addr;
@@ -82,31 +83,35 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
             let mut res = Response::new();
             // 一次把容量留够：`HeaderMap` 逐个 insert 会反复扩容，实测每请求 4 次分配
             res.headers_mut().reserve(8);
-            // 借自 `request`，不再单独分配：`decode_url_path` 在没有 `%` 时就是借用
-            let sub = files_sub_path(request.uri().path()).unwrap_or_default();
-            // 方法只取一次，下面判 GET/HEAD 与补错误页都用它
+
             let method = request.method();
             let is_head = method == Method::HEAD;
             if is_head || method == Method::GET {
+                // 借自 `request`，不再单独分配：`decode_url_path` 在没有 `%` 时就是借用。
+                // 求值放进这个分支里——非 GET/HEAD 只会返回 404，根本用不到子路径
+                let sub = files_sub_path(request.uri().path()).unwrap_or_default();
                 files.serve(&sub, &request, &mut res, Some(&slot)).await;
             } else {
                 res.status_code(StatusCode::NOT_FOUND);
             }
+
             // 与 salvo 的 `Service` 完全一致地补错误页：状态码是 4xx/5xx 且没写出响应体时
-            // 跑一遍 catcher（HEAD 不补体，RFC 9110 §9.3.2）
-            let should_render_error_page = !is_head
-                && (res.body.is_none() || res.body.is_error())
-                && res
+            // 跑一遍 catcher。判定整个放进 `!is_head` 里：HEAD 不补体（RFC 9110 §9.3.2），
+            // 就不该为它白算这两项
+            if !is_head {
+                let status_is_error = res
                     .status_code
                     .is_some_and(|code| code.is_client_error() || code.is_server_error());
-
-            if should_render_error_page {
-                // `Depot` 只有补错误页时才用得到，正常 200 路径不必每请求建一次
-                let mut depot = Depot::new();
-                Catcher::default()
-                    .catch(&mut request, &mut depot, &mut res, ConnCtrl::new())
-                    .await;
+                let body_is_missing = res.body.is_none() || res.body.is_error();
+                if status_is_error && body_is_missing {
+                    // `Depot` 只有补错误页时才用得到，正常 200 路径不必每请求建一次
+                    let mut depot = Depot::new();
+                    Catcher::default()
+                        .catch(&mut request, &mut depot, &mut res, ConnCtrl::new())
+                        .await;
+                }
             }
+
             // 必须放在 catcher 之后：salvo 的 hoop 也是在整条链跑完后才记日志，错误页的
             // Content-Length 那时才写上去
             log_access(&access_log, &request, &res);
