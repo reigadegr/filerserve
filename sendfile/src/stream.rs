@@ -5,7 +5,7 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -384,10 +384,10 @@ impl<S: SendfileTarget> AsyncWrite for SendfileStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        match this.drain_owed(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => {}
+        // `ready!` 负责把 `Pending` 原样返回（挂起时保留 waker），`if let` 只处理错误；
+        // 展开后的机器码与原先的三分支 `match` 完全一致。
+        if let Err(error) = ready!(this.drain_owed(cx)) {
+            return Poll::Ready(Err(error));
         }
 
         if matches!(this.state, State::Idle) {
@@ -409,20 +409,16 @@ impl<S: SendfileTarget> AsyncWrite for SendfileStream<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        match this.drain_owed(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => {}
+        if let Err(error) = ready!(this.drain_owed(cx)) {
+            return Poll::Ready(Err(error));
         }
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        match this.drain_owed(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => {}
+        if let Err(error) = ready!(this.drain_owed(cx)) {
+            return Poll::Ready(Err(error));
         }
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }

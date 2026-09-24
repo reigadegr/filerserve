@@ -139,12 +139,18 @@ impl FileCache {
         &self.shards[shard_index(hash)]
     }
 
-    /// 还在有效期内就直接命中：连 `lstat` 都不做，省掉每请求一次系统调用。
+    /// 在分片里找到 `path` 对应的条目，交给 `check` 判断是否可用；可用就刷新 LRU 序号并取出。
     ///
-    /// 这里**不刷新**时间戳：否则持续被请求的热文件永远等不到复校验，陈旧窗口就成了无界。
-    /// 复校验由 [`Self::get`] 做，它命中时会把时间戳刷新到当前时刻。
-    #[must_use]
-    pub fn get_fresh(&self, path: &str) -> Option<Hit> {
+    /// `check` 只在真正查到条目后调用一次，返回 `false` 表示这次不算命中。`get` 的
+    /// `check` 还需要顺便刷新有效期，所以它拿到的是 `&mut Entry`。
+    ///
+    /// 闭包会被单态化并内联，因此两条调用路径（`get_fresh` / `get`）的机器码与原先
+    /// 各自展开的实现一致。
+    #[inline]
+    fn lookup<F>(&self, path: &str, check: F) -> Option<Hit>
+    where
+        F: FnOnce(&mut Entry) -> bool,
+    {
         let hash = path_hash(path);
         let mut shard = self.shard(hash).lock().ok()?;
         shard.clock += 1;
@@ -158,13 +164,23 @@ impl FileCache {
             RawEntryMut::Occupied(entry) => entry.into_mut(),
             RawEntryMut::Vacant(_) => return None,
         };
-        if now_millis() - entry.validated_at >= REVALIDATE_MILLIS {
+        if !check(entry) {
             return None;
         }
-
         let hit = take(entry, clock);
         drop(shard);
         Some(hit)
+    }
+
+    /// 还在有效期内就直接命中：连 `lstat` 都不做，省掉每请求一次系统调用。
+    ///
+    /// 这里**不刷新**时间戳：否则持续被请求的热文件永远等不到复校验，陈旧窗口就成了无界。
+    /// 复校验由 [`Self::get`] 做，它命中时会把时间戳刷新到当前时刻。
+    #[must_use]
+    pub fn get_fresh(&self, path: &str) -> Option<Hit> {
+        self.lookup(path, |entry| {
+            now_millis() - entry.validated_at < REVALIDATE_MILLIS
+        })
     }
 
     /// 命中时返回独立的 fd、它的元数据与已经编码好的响应头，调用方会把 fd 交给 `NamedFile` 消费掉。
@@ -172,31 +188,17 @@ impl FileCache {
     /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中；命中即刷新有效期。
     #[must_use]
     pub fn get(&self, path: &str, metadata: &Metadata) -> Option<Hit> {
-        let hash = path_hash(path);
-        let mut shard = self.shard(hash).lock().ok()?;
-        shard.clock += 1;
-        let clock = shard.clock;
-
-        let entry = match shard
-            .entries
-            .raw_entry_mut()
-            .from_hash(hash, |k| &**k == path)
-        {
-            RawEntryMut::Occupied(entry) => entry.into_mut(),
-            RawEntryMut::Vacant(_) => return None,
-        };
-        if entry.metadata.ino() != metadata.ino()
-            || entry.metadata.len() != metadata.len()
-            || (entry.metadata.mtime(), entry.metadata.mtime_nsec())
-                != (metadata.mtime(), metadata.mtime_nsec())
-        {
-            return None;
-        }
-
-        entry.validated_at = now_millis();
-        let hit = take(entry, clock);
-        drop(shard);
-        Some(hit)
+        self.lookup(path, |entry| {
+            if entry.metadata.ino() != metadata.ino()
+                || entry.metadata.len() != metadata.len()
+                || (entry.metadata.mtime(), entry.metadata.mtime_nsec())
+                    != (metadata.mtime(), metadata.mtime_nsec())
+            {
+                return false;
+            }
+            entry.validated_at = now_millis();
+            true
+        })
     }
 
     /// 未命中时把刚打开并已 `fstat` 的文件放进缓存：缓存自己留一份 fd，调用方那份继续用。
