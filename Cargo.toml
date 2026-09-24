@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-salvo = { version = "0.96.0", default-features = false }
+salvo = { version = "1.0.0", default-features = false }
 chrono = "0.4.45"
 tokio = "1.53.1"
 rustix = { git = "https://github.com/reigadegr/rustix" }
