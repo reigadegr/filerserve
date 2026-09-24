@@ -13,6 +13,7 @@ salvo = { workspace = true, features = ["server", "serve-static"] }
 mime = { workspace = true }
 rust-embed = "8.12.0"
 rustc-hash = "2.1.3"
+hashbrown = "0.17"
 tokio = { workspace = true, features = ["fs", "rt"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

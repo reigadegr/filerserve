@@ -34,16 +34,21 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use hashbrown::HashMap;
+use hashbrown::hash_map::RawEntryMut;
 use lanfile_namedfile::FileMeta;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::CachedHeaders;
+
+/// 用 `FxHash` 的 HashMap：与原来 `rustc_hash::FxHashMap` 同样是 FxHasher，但底座是
+/// hashbrown 而不是 std，从而有 `raw_entry_mut` 可以复用预计算好的哈希。
+type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 /// 分片数：把一把全局锁拆成 16 把
 const SHARDS: usize = 16;
 /// 每片的条目上限（总数 512 不变）：fd 数量必须有硬上限
 const CAPACITY_PER_SHARD: usize = 32;
-
 /// 校验结果的有效期（毫秒）：这段时间内同一路径不再 `lstat`。
 ///
 /// 每请求一次 `statx` 在这台机器上要 1.03 µs，而下面这个 coarse 时钟只要 3 ns，所以只要一个
@@ -90,7 +95,7 @@ pub struct FileCache {
     shards: [Mutex<Shard>; SHARDS],
 }
 
-/// 路径落在哪一片：同一路径永远落在同一片。
+/// 路径哈希：同一路径永远落在同一片，分片索引与 `HashMap` 查找共用同一份哈希。
 ///
 /// 这里和片内的 `HashMap` 都用 `FxHash` 而不是 `SipHash`。理由不是「LAN 不怕 DoS」，而是
 /// 这套缓存的容量上界让碰撞 `DoS` 根本不成立：
@@ -102,10 +107,16 @@ pub struct FileCache {
 ///
 /// 注意：若把 `FileCache` 挪去缓存**用户可控且不要求文件存在**的键，上面两条前提即不成立，
 /// 那时必须换回抗碰撞的哈希。
-fn shard_index(path: &str) -> usize {
-    let mut hasher = rustc_hash::FxHasher::default();
+fn path_hash(path: &str) -> u64 {
+    let mut hasher = FxHasher::default();
     path.hash(&mut hasher);
-    (hasher.finish() as usize) % SHARDS
+    hasher.finish()
+}
+
+/// 根据哈希值计算落在哪个分片
+#[inline]
+const fn shard_index(hash: u64) -> usize {
+    (hash as usize) % SHARDS
 }
 
 /// 一次命中交出去的四样东西：拼好的路径、fd、元数据、已经编码好的响应头。
@@ -124,8 +135,8 @@ fn take(entry: &mut Entry, clock: u64) -> Hit {
 }
 
 impl FileCache {
-    fn shard(&self, path: &str) -> &Mutex<Shard> {
-        &self.shards[shard_index(path)]
+    fn shard(&self, hash: u64) -> &Mutex<Shard> {
+        &self.shards[shard_index(hash)]
     }
 
     /// 还在有效期内就直接命中：连 `lstat` 都不做，省掉每请求一次系统调用。
@@ -134,13 +145,23 @@ impl FileCache {
     /// 复校验由 [`Self::get`] 做，它命中时会把时间戳刷新到当前时刻。
     #[must_use]
     pub fn get_fresh(&self, path: &str) -> Option<Hit> {
-        let mut shard = self.shard(path).lock().ok()?;
+        let hash = path_hash(path);
+        let mut shard = self.shard(hash).lock().ok()?;
         shard.clock += 1;
         let clock = shard.clock;
-        let entry = shard.entries.get_mut(path)?;
+
+        let entry = match shard
+            .entries
+            .raw_entry_mut()
+            .from_hash(hash, |k| &**k == path)
+        {
+            RawEntryMut::Occupied(entry) => entry.into_mut(),
+            RawEntryMut::Vacant(_) => return None,
+        };
         if now_millis() - entry.validated_at >= REVALIDATE_MILLIS {
             return None;
         }
+
         let hit = take(entry, clock);
         drop(shard);
         Some(hit)
@@ -151,10 +172,19 @@ impl FileCache {
     /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中；命中即刷新有效期。
     #[must_use]
     pub fn get(&self, path: &str, metadata: &Metadata) -> Option<Hit> {
-        let mut shard = self.shard(path).lock().ok()?;
+        let hash = path_hash(path);
+        let mut shard = self.shard(hash).lock().ok()?;
         shard.clock += 1;
         let clock = shard.clock;
-        let entry = shard.entries.get_mut(path)?;
+
+        let entry = match shard
+            .entries
+            .raw_entry_mut()
+            .from_hash(hash, |k| &**k == path)
+        {
+            RawEntryMut::Occupied(entry) => entry.into_mut(),
+            RawEntryMut::Vacant(_) => return None,
+        };
         if entry.metadata.ino() != metadata.ino()
             || entry.metadata.len() != metadata.len()
             || (entry.metadata.mtime(), entry.metadata.mtime_nsec())
@@ -162,6 +192,7 @@ impl FileCache {
         {
             return None;
         }
+
         entry.validated_at = now_millis();
         let hit = take(entry, clock);
         drop(shard);
@@ -181,11 +212,14 @@ impl FileCache {
         metadata: FileMeta,
         headers: Arc<CachedHeaders>,
     ) {
-        let Ok(mut shard) = self.shard(path).lock() else {
+        let hash = path_hash(path);
+        let Ok(mut shard) = self.shard(hash).lock() else {
             return;
         };
+
         shard.clock += 1;
         let clock = shard.clock;
+
         // 满了就淘汰最久没被用到的那条，而不是把整片清空
         if shard.entries.len() >= CAPACITY_PER_SHARD
             && !shard.entries.contains_key(path)
@@ -197,6 +231,7 @@ impl FileCache {
         {
             shard.entries.remove(&oldest);
         }
+
         shard.entries.insert(
             path.into(),
             Entry {
@@ -212,7 +247,8 @@ impl FileCache {
 
     /// 路径已经不存在了，顺手把占着的 fd 放掉。
     pub fn remove(&self, path: &str) {
-        if let Ok(mut shard) = self.shard(path).lock() {
+        let hash = path_hash(path);
+        if let Ok(mut shard) = self.shard(hash).lock() {
             shard.entries.remove(path);
         }
     }
@@ -314,13 +350,16 @@ mod tests {
             metadata,
             headers(),
         );
+
         let cached = cache.get("file.txt", &fixture.lstat()?);
         assert!(cached.is_some(), "元数据没变就应该命中");
+
         if let Some((_, file, metadata, headers)) = cached {
             assert_eq!(read_all(&file)?, "hello");
             assert_eq!(metadata.len(), 5, "命中时给出的元数据就是那个 fd 的");
             assert_eq!(headers.content_type, text_plain(), "命中时类型也从缓存来");
         }
+
         assert!(
             cache.get("other.txt", &fixture.lstat()?).is_none(),
             "路径不同不该命中"
@@ -333,6 +372,7 @@ mod tests {
         let fixture = Fixture::new("change")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
+
         cache.insert(
             "file.txt",
             Arc::from(Path::new("file.txt")),
@@ -356,6 +396,7 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
         let original = fixture.lstat()?;
+
         cache.insert(
             "file.txt",
             Arc::from(Path::new("file.txt")),
@@ -366,6 +407,7 @@ mod tests {
 
         let replacement = fixture.dir.join("replacement.txt");
         std::fs::write(&replacement, b"world")?;
+
         rustix::fs::utimensat(
             rustix::fs::CWD,
             &replacement,
@@ -381,9 +423,10 @@ mod tests {
             },
             rustix::fs::AtFlags::empty(),
         )?;
-        std::fs::rename(&replacement, &fixture.path)?;
 
+        std::fs::rename(&replacement, &fixture.path)?;
         let replaced = fixture.lstat()?;
+
         assert_eq!(replaced.len(), 5, "替换文件的大小必须和原文件一样");
         assert!(
             cache.get("file.txt", &replaced).is_none(),
@@ -398,8 +441,10 @@ mod tests {
         let fixture = Fixture::new("headers")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
+
         let etag = etag("\"abc-1\"");
         let disposition = HeaderValue::from_static("inline");
+
         cache.insert(
             "file.txt",
             Arc::from(Path::new("file.txt")),
@@ -416,6 +461,7 @@ mod tests {
         let Some((_, _, _, cached)) = cache.get("file.txt", &fixture.lstat()?) else {
             panic!("元数据没变就应该命中");
         };
+
         assert_eq!(cached.etag, Some(etag), "命中时应当给出缓存里的 ETag");
         assert_eq!(
             cached.disposition,
@@ -430,6 +476,7 @@ mod tests {
         let fixture = Fixture::new("remove")?;
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
+
         cache.insert(
             "file.txt",
             Arc::from(Path::new("file.txt")),
@@ -437,6 +484,7 @@ mod tests {
             metadata,
             headers(),
         );
+
         cache.remove("file.txt");
         assert!(cache.get("file.txt", &fixture.lstat()?).is_none());
         Ok(())
@@ -449,6 +497,7 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
         let path = "file.txt";
+
         cache.insert(
             path,
             Arc::from(Path::new(path)),
@@ -464,7 +513,8 @@ mod tests {
         assert!(cache.get_fresh("other.txt").is_none(), "路径不同不该命中");
 
         // 把时间戳往回拨到有效期的另一侧，等价于"1 秒过去了"
-        let Some(mut shard) = cache.shard(path).lock().ok() else {
+        let hash = path_hash(path);
+        let Some(mut shard) = cache.shard(hash).lock().ok() else {
             unreachable!("锁不会中毒");
         };
         let Some(entry) = shard.entries.get_mut(path) else {
@@ -495,6 +545,7 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
         let file = Arc::new(file);
+
         for i in 0..2000 {
             let path = format!("path-{i}");
             cache.insert(
@@ -505,6 +556,7 @@ mod tests {
                 headers(),
             );
         }
+
         assert!(
             cache.total_len() <= SHARDS * CAPACITY_PER_SHARD,
             "条目总数不能超过上限"
@@ -523,21 +575,25 @@ mod tests {
         let cache = FileCache::default();
         let (file, metadata) = fixture.open()?;
         let file = Arc::new(file);
+
         // 凑够同一片里的 CAPACITY_PER_SHARD + 1 条路径，把这一片填满
-        let shard = shard_index("same-shard-0");
+        let shard = shard_index(path_hash("same-shard-0"));
         let mut paths = Vec::new();
         let mut i = 0;
+
         while paths.len() <= CAPACITY_PER_SHARD {
             let path = format!("same-shard-{i}");
-            if shard_index(&path) == shard {
+            if shard_index(path_hash(&path)) == shard {
                 paths.push(path);
             }
             i += 1;
         }
+
         let target = paths[0].clone();
         let Some(extra) = paths.pop() else {
             unreachable!("至少有一条用于触发淘汰");
         };
+
         for path in &paths {
             cache.insert(
                 path,
@@ -547,6 +603,7 @@ mod tests {
                 headers(),
             );
         }
+
         assert!(
             cache.get(&target, &fixture.lstat()?).is_some(),
             "刚插入的应当命中"
@@ -559,6 +616,7 @@ mod tests {
             metadata,
             headers(),
         );
+
         assert!(
             cache.get(&target, &fixture.lstat()?).is_some(),
             "刚用过的不能被淘汰"
