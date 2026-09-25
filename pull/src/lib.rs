@@ -145,19 +145,7 @@ async fn pull_dir(host: &str, remote: &str, local: &Path) -> Result<Stats, BoxEr
 /// 拉一个文件到 `local`：每请求一条连接，`Connection: close`，正文读到 EOF 落盘。
 async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, BoxError> {
     let path = format!("/files/{}", encode_path(remote));
-    let stream = TcpStream::connect(host).await?;
-    let _ = stream.set_nodelay(true);
-    let (read, mut write) = stream.into_split();
-    write
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await?;
-    let mut reader = BufReader::new(read);
-    let status = read_status(&mut reader).await?;
-    if status != 200 {
-        return Err(format!("HTTP {status} 拉取 {path}").into());
-    }
+    let mut reader = http_get(host, &path).await?;
     let mut file = tokio::fs::File::create(local).await?;
     let copied = tokio::io::copy(&mut reader, &mut file).await?;
     Ok(copied)
@@ -165,6 +153,15 @@ async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, BoxEr
 
 /// `GET <path>` 取 JSON 正文（目录列表）。
 async fn get_json(host: &str, path: &str) -> Result<Value, BoxError> {
+    let mut reader = http_get(host, path).await?;
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+/// 建连、写 `GET` 请求、读状态行并跳过响应头；返回可继续读正文的 reader，非 200 报错。
+/// `fetch_file`、`get_json` 共有的请求前置收口于此，避免两处重复。
+async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, BoxError> {
     let stream = TcpStream::connect(host).await?;
     let _ = stream.set_nodelay(true);
     let (read, mut write) = stream.into_split();
@@ -176,11 +173,9 @@ async fn get_json(host: &str, path: &str) -> Result<Value, BoxError> {
     let mut reader = BufReader::new(read);
     let status = read_status(&mut reader).await?;
     if status != 200 {
-        return Err(format!("HTTP {status} 列目录 {path}").into());
+        return Err(format!("HTTP {status} {path}").into());
     }
-    let mut body = Vec::new();
-    reader.read_to_end(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
+    Ok(reader)
 }
 
 /// 读状态行 + 跳过响应头，返回状态码。正文留给调用方接着读。
@@ -192,8 +187,10 @@ async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, BoxEr
         .nth(1)
         .ok_or("状态行格式异常")?
         .parse::<u16>()?;
+    // 复用同一个 String 读响应头，免得每行各分配一次。
+    let mut header = String::new();
     loop {
-        let mut header = String::new();
+        header.clear();
         let read = reader.read_line(&mut header).await?;
         if read == 0 || header.trim().is_empty() {
             break;
