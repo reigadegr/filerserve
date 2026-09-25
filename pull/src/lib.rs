@@ -34,9 +34,8 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let target = local_target(&local, &remote);
     tokio::fs::create_dir_all(&target).await?;
     let stats = pull_dir(host, &remote, &target).await?;
-    let remote_disp = format!("/{remote}");
     eprintln!(
-        "lanfile get: {base}{remote_disp} -> {}（{} 文件，{} 字节，{} 目录）",
+        "lanfile get: {base}/{remote} -> {}（{} 文件，{} 字节，{} 目录）",
         target.display(),
         stats.files,
         stats.bytes,
@@ -175,7 +174,8 @@ async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, Bo
 
 /// 读状态行 + 跳过响应头，返回状态码。正文留给调用方接着读。
 async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, BoxError> {
-    let mut status_line = String::new();
+    // 状态行最长也就几十字节，一次给够，免得 `read_line` 中途扩容
+    let mut status_line = String::with_capacity(64);
     reader.read_line(&mut status_line).await?;
     let status = status_line
         .split_whitespace()
@@ -204,8 +204,11 @@ async fn skip_existing(path: &Path, remote_size: Option<u64>) -> bool {
 
 /// 把远端路径做百分号编码：保留 `A-Za-z0-9-_.~/` 与分隔符 `/`，其余按 UTF-8 字节转义。
 /// 用于 `/files/<sub>/<name>` 与 `/api/list/<sub>` 这两类路径。
+///
+/// 转义直接查表手写两个 hex 字符，不走 `fmt::Write`：文件名带中文或空格时每个字节
+/// 都会走一次格式化分发，这条路径在每个文件下载时都会经过。
 fn encode_path(path: &str) -> String {
-    use std::fmt::Write as _;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(path.len());
     for &byte in path.as_bytes() {
         match byte {
@@ -213,7 +216,9 @@ fn encode_path(path: &str) -> String {
                 out.push(char::from(byte));
             }
             _ => {
-                let _ = write!(out, "%{byte:02X}");
+                out.push('%');
+                out.push(char::from(HEX[(byte >> 4) as usize]));
+                out.push(char::from(HEX[(byte & 0x0F) as usize]));
             }
         }
     }
