@@ -265,6 +265,19 @@ impl io::Write for &LogSink {
 
 #[tokio::main]
 async fn main() {
+    // `lanfile get <base_url> <remote_dir> [local_dir]`：递归拉取子命令。
+    // 在日志/服务端那套初始化之前就分流出去——它只是个 HTTP 客户端，用 eprintln 报进度即可。
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).is_some_and(|arg| arg == "get") {
+        match lanfile_pull::run(&argv[2..]).await {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("lanfile get: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let is_terminal = std::io::stdout().is_terminal();
@@ -284,7 +297,7 @@ async fn main() {
         .with_writer(sink_writer as fn() -> &'static LogSink)
         .init();
 
-    let (port, dir) = parse_args(std::env::args().skip(1));
+    let (port, dir) = parse_args(argv.into_iter().skip(1));
     let root = std::fs::canonicalize(&dir).unwrap_or_else(|error| {
         tracing::error!("无法访问目录 {:?}: {error}", dir);
         // 进程马上退出，这一行不能留在缓冲里

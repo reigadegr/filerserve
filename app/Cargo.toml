@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 lanfile-assets = { path = "../assets" }
 lanfile-list = { path = "../list" }
+lanfile-pull = { path = "../pull" }
 lanfile-sendfile = { path = "../sendfile" }
 salvo = { workspace = true, features = ["server", "http1"] }
 mimalloc = { version = "0.1.52", features = ["v2", "no_thp", "override"] }

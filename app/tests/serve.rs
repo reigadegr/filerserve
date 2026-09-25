@@ -713,3 +713,58 @@ async fn api_zip_skips_unreadable_directory() {
     )
     .unwrap();
 }
+
+// ---- lanfile get 递归拉取 ----
+
+/// `lanfile get` 把远端一棵小树原样镜像到本地：起一个真实监听的 lanfile，
+/// 用 `lanfile_pull::run` 拉 `sub` 子树，逐文件比对本地与原内容一致；
+/// 再拉第二次验证"本地已存在且尺寸一致就跳过"不会破坏已有文件。
+#[tokio::test]
+async fn get_subcommand_mirrors_a_tree() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("a.txt"), "aaa").unwrap();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub").join("b.txt"), "bbbb").unwrap();
+    std::fs::create_dir_all(dir.root().join("sub").join("deeper")).unwrap();
+    std::fs::write(
+        dir.root().join("sub").join("deeper").join("c.bin"),
+        vec![1_u8, 2, 3, 4, 5],
+    )
+    .unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let local = TestDir::new();
+    let base = format!("http://{addr}");
+    let local_arg = local.root().to_string_lossy().into_owned();
+    lanfile_pull::run(&[base.clone(), "sub".to_string(), local_arg.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(local.root().join("b.txt")).unwrap(), b"bbbb");
+    assert_eq!(
+        std::fs::read(local.root().join("deeper").join("c.bin")).unwrap(),
+        vec![1_u8, 2, 3, 4, 5]
+    );
+    // 根下的 a.txt 不该被拉进 sub 的镜像
+    assert!(!local.root().join("a.txt").exists());
+
+    // 第二次拉取：本地已存在且尺寸一致，应跳过，文件内容不变
+    lanfile_pull::run(&[base, "sub".to_string(), local_arg])
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(local.root().join("deeper").join("c.bin")).unwrap(),
+        vec![1_u8, 2, 3, 4, 5]
+    );
+
+    server.abort();
+}
