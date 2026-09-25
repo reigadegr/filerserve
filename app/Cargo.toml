@@ -27,3 +27,4 @@ rustix = { workspace = true, features = ["time"] }
 [dev-dependencies]
 salvo = { workspace = true, features = ["test"] }
 serde_json = "1.0.151"
+memchr = { workspace = true }

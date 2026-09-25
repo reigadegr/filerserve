@@ -85,13 +85,17 @@ fn local_target(local: &Path, remote: &str) -> PathBuf {
 }
 
 /// 远端路径的末段目录名；root（去首尾斜杠后为空）返回 `None`。
+///
+/// 用 `memrchr` 从尾部找最后一个 `/`，省掉 `trim_matches` + `rsplit` 两层迭代器
+/// （基准见 `bench_basename`）。
 fn basename(remote: &str) -> Option<&str> {
-    let trimmed = remote.trim_matches('/');
-    if trimmed.is_empty() {
-        None
-    } else {
-        trimmed.rsplit('/').next()
-    }
+    // 先跳过尾部的 `/`，等价于 `trim_matches('/')` 的右侧
+    let end = remote.as_bytes().iter().rposition(|b| *b != b'/')? + 1;
+    let head = &remote[..end];
+    Some(match memchr::memrchr(b'/', head.as_bytes()) {
+        Some(at) => &head[at + 1..],
+        None => head,
+    })
 }
 
 /// 递归拉取 `remote` 目录到 `local`。单文件失败只记一条警告并继续；目录枚举失败才上抛。
@@ -178,11 +182,7 @@ async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, BoxEr
     // 状态行最长也就几十字节，一次给够，免得 `read_line` 中途扩容
     let mut status_line = String::with_capacity(64);
     reader.read_line(&mut status_line).await?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or("状态行格式异常")?
-        .parse::<u16>()?;
+    let status = status_code(&status_line).ok_or("状态行格式异常")?;
     // 复用同一个 String 读响应头，免得每行各分配一次。
     let mut line = String::new();
     loop {
@@ -193,6 +193,23 @@ async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, BoxEr
         }
     }
     Ok(status)
+}
+
+/// 从状态行 `HTTP/1.1 200 OK` 里取出状态码。
+///
+/// 先用 `memchr` 定位版本号后那个空格，再在剩下的一小段里取词：比
+/// `split_whitespace().nth(1)` 少一整层 `Pattern` 与迭代器分发（基准见 `bench_status_code`）。
+/// 仍按任意 ASCII 空白切分，与原来的宽容度一致。
+fn status_code(line: &str) -> Option<u16> {
+    let bytes = line.as_bytes();
+    let rest = &bytes[memchr::memchr(b' ', bytes)? + 1..];
+    let start = rest.iter().position(|b| !b.is_ascii_whitespace())?;
+    let token = &rest[start..];
+    let end = token
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(token.len());
+    std::str::from_utf8(&token[..end]).ok()?.parse().ok()
 }
 
 /// 本地已存在且尺寸与远端一致就跳过（尺寸级幂等，避免重复落盘）。
@@ -300,5 +317,86 @@ mod tests {
     fn encode_path_percent_encodes_space_and_unicode() {
         assert_eq!(encode_path("a b.txt"), "a%20b.txt");
         assert_eq!(encode_path("中"), "%E4%B8%AD");
+    }
+
+    /// 基准：`memchr` 取状态码 vs `split_whitespace().nth(1)`，逐文件都会走一遍。
+    ///
+    /// `sh debug.sh` 跑在 `opt-level = 0`，此时 std 是预编译的优化产物而 `memchr` 不是；
+    /// 公平对比要 `cargo +nightly test -Z build-std`。
+    #[test]
+    fn bench_status_code() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn time(iters: u32, f: impl Fn() -> Option<u16>) -> f64 {
+            for _ in 0..iters / 10 {
+                black_box(f());
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(f());
+            }
+            start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
+        }
+
+        for line in ["HTTP/1.1 200 OK\r\n", "HTTP/1.1 404 Not Found\r\n"] {
+            let old = || line.split_whitespace().nth(1)?.parse::<u16>().ok();
+            assert_eq!(old(), status_code(line), "{line} 取值不一致");
+
+            let old_ns = time(500_000, old);
+            let memchr_ns = time(500_000, || status_code(line));
+            println!(
+                "基准 status_code（{}B）: split_whitespace {old_ns:.1} ns vs memchr {memchr_ns:.1} ns",
+                line.len()
+            );
+            // 只卡数量级：未优化的测试 profile 抖动大，这里不追求证明「更快」
+            assert!(
+                memchr_ns < old_ns * 10.0,
+                "memchr 版比原实现慢了一个数量级: {memchr_ns:.1} vs {old_ns:.1} ns"
+            );
+        }
+    }
+
+    /// 基准：`memrchr` 找末段 vs `trim_matches` + `rsplit`
+    #[test]
+    fn bench_basename() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn time(iters: u32, f: impl Fn() -> Option<&'static str>) -> f64 {
+            for _ in 0..iters / 10 {
+                black_box(f());
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(f());
+            }
+            start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
+        }
+
+        for remote in ["sub", "a/b", "sub/deeper/more/leaf", "sub/deeper/", "///"] {
+            // 原实现：去首尾斜杠后为空即 `None`（`///` 走的就是这一支）
+            let old = || {
+                let trimmed = remote.trim_matches('/');
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    trimmed.rsplit('/').next()
+                }
+            };
+            assert_eq!(old(), basename(remote), "{remote} 取值不一致");
+
+            let old_ns = time(500_000, old);
+            let memchr_ns = time(500_000, || basename(remote));
+            println!(
+                "基准 basename（{}B）: rsplit {old_ns:.1} ns vs memrchr {memchr_ns:.1} ns",
+                remote.len()
+            );
+            // 只卡数量级：未优化的测试 profile 抖动大，这里不追求证明「更快」
+            assert!(
+                memchr_ns < old_ns * 10.0,
+                "memchr 版比原实现慢了一个数量级: {memchr_ns:.1} vs {old_ns:.1} ns"
+            );
+        }
     }
 }

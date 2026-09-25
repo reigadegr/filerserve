@@ -252,12 +252,29 @@ fn seccomp_filter_installed() -> bool {
 }
 
 /// `/proc/self/status` 里 `Seccomp:` 为 2 即 `SECCOMP_MODE_FILTER`
+///
+/// 自己用 `memchr` 扫换行，不走 `lines()`：状态文件约 800 字节，这一遍扫描是整函数的主体，
+/// 优化构建下 `memchr` 的 SIMD 比逐行迭代快约 1.8×（基准见 `bench_has_seccomp_filter`）。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn has_seccomp_filter(status: &str) -> bool {
-    status.lines().any(|line| {
-        line.strip_prefix("Seccomp:")
-            .is_some_and(|value| value.trim() == "2")
-    })
+    // 内核生成的状态文件全是 ASCII，`trim_ascii` 与 `trim` 在这里等价
+    let is_filter = |line: &[u8]| {
+        line.strip_prefix(b"Seccomp:")
+            .is_some_and(|value| value.trim_ascii() == b"2")
+    };
+    let mut rest = status.as_bytes();
+    loop {
+        match memchr::memchr(b'\n', rest) {
+            Some(at) => {
+                if is_filter(&rest[..at]) {
+                    return true;
+                }
+                rest = &rest[at + 1..];
+            }
+            // 末行没有换行符
+            None => return is_filter(rest),
+        }
+    }
 }
 
 impl ServeFiles {
@@ -629,5 +646,54 @@ mod tests {
                 );
                 Ok::<(), std::io::Error>(())
             })
+    }
+
+    /// 基准：`memchr` 扫换行 vs `lines()`，输入尺寸对齐真实的 `/proc/self/status`。
+    ///
+    /// `sh debug.sh` 跑在 `opt-level = 0`，此时 std 是预编译的优化产物而 `memchr` 不是，
+    /// 这一项在默认测试 profile 下偏向 `lines()`；公平对比要
+    /// `cargo +nightly test -Z build-std`。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn bench_has_seccomp_filter() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn time(iters: u32, f: impl Fn() -> bool) -> f64 {
+            for _ in 0..iters / 10 {
+                black_box(f());
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(f());
+            }
+            start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
+        }
+
+        // `Seccomp:` 放在中后段，整份尺寸与真实状态文件同量级
+        let mut status = "Name:\tlanfile\nState:\tS (sleeping)\n".repeat(10);
+        status.push_str("Seccomp:\t2\n");
+        status.push_str(&"Tgid:\t1234\n".repeat(40));
+
+        let old = |status: &str| {
+            status.lines().any(|line| {
+                line.strip_prefix("Seccomp:")
+                    .is_some_and(|value| value.trim() == "2")
+            })
+        };
+        assert!(old(&status), "原实现应当认出 filter");
+        assert!(has_seccomp_filter(&status), "memchr 版应当认出 filter");
+
+        let lines_ns = time(20_000, || old(&status));
+        let memchr_ns = time(20_000, || has_seccomp_filter(&status));
+        println!(
+            "基准 has_seccomp_filter（{}B）: lines() {lines_ns:.1} ns vs memchr {memchr_ns:.1} ns",
+            status.len()
+        );
+        // 只卡数量级：未优化的测试 profile 抖动大，这里不追求证明「更快」
+        assert!(
+            memchr_ns < lines_ns * 10.0,
+            "memchr 版比原实现慢了一个数量级: {memchr_ns:.1} vs {lines_ns:.1} ns"
+        );
     }
 }

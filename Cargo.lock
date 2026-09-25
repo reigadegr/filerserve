@@ -882,6 +882,7 @@ dependencies = [
  "lanfile-list",
  "lanfile-pull",
  "lanfile-sendfile",
+ "memchr",
  "mimalloc",
  "rustix 1.1.5 (git+https://github.com/reigadegr/rustix)",
  "salvo",
@@ -898,6 +899,7 @@ dependencies = [
  "hashbrown",
  "lanfile-namedfile",
  "lanfile-sendfile",
+ "memchr",
  "mime",
  "rust-embed",
  "rustc-hash",
@@ -941,6 +943,7 @@ dependencies = [
 name = "lanfile-pull"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "serde_json",
  "tokio",
 ]

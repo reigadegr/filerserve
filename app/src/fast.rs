@@ -294,4 +294,44 @@ mod tests {
             Some(Cow::Borrowed(_))
         ));
     }
+
+    /// 基准：为什么前缀分流用 `starts_with` 而不是 `memchr`。
+    ///
+    /// `starts_with` 只比那 7 个字节（常量前缀会被编成一次比较），`memmem::find` 却要扫完
+    /// 整条路径才能判定「子串不在开头」，而且语义上还得再补一次 `== Some(0)`。这里把它钉成
+    /// 测试，谁要是把分流换成 `memmem`，这条会立刻报出数量级退步。
+    ///
+    /// 注意 `sh debug.sh` 跑在 `opt-level = 0`，此时 std 是预编译优化产物而 `memchr` 不是，
+    /// 差距会被放大；公平对比要 `cargo +nightly test -Z build-std`。
+    #[test]
+    fn bench_prefix_match_stays_starts_with() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn time(iters: u32, f: impl Fn() -> bool) -> f64 {
+            for _ in 0..iters / 10 {
+                black_box(f());
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                black_box(f());
+            }
+            start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
+        }
+
+        for path in ["/files/f.bin", "/files/sub/deeper/dir/c.bin"] {
+            let starts_with_ns = time(500_000, || path.starts_with("/files/"));
+            let memmem_ns = time(500_000, || {
+                memchr::memmem::find(path.as_bytes(), b"/files/") == Some(0)
+            });
+            println!(
+                "基准 前缀分流（{}B）: starts_with {starts_with_ns:.1} ns vs memmem {memmem_ns:.1} ns",
+                path.len()
+            );
+            assert!(
+                starts_with_ns < memmem_ns,
+                "starts_with 应当比 memmem 快: {starts_with_ns:.1} vs {memmem_ns:.1} ns"
+            );
+        }
+    }
 }

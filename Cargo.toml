@@ -14,6 +14,7 @@ rustix = { git = "https://github.com/reigadegr/rustix" }
 tracing = "0.1.44"
 mime = "0.3"
 bytes = "1"
+memchr = "2"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
