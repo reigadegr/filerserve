@@ -10,10 +10,7 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{
-    body::{Plan, SendfileSlot},
-    registry::{self, ConnKey},
-};
+use crate::body::{Plan, SendfileSlot};
 
 /// Marks the end of an HTTP/1 response head.
 const HEAD_END: &[u8; 4] = b"\r\n\r\n";
@@ -132,28 +129,12 @@ pub struct SendfileStream<S> {
     /// Head bytes taken from Hyper but not yet accepted by the socket.
     owed: Vec<u8>,
     plan: Option<Plan>,
-    /// `Some` 时 `Drop` 会从 registry 注销；快路径直接握着槽位，从不查 registry，
-    /// 用 `None` 跳过 register/unregister 的两次 Mutex 锁。
-    conn: Option<ConnKey>,
 }
 
 impl<S> SendfileStream<S> {
-    /// Wraps `inner` and publishes `slot` so handlers can find it for `conn`.
-    pub fn new(inner: S, slot: Arc<SendfileSlot>, conn: ConnKey) -> Self {
-        registry::register(conn, slot.clone());
-        Self {
-            inner,
-            slot,
-            state: State::Idle,
-            owed: Vec::new(),
-            plan: None,
-            conn: Some(conn),
-        }
-    }
-
     /// 构造不注册到全局 registry 的流。
     ///
-    /// 快路径在 `FastService` 里直接握着 `SendfileSlot`，从不走 `slot_for` 查 registry，
+    /// 调用方在建连接时直接握着 `SendfileSlot`，从不走按 `(local, remote)` 的全局查找，
     /// 所以注册条目永远不会被查到，register/unregister 的两次 Mutex 锁是纯浪费。
     #[must_use]
     pub const fn new_unregistered(inner: S, slot: Arc<SendfileSlot>) -> Self {
@@ -163,15 +144,6 @@ impl<S> SendfileStream<S> {
             state: State::Idle,
             owed: Vec::new(),
             plan: None,
-            conn: None,
-        }
-    }
-}
-
-impl<S> Drop for SendfileStream<S> {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn {
-            registry::unregister(conn);
         }
     }
 }
@@ -517,7 +489,6 @@ mod transport_tests {
         cell::{Cell, RefCell},
         fs::File,
         io::{self, IoSlice},
-        net::IpAddr,
         os::unix::fs::FileExt,
         pin::Pin,
         rc::Rc,
@@ -622,14 +593,13 @@ mod transport_tests {
         std::fs::write(&path, &payload).unwrap();
 
         let slot = Arc::new(SendfileSlot::new());
-        let body = slot
-            .arm(Arc::new(File::open(&path).unwrap()), OFFSET, LEN)
+        // `arm` 返回的 `SendfileBody` 是交给 Hyper 的占位体；这里不经过 Hyper，
+        // 直接丢弃即可——计划已经存进 slot，`take_plan` 仍然拿得到
+        slot.arm(Arc::new(File::open(&path).unwrap()), OFFSET, LEN)
             .unwrap();
-        assert_eq!(body.len(), LEN);
 
         let record = Record::default();
-        let key = (None::<IpAddr>, None, None, None);
-        let stream = SendfileStream::new(FakeTarget(record.clone()), slot, key);
+        let stream = SendfileStream::new_unregistered(FakeTarget(record.clone()), slot);
         (record, stream, payload)
     }
 

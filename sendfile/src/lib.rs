@@ -3,34 +3,21 @@
 //! Hyper owns the connection socket and writes every response byte itself, so a
 //! handler cannot call `sendfile(2)` on its own. This crate bridges that gap:
 //!
-//! 1. [`SendfileListener`] wraps each accepted connection's transport in a
-//!    [`SendfileStream`].
-//! 2. [`upgrade_response`] replaces the body of a file response with a
+//! 1. [`SendfileStream`] wraps an accepted connection's transport.
+//! 2. [`upgrade_response_with_slot`] replaces the body of a file response with a
 //!    [`SendfileBody`], which reports the file's exact length but yields
 //!    placeholder bytes instead of content.
 //! 3. The stream recognises those placeholders and issues `sendfile(2)` for the
 //!    same length, so the file never enters userspace.
 //!
-//! A caller that owns the service wrapper can skip the listener and the registry:
-//! [`SendfileStream::new_unregistered`] plus [`upgrade_response_with_slot`] hand
-//! the slot straight to the handler, which is what this project's fast path does.
+//! The caller owns the service wrapper, so it hands the [`SendfileSlot`] straight
+//! to the handler: [`SendfileStream::new_unregistered`] plus
+//! [`upgrade_response_with_slot`] is what this project's fast path does, and it
+//! never consults a registry.
 //!
 //! Framing is untouched: the placeholder byte count equals the `Content-Length`
 //! Hyper was given, so keep-alive, range responses and Hyper's own accounting
 //! behave exactly as they do for an ordinary body.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use salvo::prelude::*;
-//!
-//! # async fn run() {
-//! let acceptor = lanfile_sendfile::SendfileListener::new(TcpListener::new("0.0.0.0:8000"))
-//!     .bind()
-//!     .await;
-//! Server::new(acceptor).serve(Router::new()).await;
-//! # }
-//! ```
 
 use std::fs::File;
 use std::sync::Arc;
@@ -45,13 +32,9 @@ use salvo::{
 };
 
 mod body;
-mod conn;
-mod registry;
 mod stream;
 
 pub use body::{SendfileBody, SendfileSlot};
-pub use conn::{SendfileAcceptor, SendfileListener};
-pub use registry::{ConnKey, conn_key, slot_for};
 pub use stream::{SendfileStream, SendfileTarget};
 
 /// Replaces a file response body with a zero-copy `sendfile(2)` body.
@@ -62,7 +45,6 @@ pub use stream::{SendfileStream, SendfileTarget};
 ///
 /// - the status is `200 OK` or `206 Partial Content`;
 /// - `Content-Length` is present and non-zero;
-/// - the request arrived on a [`SendfileListener`] connection;
 /// - the platform has `sendfile(2)`.
 ///
 /// There is deliberately no size threshold: even for a few kilobytes `sendfile`
@@ -71,25 +53,6 @@ pub use stream::{SendfileStream, SendfileTarget};
 /// not paid before this is reached.
 ///
 /// The returned value reports whether the body was replaced.
-pub fn upgrade_response(req: &Request, res: &mut Response, file: Arc<File>) -> bool {
-    let status = res.status_code;
-    if status != Some(StatusCode::OK) && status != Some(StatusCode::PARTIAL_CONTENT) {
-        return false;
-    }
-    // 顺序与以前一致：先确认 `Content-Length` 在，再查槽位
-    if header_u64(res, CONTENT_LENGTH).is_none() {
-        return false;
-    }
-    let Some(slot) = slot_for(req.local_addr(), req.remote_addr()) else {
-        return false;
-    };
-    upgrade_response_with_slot(&slot, res, file)
-}
-
-/// 同 [`upgrade_response`]，但槽位由调用方直接给出。
-///
-/// 快路径在建连接时就握着这个槽位，用它省掉一次按 `(local, remote)` 的全局查找
-/// （分片互斥锁 + 哈希 + `Arc` 克隆）。
 pub fn upgrade_response_with_slot(
     slot: &SendfileSlot,
     res: &mut Response,

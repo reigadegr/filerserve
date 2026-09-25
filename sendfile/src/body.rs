@@ -114,23 +114,6 @@ pub struct SendfileBody {
     remaining: u64,
 }
 
-impl SendfileBody {
-    /// Number of file bytes this body stands in for.
-    #[must_use]
-    pub const fn len(&self) -> u64 {
-        self.remaining
-    }
-
-    /// Whether every placeholder byte has been handed over.
-    ///
-    /// An armed plan is never empty to begin with, so this only becomes true
-    /// after the last frame has been taken.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.remaining == 0
-    }
-}
-
 impl Body for SendfileBody {
     type Data = Bytes;
     type Error = Box<dyn std::error::Error + Send + Sync>;

@@ -8,8 +8,7 @@ use std::{
     },
 };
 
-use lanfile::{AccessLog, build_router};
-use lanfile_sendfile::SendfileListener;
+use lanfile::{AccessLog, build_router, serve};
 use salvo::{
     prelude::*,
     test::{ResponseExt, TestClient},
@@ -366,14 +365,16 @@ async fn download(addr: std::net::SocketAddr, name: &str, extra: &str) -> (Strin
     read_response(&mut stream).await
 }
 
+/// 起一个真正的 sendfile 服务：直接复用生产里的 `serve`，它自己跑 accept 循环、
+/// 给每条连接装上 `SendfileStream`（未注册版）并把槽位交给 handler。
 async fn serve_with_sendfile(root: PathBuf) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let router = api_router(root);
-    let acceptor = SendfileListener::new(TcpListener::new("127.0.0.1:0"))
-        .bind()
-        .await;
-    let addr = acceptor.local_addr().unwrap();
+    let access_log = Arc::new(AccessLog::Tracing);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        Server::new(acceptor).serve(router).await;
+        // 服务循环不返回；这里忽略它的 `io::Result`
+        let _ = serve(listener, root, access_log, router).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (addr, server)

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lanfile_namedfile::{FileMeta, NamedFile};
-use lanfile_sendfile::{SendfileSlot, upgrade_response, upgrade_response_with_slot};
+use lanfile_sendfile::{SendfileSlot, upgrade_response_with_slot};
 use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -331,13 +331,12 @@ impl ServeFiles {
 
         // 满足 sendfile 条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
         // 这里不再 dup：响应体直接共享缓存里那个 fd（sendfile 带显式 offset，共享描述符是安全的）
-        match slot {
-            Some(slot) => {
-                upgrade_response_with_slot(slot, res, file);
-            }
-            None => {
-                upgrade_response(req, res, file);
-            }
+        //
+        // 调用方要么直接握着槽位（快路径），要么走 salvo 的 handler（不传槽位）——后者
+        // 只出现在 `/files/*` 未经过快路径的场景，而 `fast.rs` 的前缀分流保证了它不会发生，
+        // 所以这里不需要再按 (local, remote) 去查一次全局 registry。
+        if let Some(slot) = slot {
+            upgrade_response_with_slot(slot, res, file);
         }
     }
 }
