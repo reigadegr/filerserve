@@ -209,41 +209,44 @@ impl LogSink {
         }
     }
 
-    /// 所有分片都空才算空。
-    fn is_empty(&self) -> bool {
-        self.pending.iter().all(|shard| lock(shard).is_empty())
-    }
-
-    /// 取出各分片里的字节并写出；全空时什么也不做。
-    fn flush(&self, out: &mut impl io::Write) -> io::Result<()> {
-        // 取出与写出都在 `writing` 下完成：写出者只有一个，顺序即取出顺序。
-        // 只按 `writing` -> `pending` 的顺序取锁，`push` 只碰自己的分片，不会死锁。
+    /// 取出各分片里的字节并写出；返回这一轮是否真的写出去过东西。
+    ///
+    /// 返回值就是"还有没有积压"的判据：`false` 意味着此刻所有分片都空，调用方可以去
+    /// [`Condvar::wait_timeout`] 上睡 [`LOG_INTERVAL`]。这样写线程每轮只需按分片走一遍，
+    /// 不必先跑一趟专门"是否全空"的预检（那一趟同样要逐个锁分片，等于把加锁次数翻倍）。
+    ///
+    /// 取出与写出都在 `writing` 下完成：写出者只有一个，顺序即取出顺序。只按
+    /// `writing` -> `pending` 的顺序取锁，`push` 只碰自己的分片，不会死锁。
+    fn flush(&self, out: &mut impl io::Write) -> io::Result<bool> {
         let _writing = lock(&self.writing);
+        let mut wrote = false;
         for shard in &self.pending {
             let batch = std::mem::take(&mut *lock(shard));
             if !batch.is_empty() {
                 out.write_all(&batch)?;
+                wrote = true;
             }
         }
-        Ok(())
+        Ok(wrote)
     }
 
     /// 写线程：攒够一批会被 [`Self::push`] 的调用方叫醒，否则最多等 [`LOG_INTERVAL`]。
     fn run(&self, out: &mut impl io::Write) {
         loop {
-            {
-                let gate = lock(&self.gate);
-                if self.is_empty() {
-                    // 锁在 `wait_timeout` 返回时已经释放；结果本身不重要，丢掉即可。
-                    // 叫醒与这里检查"全空"之间不是原子的，所以最坏也就是多等一个
-                    // `LOG_INTERVAL`，日志不会丢。
-                    let _ = self.ready.wait_timeout(gate, LOG_INTERVAL);
-                }
-            }
-            if self.flush(out).is_err() {
+            // 先把已有的刷出去。刷到东西就接着刷（可能又有新的追加进来），刷空了才去等。
+            // 这样"检查是否全空"与"等待"之间没有窗口：睡下去之前最后一次 flush 已经
+            // 确认过所有分片都是空的。
+            match self.flush(out) {
+                Ok(true) => continue,
+                Ok(false) => {}
                 // stdout 已经写不动了（管道对端消失之类），再试也没有意义
-                break;
+                Err(_) => break,
             }
+            let gate = lock(&self.gate);
+            // 锁在 `wait_timeout` 返回时已经释放；结果本身不重要，丢掉即可。
+            // 叫醒与这里检查"全空"之间不是原子的，所以最坏也就是多等一个
+            // `LOG_INTERVAL`，日志不会丢。
+            let _ = self.ready.wait_timeout(gate, LOG_INTERVAL);
         }
     }
 }
@@ -442,8 +445,20 @@ mod tests {
 
         // 没攒够一批，所以一行都还没写出去；内容与顺序原样留着
         let mut out = Vec::new();
-        sink.flush(&mut out).unwrap();
+        let wrote = sink.flush(&mut out).unwrap();
+        assert!(wrote, "有积压时 flush 必须报告写过东西");
         assert_eq!(out.as_slice(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn flush_reports_when_every_shard_is_empty() {
+        let sink = LogSink::new();
+        let mut out = Vec::new();
+        assert!(
+            !sink.flush(&mut out).unwrap(),
+            "全空时 flush 必须报告没东西可写"
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
