@@ -38,8 +38,15 @@ type BoxedFuture =
 ///
 /// 末尾带斜杠的请求在 salvo 那边匹配不上（实测 `/files/f.bin/` 是 404），这里用空串表示，
 /// `ServeFiles` 同样会把它判成 404。返回 `None` 表示这条请求不归快路径管，交给 salvo。
+///
+/// 前缀比较用 `memchr::arch::all::is_prefix` 而不是 `strip_prefix`：这里的 `prefix` 是运行时
+/// 值，`strip_prefix` 会落到 libc `memcmp` 调用上，而 `is_prefix` 的内联分块比较在优化构建下
+/// 快约 1.4×（基准见 `bench_prefix_match`）。切点由匹配结果保证落在字符边界上。
 fn sub_path<'a>(path: &'a str, prefix: &str) -> Option<Cow<'a, str>> {
-    let rest = path.strip_prefix(prefix)?.trim_start_matches('/');
+    if !memchr::arch::all::is_prefix(path.as_bytes(), prefix.as_bytes()) {
+        return None;
+    }
+    let rest = path[prefix.len()..].trim_start_matches('/');
     if rest.ends_with('/') {
         return Some(Cow::Borrowed(""));
     }
@@ -295,20 +302,23 @@ mod tests {
         ));
     }
 
-    /// 基准：为什么前缀分流用 `starts_with` 而不是 `memchr`。
+    /// 基准：前缀匹配各写法的耗时，分「常量 needle」与「运行时 needle」两种情形。
     ///
-    /// `starts_with` 只比那 7 个字节（常量前缀会被编成一次比较），`memmem::find` 却要扫完
-    /// 整条路径才能判定「子串不在开头」，而且语义上还得再补一次 `== Some(0)`。这里把它钉成
-    /// 测试，谁要是把分流换成 `memmem`，这条会立刻报出数量级退步。
+    /// - 常量 needle（`route_mode` 的 `starts_with("/files/")`）：rustc 把常量前缀折成一次
+    ///   直接比较，优化构建下两种写法都在 1 ns 上下，未优化时 `starts_with` 明显更快，
+    ///   所以这里保留 `starts_with`。
+    /// - 运行时 needle（`sub_path` 的 `prefix` 参数）：`strip_prefix` 会落到 libc `memcmp`
+    ///   调用上，而 `is_prefix` 的内联分块比较在优化构建下快约 1.4×，所以 `sub_path` 用它。
     ///
-    /// 注意 `sh debug.sh` 跑在 `opt-level = 0`，此时 std 是预编译优化产物而 `memchr` 不是，
-    /// 差距会被放大；公平对比要 `cargo +nightly test -Z build-std`。
+    /// `sh debug.sh` 跑在 `opt-level = 0`：std 与 libc 都是预编译的优化产物而 `memchr` 不是，
+    /// 打印出来的数会偏向现实现。要看到那个 1.5× 得跑 `cargo test --release`；对应断言用
+    /// `debug_assertions` 关掉了，只在优化构建下生效。
     #[test]
-    fn bench_prefix_match_stays_starts_with() {
+    fn bench_prefix_match() {
         use std::hint::black_box;
         use std::time::Instant;
 
-        fn time(iters: u32, f: impl Fn() -> bool) -> f64 {
+        fn time<R>(iters: u32, f: impl Fn() -> R) -> f64 {
             for _ in 0..iters / 10 {
                 black_box(f());
             }
@@ -320,17 +330,51 @@ mod tests {
         }
 
         for path in ["/files/f.bin", "/files/sub/deeper/dir/c.bin"] {
-            let starts_with_ns = time(500_000, || path.starts_with("/files/"));
-            let memmem_ns = time(500_000, || {
+            // 常量 needle：`route_mode` 的情形
+            let sw = time(500_000, || path.starts_with("/files/"));
+            let ip = time(500_000, || {
+                memchr::arch::all::is_prefix(path.as_bytes(), b"/files/")
+            });
+            let mm = time(500_000, || {
                 memchr::memmem::find(path.as_bytes(), b"/files/") == Some(0)
             });
             println!(
-                "基准 前缀分流（{}B）: starts_with {starts_with_ns:.1} ns vs memmem {memmem_ns:.1} ns",
+                "基准 前缀分流 常量（{}B）: starts_with {sw:.1} ns | is_prefix {ip:.1} ns | memmem {mm:.1} ns",
                 path.len()
             );
+            assert_eq!(
+                path.starts_with("/files/"),
+                memchr::arch::all::is_prefix(path.as_bytes(), b"/files/"),
+                "{path} 两种写法取值不一致"
+            );
             assert!(
-                starts_with_ns < memmem_ns,
-                "starts_with 应当比 memmem 快: {starts_with_ns:.1} vs {memmem_ns:.1} ns"
+                mm > sw,
+                "memmem 不该比 starts_with 快: {mm:.1} vs {sw:.1} ns"
+            );
+
+            // 运行时 needle：`sub_path` 的情形，`black_box` 挡住常量折叠
+            let prefix: &str = black_box("/files/");
+            let strip = time(500_000, || path.strip_prefix(prefix).map(str::len));
+            let isp = time(500_000, || {
+                memchr::arch::all::is_prefix(path.as_bytes(), prefix.as_bytes())
+                    .then(|| path[prefix.len()..].len())
+            });
+            println!(
+                "基准 前缀分流 运行时（{}B）: strip_prefix {strip:.1} ns | is_prefix {isp:.1} ns",
+                path.len()
+            );
+            assert_eq!(
+                path.strip_prefix(prefix).map(str::len),
+                memchr::arch::all::is_prefix(path.as_bytes(), prefix.as_bytes())
+                    .then(|| path[prefix.len()..].len()),
+                "{path} 两种写法取值不一致"
+            );
+            // 只有优化构建下 `is_prefix` 才快于 libc `memcmp`，未优化时正好反过来，
+            // 所以这条断言只在 `debug_assertions` 关掉（release）时生效
+            #[cfg(not(debug_assertions))]
+            assert!(
+                isp < strip,
+                "优化构建下 is_prefix 应当快于 strip_prefix: {isp:.1} vs {strip:.1} ns"
             );
         }
     }
