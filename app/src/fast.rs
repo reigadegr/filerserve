@@ -56,7 +56,7 @@ struct FastService {
     fallback: Box<dyn Fn(HyperRequest<Incoming>) -> BoxedFuture + Send + Sync>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
-    /// 本连接的 sendfile 槽位。直接握着它，`upgrade_response` 就不必回 registry 查一次
+    /// 本连接的 sendfile 槽位：handler 用它 arm 文件，transport stream 用它取走 plan
     slot: Arc<SendfileSlot>,
 }
 

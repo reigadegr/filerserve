@@ -83,13 +83,9 @@ fn header_u64(res: &Response, name: salvo::http::header::HeaderName) -> Option<u
 
 /// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
 fn range_start(value: &str) -> Option<u64> {
-    value
-        .strip_prefix("bytes ")?
-        .split('-')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    let rest = value.strip_prefix("bytes ")?;
+    let (start, _) = rest.split_once('-')?;
+    start.trim().parse().ok()
 }
 
 #[cfg(test)]

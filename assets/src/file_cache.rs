@@ -215,8 +215,6 @@ impl FileCache {
         headers: Arc<CachedHeaders>,
     ) {
         let hash = path_hash(path);
-        // 先把 key 分配好：`path.into()` 是这条路径上唯一一次堆分配，放在锁里会算进临界区
-        let key: Box<str> = path.into();
         let Ok(mut shard) = self.shard(hash).lock() else {
             return;
         };
@@ -224,29 +222,47 @@ impl FileCache {
         shard.clock += 1;
         let clock = shard.clock;
 
-        // 满了就淘汰最久没被用到的那条，而不是把整片清空
-        if shard.entries.len() >= CAPACITY_PER_SHARD
-            && !shard.entries.contains_key(path)
-            && let Some(oldest) = shard
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.used)
-                .map(|(key, _)| key.clone())
+        // 一次 `raw_entry_mut` 走完：已存在就就地更新（不分配新 key、不淘汰），
+        // 不存在才走淘汰+插入。复用 `hash` 避免再哈希一遍 key。
+        match shard
+            .entries
+            .raw_entry_mut()
+            .from_hash(hash, |k| &**k == path)
         {
-            shard.entries.remove(&oldest);
+            RawEntryMut::Occupied(entry) => {
+                let entry = entry.into_mut();
+                entry.file = file;
+                entry.metadata = metadata;
+                entry.headers = headers;
+                entry.joined = joined;
+                entry.used = clock;
+                entry.validated_at = now_millis();
+            }
+            RawEntryMut::Vacant(_) => {
+                // 满了就淘汰最久没被用到的那条，而不是把整片清空
+                if shard.entries.len() >= CAPACITY_PER_SHARD
+                    && let Some(oldest) = shard
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.used)
+                        .map(|(key, _)| key.clone())
+                {
+                    shard.entries.remove(&oldest);
+                }
+                let key: Box<str> = path.into();
+                shard.entries.insert(
+                    key,
+                    Entry {
+                        file,
+                        metadata,
+                        headers,
+                        joined,
+                        used: clock,
+                        validated_at: now_millis(),
+                    },
+                );
+            }
         }
-
-        shard.entries.insert(
-            key,
-            Entry {
-                file,
-                metadata,
-                headers,
-                joined,
-                used: clock,
-                validated_at: now_millis(),
-            },
-        );
     }
 
     /// 路径已经不存在了，顺手把占着的 fd 放掉。
