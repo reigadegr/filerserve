@@ -212,14 +212,17 @@ impl FileMeta {
     #[must_use]
     pub fn modified(&self) -> std::io::Result<SystemTime> {
         if self.mtime >= 0 {
-            Ok(UNIX_EPOCH + Duration::new(self.mtime as u64, self.mtime_nsec as u32))
-        } else {
-            Ok(UNIX_EPOCH
-                - Duration::new(
-                    self.mtime.unsigned_abs() - 1,
-                    (1_000_000_000 - self.mtime_nsec) as u32,
-                ))
+            return Ok(UNIX_EPOCH + Duration::new(self.mtime as u64, self.mtime_nsec as u32));
         }
+        // 负时间的 timespec 约定是 tv_sec 向下取整、tv_nsec ∈ [0, 1e9)，
+        // 所以 (tv_sec, tv_nsec) = (-1, 0) 表示"epoch 之前整 1 秒"。
+        // 用 unsigned_abs()-1 秒 + (1e9 - nsec) 纳秒凑出时长；nsec==0 时
+        // 纳秒部分为 1e9，Duration::new 会自动进位为一整秒，结果一致。
+        Ok(UNIX_EPOCH
+            - Duration::new(
+                self.mtime.unsigned_abs() - 1,
+                (1_000_000_000 - self.mtime_nsec) as u32,
+            ))
     }
 }
 
