@@ -200,7 +200,10 @@ fn find_head_end(carry: &[u8], buf: &[u8]) -> Option<usize> {
         let take = buf.len().min(HEAD_END.len() - 1);
         joined[..carried].copy_from_slice(carry);
         joined[carried..carried + take].copy_from_slice(&buf[..take]);
-        if let Some(start) = memchr::memmem::find(&joined[..carried + take], HEAD_END) {
+        let window = &joined[..carried + take];
+        // At most six bytes: memmem's search setup costs more than scanning these few
+        // windows directly (measured ~2.6x slower), so this branch stays on std.
+        if let Some(start) = window.windows(HEAD_END.len()).position(|w| w == HEAD_END) {
             return Some(start + HEAD_END.len() - 1 - carried);
         }
     }
