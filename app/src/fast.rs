@@ -96,20 +96,19 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
             }
 
             // 与 salvo 的 `Service` 完全一致地补错误页：状态码是 4xx/5xx 且没写出响应体时
-            // 跑一遍 catcher。判定整个放进 `!is_head` 里：HEAD 不补体（RFC 9110 §9.3.2），
-            // 就不该为它白算这两项
-            if !is_head {
-                let status_is_error = res
+            // 跑一遍 catcher。`!is_head` 放最前面短路：HEAD 不补体（RFC 9110 §9.3.2），
+            // 就不该为它白算后面两项
+            if !is_head
+                && res
                     .status_code
-                    .is_some_and(|code| code.is_client_error() || code.is_server_error());
-                let body_is_missing = res.body.is_none() || res.body.is_error();
-                if status_is_error && body_is_missing {
-                    // `Depot` 只有补错误页时才用得到，正常 200 路径不必每请求建一次
-                    let mut depot = Depot::new();
-                    Catcher::default()
-                        .catch(&mut request, &mut depot, &mut res, ConnCtrl::new())
-                        .await;
-                }
+                    .is_some_and(|code| code.is_client_error() || code.is_server_error())
+                && (res.body.is_none() || res.body.is_error())
+            {
+                // `Depot` 只有补错误页时才用得到，正常 200 路径不必每请求建一次
+                let mut depot = Depot::new();
+                Catcher::default()
+                    .catch(&mut request, &mut depot, &mut res, ConnCtrl::new())
+                    .await;
             }
 
             // 必须放在 catcher 之后：salvo 的 hoop 也是在整条链跑完后才记日志，错误页的
