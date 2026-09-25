@@ -366,7 +366,7 @@ async fn download(addr: std::net::SocketAddr, name: &str, extra: &str) -> (Strin
 }
 
 /// 起一个真正的 sendfile 服务：直接复用生产里的 `serve`，它自己跑 accept 循环、
-/// 给每条连接装上 `SendfileStream`（未注册版）并把槽位交给 handler。
+/// 给每条连接装上 `SendfileStream` 并把槽位交给 handler。
 async fn serve_with_sendfile(root: PathBuf) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let access_log = Arc::new(AccessLog::Tracing);
     let router = build_router(root.clone(), 8000, Arc::clone(&access_log));

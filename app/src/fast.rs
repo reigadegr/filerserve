@@ -125,7 +125,7 @@ const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10)
 /// 跑 accept 循环，把每条连接交给 [`FastService`]。
 ///
 /// 取代原来的 `Server::new(acceptor).serve(router)`。连接本身仍按 sendfile 的要求包装
-/// （`TCP_NODELAY`、槽位 key），否则零拷贝体没有槽位可用。accept 与单条连接的准备出错都只
+/// （`TCP_NODELAY`、槽位），否则零拷贝体没有槽位可用。accept 与单条连接的准备出错都只
 /// 影响那一条连接（照 `Server` 的做法退避重试），不会像 `?` 那样把整个进程带走。
 pub async fn serve(
     listener: TcpListener,
@@ -164,7 +164,7 @@ pub async fn serve(
             tracing::debug!(error = ?error, "设置 TCP_NODELAY 失败");
         }
         let slot = Arc::new(SendfileSlot::new());
-        let stream = SendfileStream::new_unregistered(conn, Arc::clone(&slot));
+        let stream = SendfileStream::new(conn, Arc::clone(&slot));
         // 一条连接只建一份 `ConnCtrl`，与 salvo 的 `TcpAcceptor` 一样：`HyperHandler` 会把它
         // 插进每个请求的 extensions，handler 拿到的必须就是驱动这条连接的那一份，
         // `abort()`/`graceful_shutdown()`/`relax_timeouts()` 才会真的作用到这条连接上

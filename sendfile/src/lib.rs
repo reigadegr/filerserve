@@ -4,16 +4,15 @@
 //! handler cannot call `sendfile(2)` on its own. This crate bridges that gap:
 //!
 //! 1. [`SendfileStream`] wraps an accepted connection's transport.
-//! 2. [`upgrade_response_with_slot`] replaces the body of a file response with a
+//! 2. [`upgrade_response`] replaces the body of a file response with a
 //!    [`SendfileBody`], which reports the file's exact length but yields
 //!    placeholder bytes instead of content.
 //! 3. The stream recognises those placeholders and issues `sendfile(2)` for the
 //!    same length, so the file never enters userspace.
 //!
 //! The caller owns the service wrapper, so it hands the [`SendfileSlot`] straight
-//! to the handler: [`SendfileStream::new_unregistered`] plus
-//! [`upgrade_response_with_slot`] is what this project's fast path does, and it
-//! never consults a registry.
+//! to the handler: [`SendfileStream::new`] plus [`upgrade_response`] is what
+//! this project's fast path does.
 //!
 //! Framing is untouched: the placeholder byte count equals the `Content-Length`
 //! Hyper was given, so keep-alive, range responses and Hyper's own accounting
@@ -53,11 +52,7 @@ pub use stream::{SendfileStream, SendfileTarget};
 /// not paid before this is reached.
 ///
 /// The returned value reports whether the body was replaced.
-pub fn upgrade_response_with_slot(
-    slot: &SendfileSlot,
-    res: &mut Response,
-    file: Arc<File>,
-) -> bool {
+pub fn upgrade_response(slot: &SendfileSlot, res: &mut Response, file: Arc<File>) -> bool {
     let status = res.status_code;
     if status != Some(StatusCode::OK) && status != Some(StatusCode::PARTIAL_CONTENT) {
         return false;

@@ -132,12 +132,9 @@ pub struct SendfileStream<S> {
 }
 
 impl<S> SendfileStream<S> {
-    /// 构造不注册到全局 registry 的流。
-    ///
-    /// 调用方在建连接时直接握着 `SendfileSlot`，从不走按 `(local, remote)` 的全局查找，
-    /// 所以注册条目永远不会被查到，register/unregister 的两次 Mutex 锁是纯浪费。
+    /// Wraps `inner` and shares `slot` with the handler that will arm it.
     #[must_use]
-    pub const fn new_unregistered(inner: S, slot: Arc<SendfileSlot>) -> Self {
+    pub const fn new(inner: S, slot: Arc<SendfileSlot>) -> Self {
         Self {
             inner,
             slot,
@@ -599,7 +596,7 @@ mod transport_tests {
             .unwrap();
 
         let record = Record::default();
-        let stream = SendfileStream::new_unregistered(FakeTarget(record.clone()), slot);
+        let stream = SendfileStream::new(FakeTarget(record.clone()), slot);
         (record, stream, payload)
     }
 
