@@ -656,6 +656,7 @@ mod tests {
     /// `cargo +nightly test -Z build-std`。
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
+    #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_has_seccomp_filter() {
         use std::hint::black_box;
         use std::time::Instant;

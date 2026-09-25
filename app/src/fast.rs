@@ -305,18 +305,16 @@ mod tests {
         ));
     }
 
-    /// 基准：前缀匹配各写法的耗时，分「常量 needle」与「运行时 needle」两种情形。
+    /// 基准：前缀匹配各写法的耗时。
     ///
-    /// - 常量 needle（`route_mode` 的 `starts_with("/files/")`）：rustc 把常量前缀折成一次
-    ///   直接比较，优化构建下两种写法都在 1 ns 上下，未优化时 `starts_with` 明显更快，
-    ///   所以 `route_mode` 用 `starts_with`。
-    /// - 运行时 needle：项目里已经没有这个用法了——`sub_path` 的前缀由 `route_mode` 判过，
-    ///   它不再自己判——这一项留作对照，记下「运行时前缀确实该用 `is_prefix`」这个事实。
+    /// 常量 needle（`route_mode` 的 `starts_with("/files/")`）：rustc 把常量前缀折成一次
+    /// 直接比较，优化构建下两种写法都在 1 ns 上下，未优化时 `starts_with` 明显更快，
+    /// 所以 `route_mode` 用 `starts_with`。
     ///
     /// `sh debug.sh` 跑在 `opt-level = 0`：std 与 libc 都是预编译的优化产物而 `memchr` 不是，
-    /// 打印出来的数会偏向现实现。要看到那个 1.4× 得跑 `cargo test --release`；对应断言用
-    /// `debug_assertions` 关掉了，只在优化构建下生效。
+    /// 打印出来的数会偏向现实现。要看到那个 1.4× 得跑 `cargo test --release`。
     #[test]
+    #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_prefix_match() {
         use std::hint::black_box;
         use std::time::Instant;
@@ -353,31 +351,6 @@ mod tests {
             assert!(
                 mm > sw,
                 "memmem 不该比 starts_with 快: {mm:.1} vs {sw:.1} ns"
-            );
-
-            // 运行时 needle：项目里已无此用法，留作对照，`black_box` 挡住常量折叠
-            let prefix: &str = black_box("/files/");
-            let strip = time(500_000, || path.strip_prefix(prefix).map(str::len));
-            let isp = time(500_000, || {
-                memchr::arch::all::is_prefix(path.as_bytes(), prefix.as_bytes())
-                    .then(|| path[prefix.len()..].len())
-            });
-            println!(
-                "基准 前缀分流 运行时（{}B）: strip_prefix {strip:.1} ns | is_prefix {isp:.1} ns",
-                path.len()
-            );
-            assert_eq!(
-                path.strip_prefix(prefix).map(str::len),
-                memchr::arch::all::is_prefix(path.as_bytes(), prefix.as_bytes())
-                    .then(|| path[prefix.len()..].len()),
-                "{path} 两种写法取值不一致"
-            );
-            // 只有优化构建下 `is_prefix` 才快于 libc `memcmp`，未优化时正好反过来，
-            // 所以这条断言只在 `debug_assertions` 关掉（release）时生效
-            #[cfg(not(debug_assertions))]
-            assert!(
-                isp < strip,
-                "优化构建下 is_prefix 应当快于 strip_prefix: {isp:.1} vs {strip:.1} ns"
             );
         }
     }

@@ -324,6 +324,7 @@ mod tests {
     /// `sh debug.sh` 跑在 `opt-level = 0`，此时 std 是预编译的优化产物而 `memchr` 不是；
     /// 公平对比要 `cargo +nightly test -Z build-std`。
     #[test]
+    #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_status_code() {
         use std::hint::black_box;
         use std::time::Instant;
@@ -359,6 +360,7 @@ mod tests {
 
     /// 基准：`memrchr` 找末段 vs `trim_matches` + `rsplit`
     #[test]
+    #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_basename() {
         use std::hint::black_box;
         use std::time::Instant;

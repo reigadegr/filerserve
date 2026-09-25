@@ -154,18 +154,13 @@ fn push_ip(out: &mut StackWriter<'_>, ip: Option<IpAddr>) -> bool {
 
 /// `Version` 的 `{:?}` 输出，与 `http` crate 的实现逐字节一致。未知版本退回慢路径。
 fn push_version(out: &mut StackWriter<'_>, version: Version) -> bool {
-    let text = if version == Version::HTTP_09 {
-        "HTTP/0.9"
-    } else if version == Version::HTTP_10 {
-        "HTTP/1.0"
-    } else if version == Version::HTTP_11 {
-        "HTTP/1.1"
-    } else if version == Version::HTTP_2 {
-        "HTTP/2.0"
-    } else if version == Version::HTTP_3 {
-        "HTTP/3.0"
-    } else {
-        return false;
+    let text = match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2.0",
+        Version::HTTP_3 => "HTTP/3.0",
+        _ => return false, // 未知版本退回慢路径
     };
     out.push_str(text)
 }

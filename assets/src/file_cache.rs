@@ -31,7 +31,7 @@ use std::{
     fs::{File, Metadata},
     hash::{Hash, Hasher},
     os::unix::fs::MetadataExt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use hashbrown::HashMap;
@@ -64,6 +64,12 @@ const REVALIDATE_MILLIS: i64 = 1000;
 fn now_millis() -> i64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicCoarse);
     now.tv_sec * 1000 + now.tv_nsec / 1_000_000
+}
+
+/// 取锁，中毒也照常返回：临界区里只有 `Vec`/`HashMap` 增删查与 `Arc` 克隆，
+/// 中毒后内部数据仍结构完整，继续用是安全的——与 `main.rs` 的 `lock` 语义对齐。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct Entry {
@@ -152,7 +158,7 @@ impl FileCache {
         F: FnOnce(&mut Entry) -> bool,
     {
         let hash = path_hash(path);
-        let mut shard = self.shard(hash).lock().ok()?;
+        let mut shard = lock(self.shard(hash));
         shard.clock += 1;
         let clock = shard.clock;
 
@@ -215,9 +221,7 @@ impl FileCache {
         headers: Arc<CachedHeaders>,
     ) {
         let hash = path_hash(path);
-        let Ok(mut shard) = self.shard(hash).lock() else {
-            return;
-        };
+        let mut shard = lock(self.shard(hash));
 
         shard.clock += 1;
         let clock = shard.clock;
@@ -268,9 +272,8 @@ impl FileCache {
     /// 路径已经不存在了，顺手把占着的 fd 放掉。
     pub fn remove(&self, path: &str) {
         let hash = path_hash(path);
-        if let Ok(mut shard) = self.shard(hash).lock() {
-            shard.entries.remove(path);
-        }
+        let mut shard = lock(self.shard(hash));
+        shard.entries.remove(path);
     }
 
     /// 总条目数，只有测试用得到
@@ -278,8 +281,7 @@ impl FileCache {
     fn total_len(&self) -> usize {
         self.shards
             .iter()
-            .filter_map(|shard| shard.lock().ok())
-            .map(|shard| shard.entries.len())
+            .map(|shard| lock(shard).entries.len())
             .sum()
     }
 }
