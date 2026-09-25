@@ -305,7 +305,11 @@ impl ServeFiles {
         // 编码好的 `Last-Modified` 直接塞进响应头——`send_inner` 见到已经存在就不会再格式化。
         // 这里**不能**预置 `Content-Type`：`send_inner` 见到它就会走 `res.content_type()`，
         // 把头部重新解析成一个 `Mime`，比它省掉的那次 `from_str` 贵得多
-        if let Some(cached) = &cached {
+        //
+        // 先降成 `Option<&CachedHeaders>`：ETag 与 Content-Disposition 下面还要用，都从这一个
+        // 绑定上取，不必各自再借一次
+        let cached = cached.as_deref();
+        if let Some(cached) = cached {
             builder = builder.content_type(cached.content_type.clone());
             if let Some(last_modified) = &cached.last_modified {
                 res.headers_mut()
@@ -324,17 +328,14 @@ impl ServeFiles {
         // 类型）决定，命中既然要求元数据逐项一致，缓存里那份就是这次该发的那份。
         // 未命中则在这里按同一份元数据算一次 ETag 交给它，既省掉它在 send 里再算一遍，
         // 也留一份给下面写缓存，不必再从响应头里解析回来
-        let etag = match &cached {
+        let etag = match cached {
             Some(cached) => cached.etag.clone(),
             None => named_file.etag(),
         };
         if let Some(etag) = &etag {
             named_file.set_etag(etag.clone());
         }
-        if let Some(disposition) = cached
-            .as_ref()
-            .and_then(|cached| cached.disposition.clone())
-        {
+        if let Some(disposition) = cached.and_then(|cached| cached.disposition.clone()) {
             named_file.set_content_disposition(disposition);
         }
         // send 会消费掉 named_file，未命中时要写进缓存的那份类型得先取出来

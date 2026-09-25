@@ -1101,7 +1101,11 @@ impl NamedFile {
         // the disposition from the type the client will actually receive, not
         // necessarily the type detected for the file on disk. Treat an invalid
         // pre-existing value conservatively as opaque binary data.
-        let content_disposition = if self.flags.contains(Flag::ContentDisposition) {
+        // `take()` 得赶在下面 `effective_content_type` 之前：那个绑定会不可变借用
+        // `self.content_type`，之后再想可变借用 `self` 就借不到了。标志同时存成一个 bool，
+        // 下面插头时就不必隔着十几行再读一次 `self.flags`（读者也不用去确认它中间没被改）
+        let wants_disposition = self.flags.contains(Flag::ContentDisposition);
+        let content_disposition = if wants_disposition {
             self.content_disposition.take()
         } else {
             None
@@ -1116,7 +1120,7 @@ impl NamedFile {
             &self.content_type
         };
 
-        if self.flags.contains(Flag::ContentDisposition) {
+        if wants_disposition {
             if let Some(content_disposition) = content_disposition {
                 res.headers_mut()
                     .insert(CONTENT_DISPOSITION, content_disposition);

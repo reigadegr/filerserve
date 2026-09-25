@@ -452,7 +452,11 @@ fn send_one_file(
     // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
-    if f.metadata().map_or(usize::MAX, |m| m.len() as usize) < ZIP_CHUNK {
+    // 取元数据失败时按大文件走：读的时候会撞到同一个错误，`send_file_chunks` 立刻收尾发空条目。
+    // 用 `is_ok_and` 而不是 `map_or(usize::MAX, ...)`——后者读者得对照 `ZIP_CHUNK` 的类型才能
+    // 判断这条比较是否安全，而 `m.len()` 本来就是 `u64`，不必先截成 `usize`
+    let is_small = f.metadata().is_ok_and(|m| m.len() < ZIP_CHUNK as u64);
+    if is_small {
         let (buf, len) = read_first_chunk(&mut f, free_rx);
         if len < ZIP_CHUNK {
             return item_tx

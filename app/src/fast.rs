@@ -34,34 +34,32 @@ use crate::{AccessLog, log_access};
 type BoxedFuture =
     Pin<Box<dyn Future<Output = Result<HyperResponse<ResBody>, salvo::hyper::Error>> + Send>>;
 
-/// `/files/{**path}` 或 `/pull/{**path}` 的取值：去掉前缀与开头的斜杠，再按 salvo 的规则解码。
+/// 剥掉 [`route_mode`] 判过的前缀，去掉开头的斜杠，再按 salvo 的规则解码。
+///
+/// 调用方必须传 [`route_mode`] 返回的那条前缀。两者看的是同一个 `Uri`——salvo 的
+/// `Request::from_hyper` 把 `uri` 原样搬进 `Request`——所以前缀一定对得上，这里不再自己判一遍。
+/// 切点也由该前缀保证落在字符边界上。
 ///
 /// 末尾带斜杠的请求在 salvo 那边匹配不上（实测 `/files/f.bin/` 是 404），这里用空串表示，
-/// `ServeFiles` 同样会把它判成 404。返回 `None` 表示这条请求不归快路径管，交给 salvo。
-///
-/// 前缀比较用 `memchr::arch::all::is_prefix` 而不是 `strip_prefix`：这里的 `prefix` 是运行时
-/// 值，`strip_prefix` 会落到 libc `memcmp` 调用上，而 `is_prefix` 的内联分块比较在优化构建下
-/// 快约 1.4×（基准见 `bench_prefix_match`）。切点由匹配结果保证落在字符边界上。
-fn sub_path<'a>(path: &'a str, prefix: &str) -> Option<Cow<'a, str>> {
-    if !memchr::arch::all::is_prefix(path.as_bytes(), prefix.as_bytes()) {
-        return None;
-    }
+/// `ServeFiles` 同样会把它判成 404。
+fn sub_path<'a>(path: &'a str, prefix: &'static str) -> Cow<'a, str> {
+    debug_assert!(path.starts_with(prefix), "前缀必须来自 route_mode");
     let rest = path[prefix.len()..].trim_start_matches('/');
     if rest.ends_with('/') {
-        return Some(Cow::Borrowed(""));
+        return Cow::Borrowed("");
     }
-    Some(decode_url_path(rest))
+    decode_url_path(rest)
 }
 
-/// 这条路径该由快路径服务哪条端点：`Some(false)` 是 `/files`（走 fd 缓存），
-/// `Some(true)` 是 `/pull`（不缓存），`None` 表示不归快路径管、原样交给 salvo。
+/// 这条路径归快路径的哪条端点，返回该端点要剥掉的前缀；`None` 表示不归快路径管、交给 salvo。
 ///
-/// 只判前缀，真正的解码留给 [`sub_path`] 做一次。
-fn route_mode(path: &str) -> Option<bool> {
+/// 前缀直接返回给调用方，下面切子路径时就不必再判一次。两条前缀都是编译期常量，
+/// `starts_with` 会被折成一次直接比较（基准见 `bench_prefix_match`）。
+fn route_mode(path: &str) -> Option<&'static str> {
     if path.starts_with("/files/") {
-        Some(false)
+        Some("/files/")
     } else if path.starts_with("/pull/") {
-        Some(true)
+        Some("/pull/")
     } else {
         None
     }
@@ -87,9 +85,9 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
     type Future = BoxedFuture;
 
     fn call(&self, req: HyperRequest<Incoming>) -> Self::Future {
-        // 分流只看前缀，真正的解码留到下面做一次：`route_mode` 只做前缀判断，
-        // 「去前缀 + 去斜杠 + 解码」那一步留到 `sub_path` 里做
-        let Some(raw) = route_mode(req.uri().path()) else {
+        // 分流只判前缀，真正的取值留到下面 `sub_path` 做一次。前缀本身要带进去：
+        // 这里已经判过它，`sub_path` 就不必再判一遍
+        let Some(prefix) = route_mode(req.uri().path()) else {
             return (self.fallback)(req);
         };
         let files = Arc::clone(&self.files);
@@ -110,9 +108,8 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
             if is_head || method == Method::GET {
                 // 借自 `request`，不再单独分配：`decode_url_path` 在没有 `%` 时就是借用。
                 // 求值放进这个分支里——非 GET/HEAD 只会返回 404，根本用不到子路径
-                let prefix = if raw { "/pull/" } else { "/files/" };
-                let sub = sub_path(request.uri().path(), prefix).unwrap_or_default();
-                if raw {
+                let sub = sub_path(request.uri().path(), prefix);
+                if prefix == "/pull/" {
                     files.serve_raw(&sub, &request, &mut res, Some(&slot)).await;
                 } else {
                     files.serve(&sub, &request, &mut res, Some(&slot)).await;
@@ -235,10 +232,10 @@ mod tests {
     /// 快路径只认这两条前缀：`/pull` 必须由它自己服务，落到 salvo 就丢了零拷贝与不缓存的收益
     #[test]
     fn route_mode_claims_files_and_pull_only() {
-        assert_eq!(route_mode("/files/f.bin"), Some(false));
-        assert_eq!(route_mode("/files/sub/g.txt"), Some(false));
-        assert_eq!(route_mode("/pull/f.bin"), Some(true));
-        assert_eq!(route_mode("/pull/sub/g.txt"), Some(true));
+        assert_eq!(route_mode("/files/f.bin"), Some("/files/"));
+        assert_eq!(route_mode("/files/sub/g.txt"), Some("/files/"));
+        assert_eq!(route_mode("/pull/f.bin"), Some("/pull/"));
+        assert_eq!(route_mode("/pull/sub/g.txt"), Some("/pull/"));
         // 少一个斜杠或别的路径都不归快路径管
         assert_eq!(route_mode("/files"), None);
         assert_eq!(route_mode("/pull"), None);
@@ -248,57 +245,63 @@ mod tests {
     }
 
     /// 这些取值是拿旧二进制实测出来的：每个用例的注释是它当时的响应。
+    ///
+    /// 只喂 [`route_mode`] 认得的路径：前缀由它判过，`sub_path` 自己不再判。
     #[test]
     fn sub_path_matches_the_router() {
-        let cases: &[(&str, Option<&str>)] = &[
-            ("/files/f.bin", Some("f.bin")),
+        let cases: &[(&str, &str)] = &[
+            ("/files/f.bin", "f.bin"),
             // 开头的空段被跳过
-            ("/files//f.bin", Some("f.bin")),
-            ("/files/./f.bin", Some("./f.bin")),
-            ("/files/sub//g.txt", Some("sub//g.txt")),
-            ("/files/sub/../f.bin", Some("sub/../f.bin")),
+            ("/files//f.bin", "f.bin"),
+            ("/files/./f.bin", "./f.bin"),
+            ("/files/sub//g.txt", "sub//g.txt"),
+            ("/files/sub/../f.bin", "sub/../f.bin"),
             // 百分号解码，但不把 `+` 当空格
-            ("/files/a%20b.txt", Some("a b.txt")),
-            ("/files/a+b.txt", Some("a+b.txt")),
-            ("/files/%2e%2e/f.bin", Some("../f.bin")),
+            ("/files/a%20b.txt", "a b.txt"),
+            ("/files/a+b.txt", "a+b.txt"),
+            ("/files/%2e%2e/f.bin", "../f.bin"),
             // 末尾斜杠：salvo 那边匹配不上，这里用空串表达同一个 404
-            ("/files/", Some("")),
-            ("/files/f.bin/", Some("")),
-            ("/files//", Some("")),
-            // 不归快路径管
-            ("/files", None),
-            ("/", None),
-            ("/api/list", None),
-            ("/static/x.css", None),
+            ("/files/", ""),
+            ("/files/f.bin/", ""),
+            ("/files//", ""),
         ];
         for (path, expected) in cases {
             assert_eq!(
-                sub_path(path, "/files/").as_deref(),
+                &*sub_path(path, "/files/"),
                 *expected,
                 "路径 {path} 的子路径取值不对"
             );
         }
     }
 
+    /// `route_mode` 给出的前缀必须正好是 `sub_path` 要剥的那条——两者看的是同一个 `Uri`
+    #[test]
+    fn route_mode_prefix_is_what_sub_path_strips() {
+        let cases = [
+            ("/files/f.bin", "f.bin"),
+            ("/files/sub/g.txt", "sub/g.txt"),
+            ("/files/a%20b.txt", "a b.txt"),
+            ("/pull/f.bin", "f.bin"),
+        ];
+        for (path, expected) in cases {
+            let prefix = route_mode(path).unwrap();
+            assert_eq!(&*sub_path(path, prefix), expected, "路径 {path} 的切点不对");
+        }
+    }
+
     /// `/pull` 与 `/files` 共用同一套取值规则，只是前缀不同
     #[test]
     fn pull_sub_path_uses_the_same_rules() {
-        assert_eq!(
-            sub_path("/pull/sub/a%20b.txt", "/pull/").as_deref(),
-            Some("sub/a b.txt")
-        );
-        assert_eq!(sub_path("/pull/", "/pull/").as_deref(), Some(""));
-        assert_eq!(sub_path("/pull/f.bin/", "/pull/").as_deref(), Some(""));
-        // 前缀不对就不归这条路管
-        assert_eq!(sub_path("/pull", "/pull/"), None);
-        assert_eq!(sub_path("/files/f.bin", "/pull/"), None);
+        assert_eq!(&*sub_path("/pull/sub/a%20b.txt", "/pull/"), "sub/a b.txt");
+        assert_eq!(&*sub_path("/pull/", "/pull/"), "");
+        assert_eq!(&*sub_path("/pull/f.bin/", "/pull/"), "");
     }
 
     #[test]
     fn sub_path_borrows_when_nothing_is_encoded() {
         assert!(matches!(
             sub_path("/files/f.bin", "/files/"),
-            Some(Cow::Borrowed(_))
+            Cow::Borrowed(_)
         ));
     }
 
@@ -306,12 +309,12 @@ mod tests {
     ///
     /// - 常量 needle（`route_mode` 的 `starts_with("/files/")`）：rustc 把常量前缀折成一次
     ///   直接比较，优化构建下两种写法都在 1 ns 上下，未优化时 `starts_with` 明显更快，
-    ///   所以这里保留 `starts_with`。
-    /// - 运行时 needle（`sub_path` 的 `prefix` 参数）：`strip_prefix` 会落到 libc `memcmp`
-    ///   调用上，而 `is_prefix` 的内联分块比较在优化构建下快约 1.4×，所以 `sub_path` 用它。
+    ///   所以 `route_mode` 用 `starts_with`。
+    /// - 运行时 needle：项目里已经没有这个用法了——`sub_path` 的前缀由 `route_mode` 判过，
+    ///   它不再自己判——这一项留作对照，记下「运行时前缀确实该用 `is_prefix`」这个事实。
     ///
     /// `sh debug.sh` 跑在 `opt-level = 0`：std 与 libc 都是预编译的优化产物而 `memchr` 不是，
-    /// 打印出来的数会偏向现实现。要看到那个 1.5× 得跑 `cargo test --release`；对应断言用
+    /// 打印出来的数会偏向现实现。要看到那个 1.4× 得跑 `cargo test --release`；对应断言用
     /// `debug_assertions` 关掉了，只在优化构建下生效。
     #[test]
     fn bench_prefix_match() {
@@ -352,7 +355,7 @@ mod tests {
                 "memmem 不该比 starts_with 快: {mm:.1} vs {sw:.1} ns"
             );
 
-            // 运行时 needle：`sub_path` 的情形，`black_box` 挡住常量折叠
+            // 运行时 needle：项目里已无此用法，留作对照，`black_box` 挡住常量折叠
             let prefix: &str = black_box("/files/");
             let strip = time(500_000, || path.strip_prefix(prefix).map(str::len));
             let isp = time(500_000, || {
