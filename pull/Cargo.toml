@@ -8,4 +8,4 @@ workspace = true
 
 [dependencies]
 serde_json = "1"
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net"] }

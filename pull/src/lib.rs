@@ -21,8 +21,10 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// 子命令入口：`lanfile get <base_url> <remote_dir> [local_dir]`。
 ///
-/// 把 `<base_url>` 下掌管的 `<remote_dir>` 整棵树拉到 `<local_dir>`
-/// （缺省取远端目录名；拉根时缺省 `lanfile-root`，避免直接铺进当前目录）。
+/// 把 `<base_url>` 下掌管的 `<remote_dir>` 整棵树拉到 `<local_dir>` 之下——先在
+/// `<local_dir>` 里以远端目录名建一层子目录，再把该目录的内容塞进去，对齐
+/// `scp -r host:dir <local_dir>` 落成 `<local_dir>/dir/` 的语义；拉 root（无目录名可套）
+/// 时直接进 `<local_dir>`。不给 `<local_dir>` 则缺省当前目录（拉根缺省 `lanfile-root`）。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let (base, remote, local) = parse_pull_args(args)?;
     let host = base
@@ -30,8 +32,9 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
         .ok_or("base_url 必须以 http:// 开头（不支持 https）")?
         .trim_end_matches('/')
         .to_string();
-    tokio::fs::create_dir_all(&local).await?;
-    let stats = pull_dir(&host, &remote, &local).await?;
+    let target = local_target(&local, &remote);
+    tokio::fs::create_dir_all(&target).await?;
+    let stats = pull_dir(&host, &remote, &target).await?;
     let remote_disp = if remote.is_empty() {
         "/".to_string()
     } else {
@@ -39,7 +42,7 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     };
     eprintln!(
         "lanfile get: {base}{remote_disp} -> {}（{} 文件，{} 字节，{} 目录）",
-        local.display(),
+        target.display(),
         stats.files,
         stats.bytes,
         stats.dirs
@@ -65,17 +68,35 @@ fn parse_pull_args(args: &[String]) -> Result<(String, String, PathBuf), BoxErro
         .unwrap_or_default();
     let local = match args.get(2) {
         Some(s) => PathBuf::from(s),
+        // 不给 local：命名远端缺省当前目录（run 里再套 basename 一层，落成 ./<basename>）；
+        // 拉根缺省 lanfile-root，避免把整棵 share 散落进当前目录。
         None => PathBuf::from(if remote.is_empty() {
-            "lanfile-root".to_string()
+            "lanfile-root"
         } else {
-            Path::new(&remote)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("lanfile-root")
-                .to_string()
+            "."
         }),
     };
     Ok((base, remote, local))
+}
+
+/// 实际落盘根目录：命名远端目录时在 `local` 下套一层以远端目录名命名的子目录
+/// （对齐 `scp -r host:dir local` 落成 `local/dir/` 的语义）；拉 root 时没有名字可套，
+/// 直接用 `local`。
+fn local_target(local: &Path, remote: &str) -> PathBuf {
+    match basename(remote) {
+        Some(name) => local.join(name),
+        None => local.to_path_buf(),
+    }
+}
+
+/// 远端路径的末段目录名；root（去首尾斜杠后为空）返回 `None`。
+fn basename(remote: &str) -> Option<&str> {
+    let trimmed = remote.trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.rsplit('/').next()
+    }
 }
 
 /// 递归拉取 `remote` 目录到 `local`。单文件失败只记一条警告并继续；目录枚举失败才上抛。
@@ -214,11 +235,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_pull_args_defaults_local_to_remote_basename() {
+    fn parse_pull_args_defaults_local_to_cwd() {
         let (base, remote, local) = parse_pull_args(&["http://h:1".into(), "sub".into()]).unwrap();
         assert_eq!(base, "http://h:1");
         assert_eq!(remote, "sub");
-        assert_eq!(local, PathBuf::from("sub"));
+        // 不给 local：缺省当前目录；run 会再套 basename 一层，最终落成 ./sub/
+        assert_eq!(local, PathBuf::from("."));
+    }
+
+    #[test]
+    fn local_target_wraps_named_remote_in_basename_layer() {
+        assert_eq!(
+            local_target(Path::new("./dst"), "sub"),
+            PathBuf::from("./dst/sub")
+        );
+        assert_eq!(
+            local_target(Path::new("./dst"), "a/b"),
+            PathBuf::from("./dst/b")
+        );
+        assert_eq!(
+            local_target(Path::new("./dst"), "/sub/"),
+            PathBuf::from("./dst/sub")
+        );
+    }
+
+    #[test]
+    fn local_target_root_has_no_wrap() {
+        assert_eq!(local_target(Path::new("./dst"), ""), PathBuf::from("./dst"));
+        assert_eq!(
+            local_target(Path::new("./dst"), "/"),
+            PathBuf::from("./dst")
+        );
     }
 
     #[test]

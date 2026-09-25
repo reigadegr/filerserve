@@ -716,9 +716,9 @@ async fn api_zip_skips_unreadable_directory() {
 
 // ---- lanfile get 递归拉取 ----
 
-/// `lanfile get` 把远端一棵小树原样镜像到本地：起一个真实监听的 lanfile，
-/// 用 `lanfile_pull::run` 拉 `sub` 子树，逐文件比对本地与原内容一致；
-/// 再拉第二次验证"本地已存在且尺寸一致就跳过"不会破坏已有文件。
+/// `lanfile get` 把远端一棵小树镜像到本地：起一个真实监听的 lanfile，
+/// 用 `lanfile_pull::run` 拉 `sub` 子树，验证内容落进 `local/sub/`（套一层远端目录名）、
+/// 逐文件与原内容一致；再拉第二次验证"本地已存在且尺寸一致就跳过"不破坏已有文件。
 #[tokio::test]
 async fn get_subcommand_mirrors_a_tree() {
     let dir = TestDir::new();
@@ -749,9 +749,11 @@ async fn get_subcommand_mirrors_a_tree() {
         .await
         .unwrap();
 
-    assert_eq!(std::fs::read(local.root().join("b.txt")).unwrap(), b"bbbb");
+    // run 会在 local 下以远端目录名套一层：内容落进 local/sub/，而非直接散进 local
+    let mirror = local.root().join("sub");
+    assert_eq!(std::fs::read(mirror.join("b.txt")).unwrap(), b"bbbb");
     assert_eq!(
-        std::fs::read(local.root().join("deeper").join("c.bin")).unwrap(),
+        std::fs::read(mirror.join("deeper").join("c.bin")).unwrap(),
         vec![1_u8, 2, 3, 4, 5]
     );
     // 根下的 a.txt 不该被拉进 sub 的镜像
@@ -762,7 +764,7 @@ async fn get_subcommand_mirrors_a_tree() {
         .await
         .unwrap();
     assert_eq!(
-        std::fs::read(local.root().join("deeper").join("c.bin")).unwrap(),
+        std::fs::read(mirror.join("deeper").join("c.bin")).unwrap(),
         vec![1_u8, 2, 3, 4, 5]
     );
 
