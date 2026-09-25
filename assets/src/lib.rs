@@ -128,18 +128,43 @@ impl ServeFiles {
         if let Some((joined, file, metadata, headers)) = self.cache.get(sub, &metadata) {
             return Some((joined, file, metadata, Some(headers)));
         }
-        let file = self.open_uncached(sub, &joined)?;
+        let (file, metadata) = self.open_confirmed(sub, &joined)?;
+        Some((Arc::from(joined), file, metadata, None))
+    }
+
+    /// `/pull` 的打开：与 [`Self::open`] 同构，但不查缓存、不写缓存。
+    ///
+    /// `lanfile get` 每个文件只请求一次，缓存不会有命中，却要为它加一次分片锁、分配一个 key，
+    /// 分片满时还得扫一遍 LRU；下载出来的 fd 还会把 `/files` 缓存里的热文件挤出去。这条路上
+    /// 整段跳过 [`FileCache`]，只保留防穿越的路径解析与一次 `fstat`。
+    fn open_no_cache(&self, sub: &str) -> Option<(Arc<Path>, Arc<File>, FileMeta)> {
+        let joined = self.root.join(sub);
+        let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
+            return None;
+        };
+        if !metadata.is_file() {
+            return None;
+        }
+        let (file, metadata) = self.open_confirmed(sub, &joined)?;
+        Some((Arc::from(joined), file, metadata))
+    }
+
+    /// 已确认路径是普通文件之后：打开、取 fd 自己的元数据、下顺序读提示。
+    ///
+    /// `/files` 未命中缓存时与 `/pull` 全程都走这里，两条路的这一段完全一致。
+    fn open_confirmed(&self, sub: &str, joined: &Path) -> Option<(Arc<File>, FileMeta)> {
+        let file = self.open_uncached(sub, joined)?;
         // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
         // 缓存里必须记 fd 的属性而不是路径的 lstat，否则文件被换掉时会串味。
         let metadata = fd_meta(&file).ok()?;
         // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回。
-        // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以只在未命中时调一次。
+        // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以缓存路径上只在未命中时调一次。
         // 一页以内的文件整个读完也只有一页，预读窗口开多大结果都一样，这次系统调用可以省掉。
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if metadata.len() > 4096 {
             let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
         }
-        Some((Arc::from(joined), Arc::new(file), metadata, None))
+        Some((Arc::new(file), metadata))
     }
 
     /// 缓存未命中时真正去解析并打开文件（类型检查已由 [`Self::open`] 完成）。
@@ -335,6 +360,52 @@ impl ServeFiles {
             upgrade_response(slot, res, file);
         }
     }
+
+    /// `/pull` 的实际实现：与 [`Self::serve`] 同构，但不碰 fd 缓存，且只写最少的响应头。
+    ///
+    /// 面向 `lanfile get` 的一次性批量拉取：响应头它一个都不看，所以 `ETag`、`Last-Modified`
+    /// 与 `Content-Disposition` 都不编码，类型固定成 `application/octet-stream`——调用方给了
+    /// 类型，`NamedFile` 建响应体时就不必再 `pread` 一段样本去嗅探。正文照旧交给 sendfile 零拷贝发送。
+    pub async fn serve_raw(
+        &self,
+        sub: &str,
+        req: &Request,
+        res: &mut Response,
+        slot: Option<&SendfileSlot>,
+    ) {
+        let Some((path, file, metadata)) = self.open_no_cache(sub) else {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        };
+
+        let mut builder = NamedFile::builder_shared(Arc::clone(&path))
+            .preload_threshold(0)
+            .content_type(Arc::new(mime::APPLICATION_OCTET_STREAM))
+            .use_etag(false)
+            .use_last_modified(false);
+        // 拉取客户端不保存也不展示，用不到 disposition 的转义与拼接
+        builder.disable_content_disposition();
+        let Ok(named_file) = builder
+            .build_from_file_with_metadata(Arc::clone(&file), metadata)
+            .await
+        else {
+            res.render(StatusError::internal_server_error().brief("read file failed"));
+            return;
+        };
+        let head_only = req.method() == Method::HEAD;
+        // 与 `/files` 一致：有 sendfile 槽位时只写响应头，响应体交给 upgrade_response 换成零拷贝体
+        if head_only || (slot.is_some() && cfg!(any(target_os = "linux", target_os = "android"))) {
+            named_file.send_head(req.headers(), res).await;
+        } else {
+            named_file.send(req.headers(), res).await;
+        }
+        if head_only {
+            return;
+        }
+        if let Some(slot) = slot {
+            upgrade_response(slot, res, file);
+        }
+    }
 }
 
 #[handler]
@@ -357,10 +428,35 @@ impl ServeFiles {
     }
 }
 
+/// `/pull` 的 salvo handler：与 `/files` 同构，但走不缓存的 [`ServeFiles::serve_raw`]。
+///
+/// 自带一个 `ServeFiles`：`/pull` 用不到缓存，多出来的那个空缓存与 root fd 只属于这一份，
+/// 不影响 `/files` 那份。
+struct ServeRawFiles {
+    files: ServeFiles,
+}
+
+#[handler]
+impl ServeRawFiles {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        // 与 `/files` 完全相同的分流：非 GET/HEAD 一律 404
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        }
+        let sub = req.params().get("path").map_or("", String::as_str);
+        self.files.serve_raw(sub, req, res, None).await;
+    }
+}
+
 #[must_use]
 pub fn static_routes(root: PathBuf) -> Router {
     Router::new()
-        .push(Router::with_path("/files/{**path}").goal(ServeFiles::new(root)))
+        .push(Router::with_path("/files/{**path}").goal(ServeFiles::new(root.clone())))
+        .push(Router::with_path("/pull/{**path}").goal(ServeRawFiles {
+            files: ServeFiles::new(root),
+        }))
         .push(
             Router::new()
                 .filter(filters::get())

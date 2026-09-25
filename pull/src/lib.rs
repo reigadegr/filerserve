@@ -1,9 +1,10 @@
 //! `lanfile get` 的递归拉取客户端：把远端 lanfile 掌管的一棵目录树原样镜像到本地，
 //! 不打压缩包、不占服务端额外空间。
 //!
-//! 只走服务端已有的两个 GET 端点，服务端一行不改：
+//! 只走服务端两个 GET 端点：
 //! - `/api/list/<dir>` 拿到一层目录的条目（name/type/size）；
-//! - `/files/<sub>/<name>` 逐个文件落盘。
+//! - `/pull/<sub>/<name>` 逐个文件落盘。`/pull` 是拉取专用的端点：不碰 `/files` 那套 fd 缓存，
+//!   也不编码拉取端用不到的 `ETag`、`Last-Modified` 与 `Content-Disposition`（见 `lanfile_assets`）。
 //!
 //! v1 顺序拉取：一个文件一个文件、每请求一条 TCP 连接（`Connection: close`，
 //! 读到 EOF 即整段正文，连 `Content-Length` 都不用解析）。结构上每个文件的抓取收口在
@@ -138,7 +139,7 @@ async fn pull_dir(host: &str, remote: &str, local: &Path) -> Result<Stats, BoxEr
 
 /// 拉一个文件到 `local`：每请求一条连接，`Connection: close`，正文读到 EOF 落盘。
 async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, BoxError> {
-    let path = format!("/files/{}", encode_path(remote));
+    let path = format!("/pull/{}", encode_path(remote));
     let mut reader = http_get(host, &path).await?;
     let mut file = tokio::fs::File::create(local).await?;
     let copied = tokio::io::copy(&mut reader, &mut file).await?;

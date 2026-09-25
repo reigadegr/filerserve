@@ -1,15 +1,15 @@
-//! `/files` 的 hyper 快路径。
+//! `/files` 与 `/pull` 的 hyper 快路径。
 //!
 //! salvo 的 `HyperHandler` 每请求要做一整套：按 `Host` 重建 `Uri`、往 `Extensions` 里插
 //! `ConnCtrl`、把路径 `to_owned`、构造 `PathState`、跑一遍路由匹配、重建 handler 链
 //! （链上每个 handler 都是 `#[async_trait]`，各要装箱一个 future），最后再把整个 future
-//! 装箱。按调用点归因，这一圈是每请求 15 次堆分配加三次异步跳转，而 `/files` 用不到路由
-//! 与任何中间件。
+//! 装箱。按调用点归因，这一圈是每请求 15 次堆分配加三次异步跳转，而 `/files` 与 `/pull`
+//! 都用不到路由与任何中间件。
 //!
 //! 所以这里自己跑 accept 循环：`/files/*` 直接构造 salvo 的 `Request`/`Response` 调用
-//! [`ServeFiles::serve`]（不经过 `dyn Handler`，不装箱），其余路径原样交给 salvo 的
-//! `HyperHandler`。HTTP/1 的配置直接用 salvo 的 [`HttpBuilder::new`]——`Server::new` 用的
-//! 就是它，所以连接层行为与原来完全一致。
+//! [`ServeFiles::serve`]、`/pull/*` 调用不缓存的 [`ServeFiles::serve_raw`]（都不经过
+//! `dyn Handler`，不装箱），其余路径原样交给 salvo 的 `HyperHandler`。HTTP/1 的配置直接
+//! 用 salvo 的 [`HttpBuilder::new`]——`Server::new` 用的就是它，所以连接层行为与原来完全一致。
 
 use std::{borrow::Cow, future::Future, io, path::PathBuf, pin::Pin, sync::Arc};
 
@@ -34,19 +34,33 @@ use crate::{AccessLog, log_access};
 type BoxedFuture =
     Pin<Box<dyn Future<Output = Result<HyperResponse<ResBody>, salvo::hyper::Error>> + Send>>;
 
-/// `/files/{**path}` 的取值：去掉前缀与开头的斜杠，再按 salvo 的规则解码。
+/// `/files/{**path}` 或 `/pull/{**path}` 的取值：去掉前缀与开头的斜杠，再按 salvo 的规则解码。
 ///
 /// 末尾带斜杠的请求在 salvo 那边匹配不上（实测 `/files/f.bin/` 是 404），这里用空串表示，
 /// `ServeFiles` 同样会把它判成 404。返回 `None` 表示这条请求不归快路径管，交给 salvo。
-fn files_sub_path(path: &str) -> Option<Cow<'_, str>> {
-    let rest = path.strip_prefix("/files/")?.trim_start_matches('/');
+fn sub_path<'a>(path: &'a str, prefix: &str) -> Option<Cow<'a, str>> {
+    let rest = path.strip_prefix(prefix)?.trim_start_matches('/');
     if rest.ends_with('/') {
         return Some(Cow::Borrowed(""));
     }
     Some(decode_url_path(rest))
 }
 
-/// `/files` 走快路径，其余路径交给 salvo。
+/// 这条路径该由快路径服务哪条端点：`Some(false)` 是 `/files`（走 fd 缓存），
+/// `Some(true)` 是 `/pull`（不缓存），`None` 表示不归快路径管、原样交给 salvo。
+///
+/// 只判前缀，真正的解码留给 [`sub_path`] 做一次。
+fn route_mode(path: &str) -> Option<bool> {
+    if path.starts_with("/files/") {
+        Some(false)
+    } else if path.starts_with("/pull/") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// `/files` 与 `/pull` 走快路径，其余路径交给 salvo。
 ///
 /// 回退那一侧存成闭包：`Service::hyper_handler` 返回的 `HyperHandler` 在 salvo 里不可命名
 /// （`service` 模块是私有的）。闭包每连接建一次，之后每请求只是一次间接调用。
@@ -66,11 +80,11 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
     type Future = BoxedFuture;
 
     fn call(&self, req: HyperRequest<Incoming>) -> Self::Future {
-        // 分流只看前缀，真正的解码留到下面做一次：`files_sub_path` 只在这个前缀缺席时返回
-        // `None`，所以这样判与判它等价，却省掉一次「去前缀 + 去斜杠 + 解码」
-        if !req.uri().path().starts_with("/files/") {
+        // 分流只看前缀，真正的解码留到下面做一次：`route_mode` 只做前缀判断，
+        // 「去前缀 + 去斜杠 + 解码」那一步留到 `sub_path` 里做
+        let Some(raw) = route_mode(req.uri().path()) else {
             return (self.fallback)(req);
-        }
+        };
         let files = Arc::clone(&self.files);
         let access_log = Arc::clone(&self.access_log);
         let slot = Arc::clone(&self.slot);
@@ -89,8 +103,13 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
             if is_head || method == Method::GET {
                 // 借自 `request`，不再单独分配：`decode_url_path` 在没有 `%` 时就是借用。
                 // 求值放进这个分支里——非 GET/HEAD 只会返回 404，根本用不到子路径
-                let sub = files_sub_path(request.uri().path()).unwrap_or_default();
-                files.serve(&sub, &request, &mut res, Some(&slot)).await;
+                let prefix = if raw { "/pull/" } else { "/files/" };
+                let sub = sub_path(request.uri().path(), prefix).unwrap_or_default();
+                if raw {
+                    files.serve_raw(&sub, &request, &mut res, Some(&slot)).await;
+                } else {
+                    files.serve(&sub, &request, &mut res, Some(&slot)).await;
+                }
             } else {
                 res.status_code(StatusCode::NOT_FOUND);
             }
@@ -204,7 +223,22 @@ mod tests {
 
     use std::borrow::Cow;
 
-    use super::files_sub_path;
+    use super::{route_mode, sub_path};
+
+    /// 快路径只认这两条前缀：`/pull` 必须由它自己服务，落到 salvo 就丢了零拷贝与不缓存的收益
+    #[test]
+    fn route_mode_claims_files_and_pull_only() {
+        assert_eq!(route_mode("/files/f.bin"), Some(false));
+        assert_eq!(route_mode("/files/sub/g.txt"), Some(false));
+        assert_eq!(route_mode("/pull/f.bin"), Some(true));
+        assert_eq!(route_mode("/pull/sub/g.txt"), Some(true));
+        // 少一个斜杠或别的路径都不归快路径管
+        assert_eq!(route_mode("/files"), None);
+        assert_eq!(route_mode("/pull"), None);
+        assert_eq!(route_mode("/api/list"), None);
+        assert_eq!(route_mode("/static/x.css"), None);
+        assert_eq!(route_mode("/"), None);
+    }
 
     /// 这些取值是拿旧二进制实测出来的：每个用例的注释是它当时的响应。
     #[test]
@@ -232,17 +266,31 @@ mod tests {
         ];
         for (path, expected) in cases {
             assert_eq!(
-                files_sub_path(path).as_deref(),
+                sub_path(path, "/files/").as_deref(),
                 *expected,
                 "路径 {path} 的子路径取值不对"
             );
         }
     }
 
+    /// `/pull` 与 `/files` 共用同一套取值规则，只是前缀不同
+    #[test]
+    fn pull_sub_path_uses_the_same_rules() {
+        assert_eq!(
+            sub_path("/pull/sub/a%20b.txt", "/pull/").as_deref(),
+            Some("sub/a b.txt")
+        );
+        assert_eq!(sub_path("/pull/", "/pull/").as_deref(), Some(""));
+        assert_eq!(sub_path("/pull/f.bin/", "/pull/").as_deref(), Some(""));
+        // 前缀不对就不归这条路管
+        assert_eq!(sub_path("/pull", "/pull/"), None);
+        assert_eq!(sub_path("/files/f.bin", "/pull/"), None);
+    }
+
     #[test]
     fn sub_path_borrows_when_nothing_is_encoded() {
         assert!(matches!(
-            files_sub_path("/files/f.bin"),
+            sub_path("/files/f.bin", "/files/"),
             Some(Cow::Borrowed(_))
         ));
     }

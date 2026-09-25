@@ -295,6 +295,88 @@ async fn files_endpoint_head_request_succeeds() {
     assert_eq!(res.status_code, Some(StatusCode::OK));
 }
 
+// ---- lanfile get 用的 /pull 端点 ----
+
+/// `/pull` 是给 `lanfile get` 的一次性拉取端点：正文与 `/files` 一致，但类型固定成
+/// `application/octet-stream`，且不编码拉取端根本不看的 `ETag`、`Last-Modified` 与 `Content-Disposition`
+#[tokio::test]
+async fn pull_endpoint_serves_file_with_lean_headers() {
+    use salvo::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, ETAG, LAST_MODIFIED};
+
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/pull/hello.txt")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    assert_eq!(
+        res.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream"),
+        "类型固定成 octet-stream，省掉建响应体时那次嗅探 pread"
+    );
+    for name in [ETAG, LAST_MODIFIED, CONTENT_DISPOSITION] {
+        assert!(res.headers().get(&name).is_none(), "/pull 不该编码 {name}");
+    }
+    assert_eq!(res.take_string().await.unwrap(), "hello world");
+}
+
+/// `/pull` 与 `/files` 共用同一套路径校验：目录、缺失文件、穿越、符号链接都必须 404
+#[tokio::test]
+async fn pull_endpoint_rejects_what_files_rejects() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub/inner.txt"), "xyz").unwrap();
+    std::fs::write(dir.root().join("real.txt"), "real").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt")).unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut paths = vec![
+        "/pull/sub",
+        "/pull/nope.txt",
+        "/pull/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    ];
+    #[cfg(unix)]
+    paths.push("/pull/alias.txt");
+
+    for path in paths {
+        let res = TestClient::get(format!("http://127.0.0.1:5800{path}"))
+            .send(Arc::clone(&router))
+            .await;
+        assert_eq!(
+            res.status_code,
+            Some(StatusCode::NOT_FOUND),
+            "{path} 应当 404"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pull_endpoint_head_request_succeeds() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::head("http://127.0.0.1:5800/pull/hello.txt")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+}
+
+/// 非 GET/HEAD 与 `/files` 一样是 404
+#[tokio::test]
+async fn pull_endpoint_rejects_post() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let router = api_router(dir.root().to_path_buf());
+    let res = TestClient::post("http://127.0.0.1:5800/pull/hello.txt")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+}
+
 // ---- Real TCP download test ----
 
 #[tokio::test]
