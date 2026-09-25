@@ -27,19 +27,14 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// 时直接进 `<local_dir>`。不给 `<local_dir>` 则缺省当前目录（拉根缺省 `lanfile-root`）。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let (base, remote, local) = parse_pull_args(args)?;
+    // `parse_pull_args` 已经去掉 `base` 末尾的 `/`，这里只需剥掉 scheme。
     let host = base
         .strip_prefix("http://")
-        .ok_or("base_url 必须以 http:// 开头（不支持 https）")?
-        .trim_end_matches('/')
-        .to_string();
+        .ok_or("base_url 必须以 http:// 开头（不支持 https）")?;
     let target = local_target(&local, &remote);
     tokio::fs::create_dir_all(&target).await?;
-    let stats = pull_dir(&host, &remote, &target).await?;
-    let remote_disp = if remote.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{remote}")
-    };
+    let stats = pull_dir(host, &remote, &target).await?;
+    let remote_disp = format!("/{remote}");
     eprintln!(
         "lanfile get: {base}{remote_disp} -> {}（{} 文件，{} 字节，{} 目录）",
         target.display(),
@@ -173,7 +168,7 @@ async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, Bo
     let mut reader = BufReader::new(read);
     let status = read_status(&mut reader).await?;
     if status != 200 {
-        return Err(format!("HTTP {status} {path}").into());
+        return Err(format!("HTTP {status} 请求 {path}").into());
     }
     Ok(reader)
 }
@@ -188,11 +183,11 @@ async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, BoxEr
         .ok_or("状态行格式异常")?
         .parse::<u16>()?;
     // 复用同一个 String 读响应头，免得每行各分配一次。
-    let mut header = String::new();
+    let mut line = String::new();
     loop {
-        header.clear();
-        let read = reader.read_line(&mut header).await?;
-        if read == 0 || header.trim().is_empty() {
+        line.clear();
+        let read = reader.read_line(&mut line).await?;
+        if read == 0 || line.trim().is_empty() {
             break;
         }
     }
