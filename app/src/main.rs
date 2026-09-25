@@ -31,8 +31,9 @@ thread_local! {
     /// Every log line carries a timestamp and the access log writes one line per
     /// request, so `chrono`'s `strftime` ends up costing more than the rest of the
     /// line put together; what it returns only changes once a second. Reading the
-    /// second off the coarse clock also avoids the timezone conversion that
-    /// `Local::now` does on every call, without paying for a real clock read.
+    /// second off the coarse clock also avoids the real `clock_gettime` on every
+    /// call; the timezone conversion inside `Local::now` still happens once per
+    /// refresh, but a refresh is at most one per second instead of one per line.
     static STAMP: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) };
 
     /// 直写访问日志退回 `String` 拼行（快路径在栈上）时用的缓冲，按线程复用，省掉每请求一次分配。
@@ -192,7 +193,8 @@ impl LogSink {
 
     /// 往本线程的分片里追加一段日志，返回是否已经攒够一批（`true` 时调用方该叫醒写线程）。
     ///
-    /// 分片已经到 [`LOG_PENDING_MAX_PER_SHARD`] 时这一行直接丢掉。
+    /// 分片已经到 [`LOG_PENDING_MAX_PER_SHARD`] 时这一行直接丢掉；丢弃不构成"攒够一批"，
+    /// 因此同样返回 `false`——调用方据此不会为一个已经满的缓冲去叫醒写线程。
     fn append(&self, shard: usize, buf: &[u8]) -> bool {
         let mut pending = lock(&self.pending[shard]);
         if pending.len() >= LOG_PENDING_MAX_PER_SHARD {
@@ -221,6 +223,8 @@ impl LogSink {
         let _writing = lock(&self.writing);
         let mut wrote = false;
         for shard in &self.pending {
+            // `mem::take` 把这一片取空，锁随即释放：下面的 `write_all` 在锁外做，
+            // 分片上的追加不会被这次可能很慢的写出堵住。
             let batch = std::mem::take(&mut *lock(shard));
             if !batch.is_empty() {
                 out.write_all(&batch)?;
@@ -350,10 +354,12 @@ fn access_log(is_terminal: bool) -> AccessLog {
                 let mut buf = buf.borrow_mut();
                 buf.clear();
                 buf.push_str(stamp);
-                if render_line(line, &mut buf).is_err() {
-                    return;
+                // 写 `String` 不会失败；这里仍按 `is_ok` 收口，是为了让容量回收
+                // 在两条支路上都会跑到——不能因为一次（不可能发生的）格式化失败
+                // 就把一块被撑大的缓冲永久留在本线程上。
+                if render_line(line, &mut buf).is_ok() {
+                    SINK.push(buf.as_bytes());
                 }
-                SINK.push(buf.as_bytes());
                 if buf.capacity() > LINE_KEEP_MAX {
                     *buf = String::new();
                 }
