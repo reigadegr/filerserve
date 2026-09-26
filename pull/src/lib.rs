@@ -92,18 +92,19 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir]`。
+/// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
 /// 两种来源：
-/// - 裸 host（`http://h [remote] [local]`）：`remote` 缺省即拉根；给了名字则先试目录，
-///   `/api/list` 返回 200 当目录拉，404 当单个文件拉（对 `lanfile get http://h a.tgz`
+/// - 裸 host（`http://h [remote] [local] [--flat]`）：`remote` 缺省即拉根；给了名字则先试
+///   目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉（对 `lanfile get http://h a.tgz`
 ///   不再因 `/api/list` 404 直接失败，而是改走 `/pull` 把文件拉下来）。
 /// - 直链（`http://h/files/<sub>` 或 `http://h/pull/<sub>`）：直接当文件拉，`<sub>`
 ///   即远端相对路径；不给 `local` 则落进当前目录、文件名取末段。
 ///
-/// 落盘语义对齐 `scp -r`：拉目录时在 `local` 下套一层以远端目录名命名的子目录
-/// （`local/dir/`）；拉单个文件时直接落 `local/<basename>`，不套层。不给 `local` 时，
-/// 命名远端/文件缺省当前目录，拉根缺省 `lanfile-root`（避免把整棵 share 散落进当前目录）。
+/// 落盘语义对齐 `scp -r`：默认拉目录时在 `local` 下套一层以远端目录名命名的子目录
+/// （`local/dir/`）；`--flat`/`-f` 不套层，目录内容直接落 `local`（恢复 8f8a234 前的默认）。
+/// 拉单个文件时直接落 `local/<basename>`，不套层。不给 `local` 时，命名远端/文件缺省
+/// 当前目录，拉根缺省 `lanfile-root`（避免把整棵 share 散落进当前目录）。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
     // 直链（文件）直接当文件拉；裸 host 先试目录，`/api/list` 404 再当文件。
@@ -136,6 +137,8 @@ struct Parsed {
     kind: Kind,
     /// 本地落盘目录。
     local: PathBuf,
+    /// 不套 basename 一层：目录内容直接落进 `local`，根总是如此（无名字可套）。
+    flat: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -161,28 +164,37 @@ async fn run_file(p: &Parsed) -> Result<(), BoxError> {
 fn parse_args(args: &[String]) -> Result<Parsed, Error> {
     if args.is_empty() {
         return Err(Error::Malformed(
-            "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir]",
+            "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]",
         ));
     }
     let src = parse_source(&args[0])?;
+    let trailing = args.get(1..).unwrap_or(&[]);
+    let (pos, flat) = parse_trailing(trailing);
     let (remote, kind, local) = if let Some(direct) = src.direct {
-        // 直链：remote 已在 URL 里指明，后面只剩可选 local。
-        (
-            direct.remote,
-            direct.kind,
-            parse_local(args.get(1..).unwrap_or(&[]))?,
-        )
+        // 直链：remote 已在 URL 里指明，后面只剩可选 local 与 flag。
+        let local = match pos {
+            [] => None,
+            [s] => Some(PathBuf::from(s)),
+            _ => {
+                return Err(Error::Malformed(
+                    "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]",
+                ));
+            }
+        };
+        (direct.remote, direct.kind, local)
     } else {
-        // 裸 host：[remote] [local]；remote 缺省即拉根。
-        let remote = args
-            .get(1)
+        // 裸 host：[remote] [local] [flag]；remote 缺省即拉根。
+        if pos.len() > 2 {
+            return Err(Error::Malformed(
+                "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]",
+            ));
+        }
+        let remote = pos
+            .first()
             .map(|s| s.trim_matches('/').to_string())
             .unwrap_or_default();
-        (
-            remote,
-            Kind::Auto,
-            parse_local(args.get(2..).unwrap_or(&[]))?,
-        )
+        let local = pos.get(1).map(PathBuf::from);
+        (remote, Kind::Auto, local)
     };
     // 不给 local：命名远端/文件缺省当前目录，拉根缺省 lanfile-root。
     let local = local.unwrap_or_else(|| {
@@ -198,17 +210,18 @@ fn parse_args(args: &[String]) -> Result<Parsed, Error> {
         remote,
         kind,
         local,
+        flat,
     })
 }
 
-/// 取可选的 local 目录：空 → None（由 `parse_args` 补缺省）；多余参数报用法错误。
-fn parse_local(args: &[String]) -> Result<Option<PathBuf>, Error> {
-    match args {
-        [] => Ok(None),
-        [s] => Ok(Some(PathBuf::from(s))),
-        _ => Err(Error::Malformed(
-            "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir]",
-        )),
+/// 末尾若是 `--flat`/`-f` 则取下，返回剩余位置参数与 flat 标志。
+/// flag 只认末尾一个：按用户的写法，它跟在 `local_dir` 之后。
+fn parse_trailing(args: &[String]) -> (&[String], bool) {
+    match args.last() {
+        Some(last) if last.as_str() == "--flat" || last.as_str() == "-f" => {
+            (&args[..args.len() - 1], true)
+        }
+        _ => (args, false),
     }
 }
 
@@ -285,10 +298,10 @@ const fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// 拉目录到 `local`（先在 `local` 下套一层远端目录名，对齐 `scp -r`）。
+/// 拉目录到 `local`（默认在 `local` 下套一层远端目录名，对齐 `scp -r`；`--flat` 不套层）。
 async fn pull_dir_run(p: &Parsed, entries: Vec<RemoteEntry>) -> Result<(), Error> {
     let remote = &p.remote;
-    let target = local_target(&p.local, remote);
+    let target = local_target(&p.local, remote, p.flat);
     tokio::fs::create_dir_all(&target).await?;
     let stats = pull_entries(&p.host, remote, &target, entries).await?;
     eprintln!(
@@ -319,14 +332,14 @@ async fn pull_file_run(p: &Parsed) -> Result<(), Error> {
     Ok(())
 }
 
-/// 实际落盘根目录：命名远端目录时在 `local` 下套一层以远端目录名命名的子目录
-/// （对齐 `scp -r host:dir local` 落成 `local/dir/` 的语义）；拉 root 时没有名字可套，
-/// 直接用 `local`。
-fn local_target(local: &Path, remote: &str) -> PathBuf {
-    match basename(remote) {
-        Some(name) => local.join(name),
-        None => local.to_path_buf(),
+/// 实际落盘根目录：默认在 `local` 下套一层以远端目录名命名的子目录（对齐
+/// `scp -r host:dir local` 落成 `local/dir/` 的语义）；`flat` 为真或拉 root（无名字可套）
+/// 时直接用 `local`。
+fn local_target(local: &Path, remote: &str, flat: bool) -> PathBuf {
+    if !flat && let Some(name) = basename(remote) {
+        return local.join(name);
     }
+    local.to_path_buf()
 }
 
 /// 远端路径的末段目录名；root（去首尾斜杠后为空）返回 `None`。
@@ -624,6 +637,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_flat_flag_after_local() {
+        let p = parse_args(&[
+            "http://h:1".into(),
+            "sub".into(),
+            "./dst".into(),
+            "--flat".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.remote, "sub");
+        assert_eq!(p.local, PathBuf::from("./dst"));
+        assert!(p.flat);
+    }
+
+    #[test]
+    fn parse_args_flat_short_flag_no_local() {
+        // -f 且不给 local：命名远端缺省当前目录。
+        let p = parse_args(&["http://h:1".into(), "sub".into(), "-f".into()]).unwrap();
+        assert_eq!(p.remote, "sub");
+        assert_eq!(p.local, PathBuf::from("."));
+        assert!(p.flat);
+    }
+
+    #[test]
+    fn parse_args_flat_root() {
+        // 拉根 + --flat：flat 对根是 no-op。
+        let p = parse_args(&["http://h:1".into(), "--flat".into()]).unwrap();
+        assert_eq!(p.remote, "");
+        assert_eq!(p.local, PathBuf::from("lanfile-root"));
+        assert!(p.flat);
+    }
+
+    #[test]
+    fn parse_args_file_direct_link_flat() {
+        let p =
+            parse_args(&["http://h:1/files/x".into(), "./dst".into(), "--flat".into()]).unwrap();
+        assert_eq!(p.remote, "x");
+        assert_eq!(p.kind, Kind::File);
+        assert_eq!(p.local, PathBuf::from("./dst"));
+        assert!(p.flat);
+    }
+
+    #[test]
+    fn parse_args_no_flat_by_default() {
+        let p = parse_args(&["http://h:1".into(), "sub".into(), "./dst".into()]).unwrap();
+        assert!(!p.flat);
+    }
+
+    #[test]
     fn percent_decode_basic() {
         assert_eq!(percent_decode("boards.md"), "boards.md");
         assert_eq!(percent_decode("a%20b.txt"), "a b.txt");
@@ -635,24 +696,44 @@ mod tests {
     #[test]
     fn local_target_wraps_named_remote_in_basename_layer() {
         assert_eq!(
-            local_target(Path::new("./dst"), "sub"),
+            local_target(Path::new("./dst"), "sub", false),
             PathBuf::from("./dst/sub")
         );
         assert_eq!(
-            local_target(Path::new("./dst"), "a/b"),
+            local_target(Path::new("./dst"), "a/b", false),
             PathBuf::from("./dst/b")
         );
         assert_eq!(
-            local_target(Path::new("./dst"), "/sub/"),
+            local_target(Path::new("./dst"), "/sub/", false),
             PathBuf::from("./dst/sub")
         );
     }
 
     #[test]
     fn local_target_root_has_no_wrap() {
-        assert_eq!(local_target(Path::new("./dst"), ""), PathBuf::from("./dst"));
         assert_eq!(
-            local_target(Path::new("./dst"), "/"),
+            local_target(Path::new("./dst"), "", false),
+            PathBuf::from("./dst")
+        );
+        assert_eq!(
+            local_target(Path::new("./dst"), "/", false),
+            PathBuf::from("./dst")
+        );
+    }
+
+    #[test]
+    fn local_target_flat_drops_basename_layer() {
+        // --flat：不套 basename 一层，直接落 local；根无名字可套，flat 是 no-op。
+        assert_eq!(
+            local_target(Path::new("./dst"), "sub", true),
+            PathBuf::from("./dst")
+        );
+        assert_eq!(
+            local_target(Path::new("./dst"), "a/b", true),
+            PathBuf::from("./dst")
+        );
+        assert_eq!(
+            local_target(Path::new("./dst"), "", true),
             PathBuf::from("./dst")
         );
     }

@@ -936,3 +936,48 @@ async fn get_missing_remote_reports_not_found() {
 
     server.abort();
 }
+
+/// `--flat`：不套 basename 一层，目录内容直接落进 local，而非 local/<远端名>/。
+#[tokio::test]
+async fn get_flat_does_not_nest() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub").join("b.txt"), "bbbb").unwrap();
+    std::fs::create_dir_all(dir.root().join("sub").join("deeper")).unwrap();
+    std::fs::write(
+        dir.root().join("sub").join("deeper").join("c.bin"),
+        vec![1_u8, 2, 3, 4, 5],
+    )
+    .unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let base = format!("http://{addr}");
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        base,
+        "sub".into(),
+        dst.root().to_string_lossy().into(),
+        "--flat".into(),
+    ])
+    .await
+    .unwrap();
+
+    // 内容直接落进 dst，不再有 dst/sub/ 这一层
+    assert!(!dst.root().join("sub").exists());
+    assert_eq!(std::fs::read(dst.root().join("b.txt")).unwrap(), b"bbbb");
+    assert_eq!(
+        std::fs::read(dst.root().join("deeper").join("c.bin")).unwrap(),
+        vec![1_u8, 2, 3, 4, 5]
+    );
+
+    server.abort();
+}
