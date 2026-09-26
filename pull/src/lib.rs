@@ -15,11 +15,12 @@
 //!
 //! v1 顺序拉取：一个文件一个文件，但共用一条 keep-alive 连接——一棵目录树只握一次手，
 //! 省掉每个文件的三次握手与慢启动。正文严格按响应声明的 `Content-Length` 读满即停：长度
-//! 不再是事后校验，而是读取本身的停止条件，读满的连接干净、直接归还池子复用；响应没有
-//! `Content-Length`（理论上不会有）则退化成读到 EOF、丢弃连接，不猜长度。连接与单次读取
-//! 都设了空闲超时，服务器半路哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次
-//! 请求会换一条新连接重试一次。结构上每个文件的抓取收口在 [`fetch_file`]、目录枚举收口
-//! 在 [`list_entries`]，未来要做有限并发时把它们解耦、对文件任务套一层 `buffer_unordered`
+//! 不再是事后校验，而是读取本身的停止条件，读满的连接干净、直接归还池子复用。响应必须带
+//! `Content-Length`（见 [`NO_CONTENT_LENGTH`]）：缺了当场报错，不猜长度、也不退化成读到
+//! EOF——keep-alive 下对端不会关连接，那只会在空等之后撞上读取超时。连接与单次读取都设了
+//! 空闲超时，服务器半路哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次请求会换
+//! 一条新连接重试一次。结构上每个文件的抓取收口在 [`fetch_file`]、目录枚举收口在
+//! [`list_entries`]，未来要做有限并发时把它们解耦、对文件任务套一层 `buffer_unordered`
 //! 即可，不必重写本模块。
 
 use std::{
@@ -54,7 +55,7 @@ pub enum Error {
     NotFound { remote: String },
     /// 连接或读取超时：远端在约定时间内一句话都没回。
     Timeout {
-        /// 卡在哪一步（`连接`、`读取响应`、`读取正文`）。
+        /// 卡在哪一步（`连接`、`读取响应`、`读取目录列表`、`读取正文`）。
         phase: &'static str,
     },
     /// 正文被提前截断：收到的字节数与应得的不一致。
@@ -469,8 +470,8 @@ async fn pull_dir(pool: &mut Pool, host: &str, remote: &str, local: &Path) -> Re
     pull_entries(pool, host, remote, local, entries).await
 }
 
-/// 取一层目录的条目：`GET /api/list[/<remote>]`。正文按 `Content-Length` 精确读满，
-/// 连接干净归还池子复用；没有 `Content-Length`（理论上不会有）才读到 EOF、丢弃连接。
+/// 取一层目录的条目：`GET /api/list[/<remote>]`。正文按 `Content-Length` 增量读满，连接干净
+/// 归还池子复用；读不满即截断，连接丢弃。
 async fn list_entries(
     pool: &mut Pool,
     host: &str,
@@ -481,27 +482,25 @@ async fn list_entries(
     } else {
         format!("/api/list/{}", encode_path(remote))
     };
-    let (mut reader, declared) = http_get(pool, host, &path).await?;
-    let body = if let Some(len) = declared {
-        // 有 Content-Length：精确读满，连接可复用；读不满（EOF）算 IO 错，连接丢弃。
-        let mut buf = vec![0_u8; len as usize];
-        tokio::time::timeout(READ_TIMEOUT, reader.read_exact(&mut buf))
-            .await
-            .map_err(|_| Error::Timeout {
-                phase: "读取目录列表",
-            })??;
-        pool.release(reader);
-        buf
-    } else {
-        // 无 Content-Length：读到 EOF，连接不可复用。
-        let mut body = Vec::new();
-        tokio::time::timeout(READ_TIMEOUT, reader.read_to_end(&mut body))
-            .await
-            .map_err(|_| Error::Timeout {
-                phase: "读取目录列表",
-            })??;
-        body
-    };
+    let (reader, declared) = http_get(pool, host, &path).await?;
+    let len = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
+    // 列表正文就几十 KB 出头，这里卡的是整段读完的总时长（不是空闲）。用 `take` 把读取截在
+    // 声明的长度上，而不是先按这个长度开一块：对端报的数在读懂之前都不算数。
+    let mut limited = reader.take(len);
+    let mut body = Vec::new();
+    tokio::time::timeout(READ_TIMEOUT, limited.read_to_end(&mut body))
+        .await
+        .map_err(|_| Error::Timeout {
+            phase: "读取目录列表",
+        })??;
+    if body.len() as u64 != len {
+        return Err(Error::Truncated {
+            remote: remote.to_string(),
+            want: len,
+            got: body.len() as u64,
+        });
+    }
+    pool.release(limited.into_inner());
     Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
 }
 
@@ -560,10 +559,18 @@ const READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// 正文搬运的缓冲区。开大一点，读的次数与定时器条目就跟着少。
 const COPY_BUF: usize = 64 * 1024;
 
+/// 响应没带 `Content-Length` 时的报错：正文边界无从得知，当场说清，不猜长度。
+///
+/// 这里不能退化成读到 EOF——请求不带 `Connection: close`，对端不会关连接，`read_to_end`
+/// 只会空等到 `READ_TIMEOUT` 再报超时，还不如当场把话说清楚。`/api/list`（salvo 的 `Json`）
+/// 与 `/pull`（`NamedFile`）都带长度，所以正常走不到这一支。
+const NO_CONTENT_LENGTH: &str = "响应没有 Content-Length，无法确定正文边界";
+
 /// 一条可复用的 HTTP/1.1 keep-alive 连接。顺序拉取只用一条：每请求省掉一次三次握手与慢启动。
 ///
 /// 正文按 `Content-Length` 精确读满后由调用方 [`Pool::release`] 归还，下一请求 [`Pool::acquire`]
-/// 直接拿来用；读取出错、响应不带 `Content-Length`、或连接被对端关掉时不归还，连接随之关闭。
+/// 直接拿来用；读取出错、读不满声明的长度、或响应不带 `Content-Length`（见
+/// [`NO_CONTENT_LENGTH`]）都不归还，连接随之关闭。
 #[derive(Default)]
 struct Pool {
     conn: Option<BufReader<TcpStream>>,
@@ -596,33 +603,30 @@ impl Pool {
 ///
 /// 读满后连接干净，归还池子给下一个文件复用；服务端提前 EOF（读到的字节数不足声明的长度）
 /// 或半路超时/IO 出错，都把没写完的文件删掉再报错——宁可什么都没有，也不留一个看着完整
-/// 其实残缺的文件。响应没有 `Content-Length`（理论上不会有）就退化成读到 EOF、连接用完即弃。
+/// 其实残缺的文件。
 async fn fetch_file(pool: &mut Pool, host: &str, remote: &str, local: &Path) -> Result<u64, Error> {
     let path = format!("/pull/{}", encode_path(remote));
     let (mut reader, declared) = http_get(pool, host, &path).await?;
+    let want = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
     let mut file = tokio::fs::File::create(local).await?;
-    let copied = match copy_body(&mut reader, &mut file, declared).await {
+    let copied = match copy_body(&mut reader, &mut file, want).await {
         Ok(copied) => copied,
         Err(error) => {
             discard(local).await;
             return Err(error);
         }
     };
-    match declared {
-        // 精确读满 Content-Length：连接干净，归还复用
-        Some(want) if copied == want => pool.release(reader),
-        // 读到 EOF 却不足声明的长度：传输不完整
-        Some(want) => {
-            discard(local).await;
-            return Err(Error::Truncated {
-                remote: remote.to_string(),
-                want,
-                got: copied,
-            });
-        }
-        // 无 Content-Length：读到 EOF，连接不可复用，不归还即丢弃
-        None => {}
+    // 只有读满声明的长度、连接干净才归还：读多一个字节会把下一条响应的开头吃进缓冲，
+    // 读不满即传输不完整，两种情况都不能复用。
+    if copied != want {
+        discard(local).await;
+        return Err(Error::Truncated {
+            remote: remote.to_string(),
+            want,
+            got: copied,
+        });
     }
+    pool.release(reader);
     Ok(copied)
 }
 
@@ -635,24 +639,20 @@ async fn discard(local: &Path) {
 
 /// 把正文读进 `file` 并落盘，返回落盘字节数。
 ///
-/// `max` 为响应声明的 `Content-Length` 时每次只读到「还差多少」为止，读满即停——读多一个
-/// 字节就会把下一条响应的开头吃进缓冲，连接就没法复用了；它同时也是完整性的停止条件，读不满
-/// 即截断。`max` 为 `None`（响应没有 `Content-Length`，理论上不会有）退化成读到 EOF、
-/// 连接用完即弃。每次读取都套一个空闲超时——服务器接上却半路哑掉（既不回数据也不断连）时
-/// 不能把客户端挂死。不用 `tokio::io::copy` 是因为它没有这个挂点；而在外面套一个 `timeout`
-/// 又会连总时长一起限住，大文件在慢链路上会被误杀。
+/// `max` 是响应声明的 `Content-Length`，每次只读到「还差多少」为止，读满即停——读多一个
+/// 字节就会把下一条响应的开头吃进缓冲，连接就没法复用了；它同时也是完整性的停止条件，
+/// 读不满即截断（由调用方拿返回的字节数判定）。每次读取都套一个空闲超时——服务器接上却
+/// 半路哑掉（既不回数据也不断连）时不能把客户端挂死。不用 `tokio::io::copy` 是因为它没有
+/// 这个挂点；而在外面套一个 `timeout` 又会连总时长一起限住，大文件在慢链路上会被误杀。
 async fn copy_body(
     reader: &mut BufReader<TcpStream>,
     file: &mut tokio::fs::File,
-    max: Option<u64>,
+    max: u64,
 ) -> Result<u64, Error> {
     let mut buf = vec![0_u8; COPY_BUF];
     let mut total = 0_u64;
     loop {
-        let want = match max {
-            Some(m) => buf.len().min((m - total) as usize),
-            None => buf.len(),
-        };
+        let want = buf.len().min((max - total) as usize);
         if want == 0 {
             break;
         }
