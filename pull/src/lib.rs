@@ -1,9 +1,14 @@
-//! `lanfile get` 的递归拉取客户端：把远端 lanfile 掌管的一棵目录树原样镜像到本地，
+//! `lanfile get` 的拉取客户端：把远端 lanfile 掌管的一棵目录树原样镜像到本地，或拉单个文件，
 //! 不打压缩包、不占服务端额外空间。
+//!
+//! 来源两种：
+//! - 裸 host：`http://h [remote] [local]`——`remote` 缺省拉根；给了名字先试目录，
+//!   `/api/list` 返回 200 当目录拉，404 当单个文件拉；
+//! - 直链：`http://h/files/<sub>`、`http://h/pull/<sub>` 直接连到单个文件。
 //!
 //! 只走服务端两个 GET 端点：
 //! - `/api/list/<dir>` 拿到一层目录的条目（name/type/size）；
-//! - `/pull/<sub>/<name>` 逐个文件落盘。`/pull` 是拉取专用的端点：不碰 `/files` 那套 fd 缓存，
+//! - `/pull/<sub>` 逐个文件落盘。`/pull` 是拉取专用的端点：不碰 `/files` 那套 fd 缓存，
 //!   也不编码拉取端用不到的 `ETag`、`Last-Modified` 与 `Content-Disposition`（见 `lanfile_assets`）。
 //!
 //! v1 顺序拉取：一个文件一个文件、每请求一条 TCP 连接（`Connection: close`，
@@ -27,7 +32,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// 原先一律 `Box<dyn Error>` 加一句 `HTTP {status} 请求 {path}`，把"给的是文件、所以
 /// `/api/list` 返回 404"说成了普通的 HTTP 失败。这里按"哪一步、为什么"拆开：
-/// 连不上、服务端非 200、远端不是目录、响应结构不对、底层 IO、JSON 解析各占一条，
+/// 连不上、服务端非 200、远端不存在、响应结构不对、底层 IO、JSON 解析各占一条，
 /// 报错时能说清到底卡在哪。
 #[derive(Debug)]
 pub enum Error {
@@ -38,8 +43,8 @@ pub enum Error {
     },
     /// 远端返回了非 200 状态码。
     Http { status: u16, path: String },
-    /// `/api/list` 说这个路径不是目录（404）——它可能是个文件，也可能根本不存在。
-    NotADirectory { remote: String },
+    /// 远端这个路径既不是目录也不是文件（`/api/list` 与 `/pull` 都 404）。
+    NotFound { remote: String },
     /// 命令行参数或响应结构不符合预期。
     Malformed(&'static str),
     /// 底层 IO（读写、建连之后的网络错误等）。
@@ -55,8 +60,8 @@ impl fmt::Display for Error {
                 write!(f, "连接 `{host}` 失败：{source}")
             }
             Self::Http { status, path } => write!(f, "HTTP {status} 请求 {path}"),
-            Self::NotADirectory { remote } => {
-                write!(f, "远端 `{remote}` 不是目录（HTTP 404）")
+            Self::NotFound { remote } => {
+                write!(f, "远端 `{remote}` 不存在（既不是目录也不是文件）")
             }
             Self::Malformed(what) => write!(f, "{what}"),
             Self::Io(error) => write!(f, "{error}"),
@@ -87,43 +92,29 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// 子命令入口：`lanfile get <base_url> <remote_dir> [local_dir]`。
+/// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir]`。
 ///
-/// 把 `<base_url>` 下掌管的 `<remote_dir>` 整棵树拉到 `<local_dir>` 之下——先在
-/// `<local_dir>` 里以远端目录名建一层子目录，再把该目录的内容塞进去，对齐
-/// `scp -r host:dir <local_dir>` 落成 `<local_dir>/dir/` 的语义；拉 root（无目录名可套）
-/// 时直接进 `<local_dir>`。不给 `<local_dir>` 则缺省当前目录（拉根缺省 `lanfile-root`）。
+/// 两种来源：
+/// - 裸 host（`http://h [remote] [local]`）：`remote` 缺省即拉根；给了名字则先试目录，
+///   `/api/list` 返回 200 当目录拉，404 当单个文件拉（对 `lanfile get http://h a.tgz`
+///   不再因 `/api/list` 404 直接失败，而是改走 `/pull` 把文件拉下来）。
+/// - 直链（`http://h/files/<sub>` 或 `http://h/pull/<sub>`）：直接当文件拉，`<sub>`
+///   即远端相对路径；不给 `local` 则落进当前目录、文件名取末段。
+///
+/// 落盘语义对齐 `scp -r`：拉目录时在 `local` 下套一层以远端目录名命名的子目录
+/// （`local/dir/`）；拉单个文件时直接落 `local/<basename>`，不套层。不给 `local` 时，
+/// 命名远端/文件缺省当前目录，拉根缺省 `lanfile-root`（避免把整棵 share 散落进当前目录）。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
-    let (base, remote, local) = parse_pull_args(args)?;
-    // `parse_pull_args` 已经去掉 `base` 末尾的 `/`，这里只需剥掉 scheme。
-    let host = base
-        .strip_prefix("http://")
-        .ok_or(Error::Malformed(
-            "base_url 必须以 http:// 开头（不支持 https）",
-        ))?
-        .to_string();
-    let target = local_target(&local, &remote);
-    tokio::fs::create_dir_all(&target).await?;
-    // 顶层先取一次目录列表：404 说明用户给的那条远端根本不是目录（多半是个文件）。
-    // 只在这一层把 404 报成"不是目录"——递归里中层目录消失仍按 HTTP 错误原样上抛，
-    // 不会把"子目录拉到一半没了"误报成"顶层远端不是目录"。
-    let entries = list_entries(&host, &remote)
-        .await
-        .map_err(|error| match error {
-            Error::Http { status: 404, .. } => Error::NotADirectory {
-                remote: remote.clone(),
-            },
-            other => other,
-        })?;
-    let stats = pull_entries(&host, &remote, &target, entries).await?;
-    eprintln!(
-        "lanfile get: {base}/{remote} -> {}（{} 文件，{} 字节，{} 目录）",
-        target.display(),
-        stats.files,
-        stats.bytes,
-        stats.dirs
-    );
-    Ok(())
+    let p = parse_args(args)?;
+    // 直链（文件）直接当文件拉；裸 host 先试目录，`/api/list` 404 再当文件。
+    if p.kind == Kind::File {
+        return run_file(&p).await;
+    }
+    match list_entries(&p.host, &p.remote).await {
+        Ok(entries) => pull_dir_run(&p, entries).await.map_err(Into::into),
+        Err(Error::Http { status: 404, .. }) => run_file(&p).await,
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Default)]
@@ -133,28 +124,199 @@ struct Stats {
     bytes: u64,
 }
 
-fn parse_pull_args(args: &[String]) -> Result<(String, String, PathBuf), Error> {
+/// 解析后的参数。
+struct Parsed {
+    /// `http://<host>`，打印进度用。
+    base: String,
+    /// 已剥 scheme 的 `host[:port]`，建连用。
+    host: String,
+    /// 远端相对路径（已剥首尾斜杠）；拉根为空串。
+    remote: String,
+    /// 已知 kind，还是得探测。
+    kind: Kind,
+    /// 本地落盘目录。
+    local: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Kind {
+    /// 裸 host + 名字：先试目录，404 再当文件。
+    Auto,
+    /// `/files/`、`/pull/` 直链：直接当文件。
+    File,
+}
+
+/// 当文件拉 `/pull/<remote>`；`/pull` 也 404 说明远端既不是目录也不是文件。
+async fn run_file(p: &Parsed) -> Result<(), BoxError> {
+    pull_file_run(p).await.map_err(|e| match e {
+        Error::Http { status: 404, .. } => Error::NotFound {
+            remote: p.remote.clone(),
+        }
+        .into(),
+        e => e.into(),
+    })
+}
+
+/// 解析命令行：`<base_url|直链> [remote] [local]`。
+fn parse_args(args: &[String]) -> Result<Parsed, Error> {
     if args.is_empty() {
         return Err(Error::Malformed(
-            "用法: lanfile get <base_url> <remote_dir> [local_dir]",
+            "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir]",
         ));
     }
-    let base = args[0].trim_end_matches('/').to_string();
-    let remote = args
-        .get(1)
-        .map(|s| s.trim_matches('/').to_string())
-        .unwrap_or_default();
-    let local = match args.get(2) {
-        Some(s) => PathBuf::from(s),
-        // 不给 local：命名远端缺省当前目录（run 里再套 basename 一层，落成 ./<basename>）；
-        // 拉根缺省 lanfile-root，避免把整棵 share 散落进当前目录。
-        None => PathBuf::from(if remote.is_empty() {
-            "lanfile-root"
-        } else {
-            "."
-        }),
+    let src = parse_source(&args[0])?;
+    let (remote, kind, local) = if let Some(direct) = src.direct {
+        // 直链：remote 已在 URL 里指明，后面只剩可选 local。
+        (
+            direct.remote,
+            direct.kind,
+            parse_local(args.get(1..).unwrap_or(&[]))?,
+        )
+    } else {
+        // 裸 host：[remote] [local]；remote 缺省即拉根。
+        let remote = args
+            .get(1)
+            .map(|s| s.trim_matches('/').to_string())
+            .unwrap_or_default();
+        (
+            remote,
+            Kind::Auto,
+            parse_local(args.get(2..).unwrap_or(&[]))?,
+        )
     };
-    Ok((base, remote, local))
+    // 不给 local：命名远端/文件缺省当前目录，拉根缺省 lanfile-root。
+    let local = local.unwrap_or_else(|| {
+        if remote.is_empty() {
+            PathBuf::from("lanfile-root")
+        } else {
+            PathBuf::from(".")
+        }
+    });
+    Ok(Parsed {
+        base: src.base,
+        host: src.host,
+        remote,
+        kind,
+        local,
+    })
+}
+
+/// 取可选的 local 目录：空 → None（由 `parse_args` 补缺省）；多余参数报用法错误。
+fn parse_local(args: &[String]) -> Result<Option<PathBuf>, Error> {
+    match args {
+        [] => Ok(None),
+        [s] => Ok(Some(PathBuf::from(s))),
+        _ => Err(Error::Malformed(
+            "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir]",
+        )),
+    }
+}
+
+/// 直链解析结果：URL 已指明远端路径与它是文件还是目录。
+struct Direct {
+    remote: String,
+    kind: Kind,
+}
+
+/// URL 解析结果：`base`/`host` 永远有；`direct` 为 `None` 即裸 host（remote 留给位置参数）。
+struct Source {
+    base: String,
+    host: String,
+    direct: Option<Direct>,
+}
+
+/// 解析 URL：剥 scheme，分 `host` 与路径，认 `/files/`、`/pull/` 文件直链。
+fn parse_source(url: &str) -> Result<Source, Error> {
+    let rest = url.strip_prefix("http://").ok_or(Error::Malformed(
+        "base_url 必须以 http:// 开头（不支持 https）",
+    ))?;
+    let (host, after) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_string();
+    // 路径到 '?' 或 '#' 为止（query 与 fragment 客户端用不到）；两者都是 ASCII 单字节，
+    // 切点必在 UTF-8 字符边界上。
+    let path_end = after
+        .bytes()
+        .position(|b| b == b'?' || b == b'#')
+        .unwrap_or(after.len());
+    let path = &after[..path_end];
+    // /files/<sub>、/pull/<sub> 直链 → 文件；空 sub（/files/、/pull/）不当直链。
+    let direct = path
+        .strip_prefix("files/")
+        .or_else(|| path.strip_prefix("pull/"))
+        .filter(|sub| !sub.is_empty())
+        .map(|sub| Direct {
+            remote: percent_decode(sub),
+            kind: Kind::File,
+        });
+    Ok(Source {
+        base: format!("http://{host}"),
+        host,
+        direct,
+    })
+}
+
+/// 百分号解码：把 `%XX` 还原成原字节，用于直链里 URL 编码过的子路径（解码后再交给
+/// [`encode_path`] 重新编码发请求，本地文件名取解码后的末段）。
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+const fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 拉目录到 `local`（先在 `local` 下套一层远端目录名，对齐 `scp -r`）。
+async fn pull_dir_run(p: &Parsed, entries: Vec<RemoteEntry>) -> Result<(), Error> {
+    let remote = &p.remote;
+    let target = local_target(&p.local, remote);
+    tokio::fs::create_dir_all(&target).await?;
+    let stats = pull_entries(&p.host, remote, &target, entries).await?;
+    eprintln!(
+        "lanfile get: {}/{remote} -> {}（{} 文件，{} 字节，{} 目录）",
+        p.base,
+        target.display(),
+        stats.files,
+        stats.bytes,
+        stats.dirs
+    );
+    Ok(())
+}
+
+/// 拉单个文件到 `local/<basename>`：不套层，落盘根目录按需建。
+async fn pull_file_run(p: &Parsed) -> Result<(), Error> {
+    let remote = &p.remote;
+    let name = basename(remote).unwrap_or("download");
+    let target = p.local.join(name);
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let bytes = fetch_file(&p.host, remote, &target).await?;
+    eprintln!(
+        "lanfile get: {}/{remote} -> {}（{bytes} 字节）",
+        p.base,
+        target.display()
+    );
+    Ok(())
 }
 
 /// 实际落盘根目录：命名远端目录时在 `local` 下套一层以远端目录名命名的子目录
@@ -388,12 +550,86 @@ mod tests {
     }
 
     #[test]
-    fn parse_pull_args_defaults_local_to_cwd() {
-        let (base, remote, local) = parse_pull_args(&["http://h:1".into(), "sub".into()]).unwrap();
-        assert_eq!(base, "http://h:1");
-        assert_eq!(remote, "sub");
+    fn parse_args_bare_host_defaults_local_to_cwd() {
+        let p = parse_args(&["http://h:1".into(), "sub".into()]).unwrap();
+        assert_eq!(p.base, "http://h:1");
+        assert_eq!(p.host, "h:1");
+        assert_eq!(p.remote, "sub");
+        assert_eq!(p.kind, Kind::Auto);
         // 不给 local：缺省当前目录；run 会再套 basename 一层，最终落成 ./sub/
-        assert_eq!(local, PathBuf::from("."));
+        assert_eq!(p.local, PathBuf::from("."));
+    }
+
+    #[test]
+    fn parse_args_bare_host_strips_slashes() {
+        let p = parse_args(&["http://h:1/".into(), "/sub/deep/".into()]).unwrap();
+        assert_eq!(p.remote, "sub/deep");
+        assert_eq!(p.kind, Kind::Auto);
+    }
+
+    #[test]
+    fn parse_args_bare_host_root_defaults_local() {
+        let p = parse_args(&["http://h:1".into()]).unwrap();
+        assert_eq!(p.remote, "");
+        assert_eq!(p.local, PathBuf::from("lanfile-root"));
+    }
+
+    #[test]
+    fn parse_args_bare_host_explicit_local() {
+        let p = parse_args(&["http://h:1".into(), "sub".into(), "./dst".into()]).unwrap();
+        assert_eq!(p.local, PathBuf::from("./dst"));
+    }
+
+    #[test]
+    fn parse_args_empty_errors() {
+        assert!(parse_args(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_args_file_direct_link_defaults_local_to_cwd() {
+        let p = parse_args(&["http://h:1/files/boards.md".into()]).unwrap();
+        assert_eq!(p.base, "http://h:1");
+        assert_eq!(p.host, "h:1");
+        assert_eq!(p.remote, "boards.md");
+        assert_eq!(p.kind, Kind::File);
+        assert_eq!(p.local, PathBuf::from("."));
+    }
+
+    #[test]
+    fn parse_args_pull_direct_link_is_file() {
+        let p = parse_args(&["http://h:1/pull/a/b.txt".into()]).unwrap();
+        assert_eq!(p.remote, "a/b.txt");
+        assert_eq!(p.kind, Kind::File);
+    }
+
+    #[test]
+    fn parse_args_file_direct_link_explicit_local() {
+        let p = parse_args(&["http://h:1/files/x".into(), "./dst".into()]).unwrap();
+        assert_eq!(p.local, PathBuf::from("./dst"));
+    }
+
+    #[test]
+    fn parse_args_direct_link_strips_query_and_fragment() {
+        let p = parse_args(&["http://h:1/files/x.txt?v=1#frag".into()]).unwrap();
+        assert_eq!(p.remote, "x.txt");
+    }
+
+    #[test]
+    fn parse_args_bare_host_with_unrecognized_path_stays_auto() {
+        // 未知路径不当直链：仍走裸 host，remote 从位置参数来。
+        let p = parse_args(&["http://h:1/whatever".into(), "sub".into()]).unwrap();
+        assert_eq!(p.host, "h:1");
+        assert_eq!(p.remote, "sub");
+        assert_eq!(p.kind, Kind::Auto);
+    }
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("boards.md"), "boards.md");
+        assert_eq!(percent_decode("a%20b.txt"), "a b.txt");
+        assert_eq!(percent_decode("%E4%B8%AD"), "中");
+        // 非法 %XX 原样保留
+        assert_eq!(percent_decode("a%2z.txt"), "a%2z.txt");
     }
 
     #[test]
@@ -419,31 +655,6 @@ mod tests {
             local_target(Path::new("./dst"), "/"),
             PathBuf::from("./dst")
         );
-    }
-
-    #[test]
-    fn parse_pull_args_strips_slashes() {
-        let (_, remote, _) = parse_pull_args(&["http://h:1/".into(), "/sub/deep/".into()]).unwrap();
-        assert_eq!(remote, "sub/deep");
-    }
-
-    #[test]
-    fn parse_pull_args_root_defaults_local() {
-        let (_, remote, local) = parse_pull_args(&["http://h:1".into()]).unwrap();
-        assert_eq!(remote, "");
-        assert_eq!(local, PathBuf::from("lanfile-root"));
-    }
-
-    #[test]
-    fn parse_pull_args_explicit_local() {
-        let (_, _, local) =
-            parse_pull_args(&["http://h:1".into(), "sub".into(), "./dst".into()]).unwrap();
-        assert_eq!(local, PathBuf::from("./dst"));
-    }
-
-    #[test]
-    fn parse_pull_args_empty_errors() {
-        assert!(parse_pull_args(&[]).is_err());
     }
 
     #[test]

@@ -853,10 +853,10 @@ async fn get_subcommand_mirrors_a_tree() {
     server.abort();
 }
 
-/// `lanfile get` 给一个文件名（而非目录）时，顶层 `/api/list` 返回 404，报错该说清
-/// "远端 `<名字>` 不是目录"，而不是笼统的"HTTP 404 请求 /api/list/<名字>"。
+/// `lanfile get` 给一个文件名（而非目录）时，顶层 `/api/list` 返回 404 后要改走 `/pull`
+/// 把文件拉下来，而不是直接失败。
 #[tokio::test]
-async fn get_on_a_file_reports_not_a_directory() {
+async fn get_on_a_file_downloads_it() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("claude-code.tgz"), "not a dir").unwrap();
 
@@ -871,18 +871,68 @@ async fn get_on_a_file_reports_not_a_directory() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let base = format!("http://{addr}");
-    let error = lanfile_pull::run(&[base, "claude-code.tgz".into()])
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        base,
+        "claude-code.tgz".into(),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap();
+
+    let got = std::fs::read(dst.root().join("claude-code.tgz")).unwrap();
+    assert_eq!(got, b"not a dir");
+
+    server.abort();
+}
+
+/// `lanfile get http://h/files/<sub>` 直链：当文件拉，落进 local（默认当前目录）。
+#[tokio::test]
+async fn get_file_direct_link_downloads_it() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("boards.md"), "# boards").unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let url = format!("http://{addr}/files/boards.md");
+    let dst = TestDir::new();
+    lanfile_pull::run(&[url, dst.root().to_string_lossy().into()])
         .await
-        .unwrap_err();
+        .unwrap();
+
+    let got = std::fs::read(dst.root().join("boards.md")).unwrap();
+    assert_eq!(got, b"# boards");
+
+    server.abort();
+}
+
+/// `lanfile get` 给一个根本不存在的名字时，目录与文件都 404，报成"远端不存在"。
+#[tokio::test]
+async fn get_missing_remote_reports_not_found() {
+    let dir = TestDir::new();
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let base = format!("http://{addr}");
+    let error = lanfile_pull::run(&[base, "nope".into()]).await.unwrap_err();
     let msg = error.to_string();
-    assert!(
-        msg.contains("不是目录"),
-        "报错该说明\"不是目录\"，实际: {msg}"
-    );
-    assert!(
-        msg.contains("claude-code.tgz"),
-        "报错该带上远端名，实际: {msg}"
-    );
+    assert!(msg.contains("不存在"), "报错该说明\"不存在\"，实际: {msg}");
+    assert!(msg.contains("nope"), "报错该带上远端名，实际: {msg}");
 
     server.abort();
 }

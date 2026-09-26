@@ -269,7 +269,8 @@ impl io::Write for &LogSink {
 
 #[tokio::main]
 async fn main() {
-    // `lanfile get <base_url> <remote_dir> [local_dir]`：递归拉取子命令。
+    // `lanfile get <base_url|直链> [<remote_dir>] [local_dir]`：拉取子命令，目录整棵镜像、
+    // 单文件直落（`http://h/files/<sub>`、`http://h/pull/<sub>` 直链同样支持）。
     // 在日志/服务端那套初始化之前就分流出去——它只是个 HTTP 客户端，用 eprintln 报进度即可。
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).is_some_and(|arg| arg == "get") {
