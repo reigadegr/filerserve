@@ -11,14 +11,81 @@
 //! [`fetch_file`]、目录枚举收口在 [`pull_dir`]，未来要做有限并发时把它们解耦、对文件
 //! 任务套一层 `buffer_unordered` 即可，不必重写本模块。
 
-use std::path::{Path, PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
-use serde_json::Value;
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, tcp::OwnedReadHalf};
 
-/// 简化错误类型：一个能跨线程的 boxed error，`?` 直接收 `io::Error`/`serde_json::Error`。
+/// 简化错误类型：一个能跨线程的 boxed error，`run` 的出口用它收口内部各处错误。
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// `lanfile get` 的内部错误。
+///
+/// 原先一律 `Box<dyn Error>` 加一句 `HTTP {status} 请求 {path}`，把"给的是文件、所以
+/// `/api/list` 返回 404"说成了普通的 HTTP 失败。这里按"哪一步、为什么"拆开：
+/// 连不上、服务端非 200、远端不是目录、响应结构不对、底层 IO、JSON 解析各占一条，
+/// 报错时能说清到底卡在哪。
+#[derive(Debug)]
+pub enum Error {
+    /// 连不上远端。
+    Connect {
+        host: String,
+        source: std::io::Error,
+    },
+    /// 远端返回了非 200 状态码。
+    Http { status: u16, path: String },
+    /// `/api/list` 说这个路径不是目录（404）——它可能是个文件，也可能根本不存在。
+    NotADirectory { remote: String },
+    /// 命令行参数或响应结构不符合预期。
+    Malformed(&'static str),
+    /// 底层 IO（读写、建连之后的网络错误等）。
+    Io(std::io::Error),
+    /// JSON 解析失败。
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connect { host, source } => {
+                write!(f, "连接 `{host}` 失败：{source}")
+            }
+            Self::Http { status, path } => write!(f, "HTTP {status} 请求 {path}"),
+            Self::NotADirectory { remote } => {
+                write!(f, "远端 `{remote}` 不是目录（HTTP 404）")
+            }
+            Self::Malformed(what) => write!(f, "{what}"),
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Json(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect { source, .. } | Self::Io(source) => Some(source),
+            Self::Json(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
 
 /// 子命令入口：`lanfile get <base_url> <remote_dir> [local_dir]`。
 ///
@@ -31,10 +98,24 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     // `parse_pull_args` 已经去掉 `base` 末尾的 `/`，这里只需剥掉 scheme。
     let host = base
         .strip_prefix("http://")
-        .ok_or("base_url 必须以 http:// 开头（不支持 https）")?;
+        .ok_or(Error::Malformed(
+            "base_url 必须以 http:// 开头（不支持 https）",
+        ))?
+        .to_string();
     let target = local_target(&local, &remote);
     tokio::fs::create_dir_all(&target).await?;
-    let stats = pull_dir(host, &remote, &target).await?;
+    // 顶层先取一次目录列表：404 说明用户给的那条远端根本不是目录（多半是个文件）。
+    // 只在这一层把 404 报成"不是目录"——递归里中层目录消失仍按 HTTP 错误原样上抛，
+    // 不会把"子目录拉到一半没了"误报成"顶层远端不是目录"。
+    let entries = list_entries(&host, &remote)
+        .await
+        .map_err(|error| match error {
+            Error::Http { status: 404, .. } => Error::NotADirectory {
+                remote: remote.clone(),
+            },
+            other => other,
+        })?;
+    let stats = pull_entries(&host, &remote, &target, entries).await?;
     eprintln!(
         "lanfile get: {base}/{remote} -> {}（{} 文件，{} 字节，{} 目录）",
         target.display(),
@@ -52,9 +133,11 @@ struct Stats {
     bytes: u64,
 }
 
-fn parse_pull_args(args: &[String]) -> Result<(String, String, PathBuf), BoxError> {
+fn parse_pull_args(args: &[String]) -> Result<(String, String, PathBuf), Error> {
     if args.is_empty() {
-        return Err("用法: lanfile get <base_url> <remote_dir> [local_dir]".into());
+        return Err(Error::Malformed(
+            "用法: lanfile get <base_url> <remote_dir> [local_dir]",
+        ));
     }
     let base = args[0].trim_end_matches('/').to_string();
     let remote = args
@@ -98,28 +181,68 @@ fn basename(remote: &str) -> Option<&str> {
     })
 }
 
-/// 递归拉取 `remote` 目录到 `local`。单文件失败只记一条警告并继续；目录枚举失败才上抛。
-async fn pull_dir(host: &str, remote: &str, local: &Path) -> Result<Stats, BoxError> {
-    let mut stats = Stats::default();
-    let list_path = if remote.is_empty() {
+/// `/api/list` 返回的一条条目。
+///
+/// `type` 缺字段按文件处理（与原先 `unwrap_or("file")` 一致）；`size` 仅文件有，目录为
+/// `None`，用于"本地已存在且尺寸一致就跳过"。
+#[derive(Deserialize)]
+struct RemoteEntry {
+    name: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+    size: Option<u64>,
+}
+
+impl RemoteEntry {
+    fn is_dir(&self) -> bool {
+        self.kind == "dir"
+    }
+}
+
+/// `/api/list` 的响应体：只取 `entries`，其余字段（`path`/`lan_ip`/`port`）客户端用不到。
+#[derive(Deserialize)]
+struct ListResponse {
+    entries: Vec<RemoteEntry>,
+}
+
+/// 递归拉取 `remote` 目录到 `local`：先取这层条目，再逐条落盘。
+async fn pull_dir(host: &str, remote: &str, local: &Path) -> Result<Stats, Error> {
+    let entries = list_entries(host, remote).await?;
+    pull_entries(host, remote, local, entries).await
+}
+
+/// 取一层目录的条目：`GET /api/list[/<remote>]`，正文一次性读全再反序列化。
+async fn list_entries(host: &str, remote: &str) -> Result<Vec<RemoteEntry>, Error> {
+    let path = if remote.is_empty() {
         "/api/list".to_string()
     } else {
         format!("/api/list/{}", encode_path(remote))
     };
-    let value = get_json(host, &list_path).await?;
-    let entries = value["entries"]
-        .as_array()
-        .ok_or("list 响应缺少 entries 数组")?;
+    let mut reader = http_get(host, &path).await?;
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).await?;
+    Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
+}
+
+/// 把一层条目落到 `local`：目录递归，文件逐个抓。单文件失败只记一条警告并继续。
+///
+/// 与 [`list_entries`] 拆开是为了让顶层那一次列表请求的失败（404）能被 [`run`] 捕获、
+/// 转成"远端不是目录"，而不是在这里被当成"递归里某层目录没了"。
+async fn pull_entries(
+    host: &str,
+    remote: &str,
+    local: &Path,
+    entries: Vec<RemoteEntry>,
+) -> Result<Stats, Error> {
+    let mut stats = Stats::default();
     for entry in entries {
-        let name = entry["name"].as_str().ok_or("条目缺少 name")?;
-        let entry_type = entry["type"].as_str().unwrap_or("file");
         let remote_child = if remote.is_empty() {
-            name.to_string()
+            entry.name.clone()
         } else {
-            format!("{remote}/{name}")
+            format!("{remote}/{}", entry.name)
         };
-        let local_child = local.join(name);
-        if entry_type == "dir" {
+        let local_child = local.join(&entry.name);
+        if entry.is_dir() {
             tokio::fs::create_dir_all(&local_child).await?;
             stats.dirs += 1;
             // async 递归必须装箱，否则 future 尺寸无限
@@ -128,7 +251,7 @@ async fn pull_dir(host: &str, remote: &str, local: &Path) -> Result<Stats, BoxEr
             stats.dirs += sub.dirs;
             stats.bytes += sub.bytes;
         } else {
-            let remote_size = entry["size"].as_u64();
+            let remote_size = entry.size;
             if !skip_existing(&local_child, remote_size).await {
                 match fetch_file(host, &remote_child, &local_child).await {
                     Ok(n) => stats.bytes += n,
@@ -142,7 +265,7 @@ async fn pull_dir(host: &str, remote: &str, local: &Path) -> Result<Stats, BoxEr
 }
 
 /// 拉一个文件到 `local`：每请求一条连接，`Connection: close`，正文读到 EOF 落盘。
-async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, BoxError> {
+async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, Error> {
     let path = format!("/pull/{}", encode_path(remote));
     let mut reader = http_get(host, &path).await?;
     let mut file = tokio::fs::File::create(local).await?;
@@ -150,18 +273,15 @@ async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, BoxEr
     Ok(copied)
 }
 
-/// `GET <path>` 取 JSON 正文（目录列表）。
-async fn get_json(host: &str, path: &str) -> Result<Value, BoxError> {
-    let mut reader = http_get(host, path).await?;
-    let mut body = Vec::new();
-    reader.read_to_end(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
-}
-
 /// 建连、写 `GET` 请求、读状态行并跳过响应头；返回可继续读正文的 reader，非 200 报错。
-/// `fetch_file`、`get_json` 共有的请求前置收口于此，避免两处重复。
-async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, BoxError> {
-    let stream = TcpStream::connect(host).await?;
+/// `fetch_file`、`list_entries` 共有的请求前置收口于此，避免两处重复。
+async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, Error> {
+    let stream = TcpStream::connect(host)
+        .await
+        .map_err(|source| Error::Connect {
+            host: host.to_string(),
+            source,
+        })?;
     let _ = stream.set_nodelay(true);
     let (read, mut write) = stream.into_split();
     write
@@ -172,17 +292,20 @@ async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, Bo
     let mut reader = BufReader::new(read);
     let status = read_status(&mut reader).await?;
     if status != 200 {
-        return Err(format!("HTTP {status} 请求 {path}").into());
+        return Err(Error::Http {
+            status,
+            path: path.to_string(),
+        });
     }
     Ok(reader)
 }
 
 /// 读状态行 + 跳过响应头，返回状态码。正文留给调用方接着读。
-async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, BoxError> {
+async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, Error> {
     // 状态行最长也就几十字节，一次给够，免得 `read_line` 中途扩容
     let mut status_line = String::with_capacity(64);
     reader.read_line(&mut status_line).await?;
-    let status = status_code(&status_line).ok_or("状态行格式异常")?;
+    let status = status_code(&status_line).ok_or(Error::Malformed("状态行格式异常"))?;
     // 复用同一个 String 读响应头，免得每行各分配一次。
     let mut line = String::new();
     loop {

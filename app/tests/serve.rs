@@ -852,3 +852,37 @@ async fn get_subcommand_mirrors_a_tree() {
 
     server.abort();
 }
+
+/// `lanfile get` 给一个文件名（而非目录）时，顶层 `/api/list` 返回 404，报错该说清
+/// "远端 `<名字>` 不是目录"，而不是笼统的"HTTP 404 请求 /api/list/<名字>"。
+#[tokio::test]
+async fn get_on_a_file_reports_not_a_directory() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("claude-code.tgz"), "not a dir").unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let base = format!("http://{addr}");
+    let error = lanfile_pull::run(&[base, "claude-code.tgz".into()])
+        .await
+        .unwrap_err();
+    let msg = error.to_string();
+    assert!(
+        msg.contains("不是目录"),
+        "报错该说明\"不是目录\"，实际: {msg}"
+    );
+    assert!(
+        msg.contains("claude-code.tgz"),
+        "报错该带上远端名，实际: {msg}"
+    );
+
+    server.abort();
+}
