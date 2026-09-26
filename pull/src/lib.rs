@@ -267,13 +267,9 @@ fn parse_source(url: &str) -> Result<Source, Error> {
     let host = rest[..host_end].to_string();
     let tail = &rest[host_end..];
     let after = tail.strip_prefix('/').unwrap_or(tail);
-    // 路径到 '?' 或 '#' 为止；两者都是 ASCII 单字节，切点必在 UTF-8 字符边界上。
-    let path_end = after
-        .bytes()
-        .position(|b| b == b'?' || b == b'#')
-        .unwrap_or(after.len());
-    let path = &after[..path_end];
-    let fragment = after[path_end..].strip_prefix('#').unwrap_or("");
+    // `#` 之后是 fragment；路径到 `#` 前的第一个 `?` 为止——`?` 在 `#` 之后时归 fragment。
+    let (head, fragment) = after.split_once('#').unwrap_or((after, ""));
+    let path = head.split_once('?').map_or(head, |(path, _)| path);
     Ok(Source {
         base: format!("http://{host}"),
         host,
@@ -304,9 +300,11 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
             kind: Kind::Dir,
         });
     }
-    // 站内直链 /#<sub>：path 为空（`/`、`/#<sub>`，或没写 `/` 的 `#<sub>`）。
+    // 站内直链 /#<sub>：path 为空（`/`、`/#<sub>`，或没写 `/` 的 `#<sub>`）。`#` 在 `?` 之前时
+    // 用户多写的查询串也算 fragment（`/#sub?x=1`），一并切掉。
     if path.is_empty() {
         let sub = fragment.trim_start_matches('/');
+        let sub = sub.split_once('?').map_or(sub, |(sub, _)| sub);
         if !sub.is_empty() {
             return Some(Direct {
                 remote: percent_decode(sub),
@@ -674,6 +672,23 @@ mod tests {
     fn parse_args_direct_link_strips_query_and_fragment() {
         let p = parse_args(&["http://h:1/files/x.txt?v=1#frag".into()]).unwrap();
         assert_eq!(p.remote, "x.txt");
+    }
+
+    #[test]
+    fn parse_args_fragment_after_query_direct_link_is_dir() {
+        // `?` 在 `#` 之前：`?` 之后是查询串，fragment 仍要认出来。
+        let p = parse_args(&["http://h:1?x=1#filerserve".into()]).unwrap();
+        assert_eq!(p.host, "h:1");
+        assert_eq!(p.remote, "filerserve");
+        assert_eq!(p.kind, Kind::Dir);
+    }
+
+    #[test]
+    fn parse_args_fragment_direct_link_strips_query() {
+        // `#` 在 `?` 之前：查询串随 fragment 一起被切掉。
+        let p = parse_args(&["http://h:1/#filerserve?x=1".into()]).unwrap();
+        assert_eq!(p.remote, "filerserve");
+        assert_eq!(p.kind, Kind::Dir);
     }
 
     #[test]
