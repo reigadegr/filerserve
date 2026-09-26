@@ -249,6 +249,21 @@ mod tests {
 
     use super::*;
 
+    /// 跑 `iters` 次取平均纳秒，先热身 `iters/10` 次；两个基准共用。
+    fn time<R>(iters: u32, f: impl Fn() -> R) -> f64 {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for _ in 0..iters / 10 {
+            black_box(f());
+        }
+        let start = Instant::now();
+        for _ in 0..iters {
+            black_box(f());
+        }
+        start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
+    }
+
     #[test]
     fn parse_pull_args_defaults_local_to_cwd() {
         let (base, remote, local) = parse_pull_args(&["http://h:1".into(), "sub".into()]).unwrap();
@@ -321,25 +336,11 @@ mod tests {
 
     /// 基准：`memchr` 取状态码 vs `split_whitespace().nth(1)`，逐文件都会走一遍。
     ///
-    /// `sh debug.sh` 跑在 `opt-level = 0`，此时 std 是预编译的优化产物而 `memchr` 不是；
-    /// 公平对比要 `cargo +nightly test -Z build-std`。
+    /// `cargo test` 默认跑在 `opt-level = 0`：std 是预编译的优化产物而 `memchr` 不是，
+    /// 那种 profile 下这一项偏向原实现；要看真实差距得加 `--release`。
     #[test]
     #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_status_code() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        fn time(iters: u32, f: impl Fn() -> Option<u16>) -> f64 {
-            for _ in 0..iters / 10 {
-                black_box(f());
-            }
-            let start = Instant::now();
-            for _ in 0..iters {
-                black_box(f());
-            }
-            start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
-        }
-
         for line in ["HTTP/1.1 200 OK\r\n", "HTTP/1.1 404 Not Found\r\n"] {
             let old = || line.split_whitespace().nth(1)?.parse::<u16>().ok();
             assert_eq!(old(), status_code(line), "{line} 取值不一致");
@@ -362,20 +363,6 @@ mod tests {
     #[test]
     #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_basename() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        fn time(iters: u32, f: impl Fn() -> Option<&'static str>) -> f64 {
-            for _ in 0..iters / 10 {
-                black_box(f());
-            }
-            let start = Instant::now();
-            for _ in 0..iters {
-                black_box(f());
-            }
-            start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
-        }
-
         for remote in ["sub", "a/b", "sub/deeper/more/leaf", "sub/deeper/", "///"] {
             // 原实现：去首尾斜杠后为空即 `None`（`///` 走的就是这一支）
             let old = || {

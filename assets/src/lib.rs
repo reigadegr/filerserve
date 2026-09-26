@@ -254,7 +254,7 @@ fn seccomp_filter_installed() -> bool {
 /// `/proc/self/status` 里 `Seccomp:` 为 2 即 `SECCOMP_MODE_FILTER`
 ///
 /// 自己用 `memchr` 扫换行，不走 `lines()`：状态文件约 800 字节，这一遍扫描是整函数的主体，
-/// 优化构建下 `memchr` 的 SIMD 比逐行迭代快约 1.8×（基准见 `bench_has_seccomp_filter`）。
+/// release 下 `memchr` 的 SIMD 比逐行迭代快约 1.3×（基准见 `bench_has_seccomp_filter`）。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn has_seccomp_filter(status: &str) -> bool {
     // 内核生成的状态文件全是 ASCII，`trim_ascii` 与 `trim` 在这里等价
@@ -448,8 +448,8 @@ impl ServeFiles {
 
 /// `/pull` 的 salvo handler：与 `/files` 同构，但走不缓存的 [`ServeFiles::serve_raw`]。
 ///
-/// 自带一个 `ServeFiles`：`/pull` 用不到缓存，多出来的那个空缓存与 root fd 只属于这一份，
-/// 不影响 `/files` 那份。
+/// 自带一个 `ServeFiles`：防穿越的 `openat2` 要用它那份 root fd，而它那份 `FileCache` 一条
+/// 都不插，只多一个空表；两份实例互不影响，`/pull` 下载出来的 fd 也不会挤掉 `/files` 的热文件。
 struct ServeRawFiles {
     files: ServeFiles,
 }
@@ -651,9 +651,8 @@ mod tests {
 
     /// 基准：`memchr` 扫换行 vs `lines()`，输入尺寸对齐真实的 `/proc/self/status`。
     ///
-    /// `sh debug.sh` 跑在 `opt-level = 0`，此时 std 是预编译的优化产物而 `memchr` 不是，
-    /// 这一项在默认测试 profile 下偏向 `lines()`；公平对比要
-    /// `cargo +nightly test -Z build-std`。
+    /// `cargo test` 默认跑在 `opt-level = 0`：std 是预编译的优化产物而 `memchr` 不是，
+    /// 那种 profile 下这一项偏向 `lines()`；要看真实差距得加 `--release`。
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]

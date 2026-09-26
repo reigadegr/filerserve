@@ -226,6 +226,9 @@ impl FileCache {
         shard.clock += 1;
         let clock = shard.clock;
 
+        // 淘汰下来的 `Entry` 先攥着，等出了锁再丢：它那份 `Arc<File>` 很可能就是最后一个
+        // 引用，一丢就要 `close(2)`，不该把这个系统调用放进临界区
+        let mut evicted = None;
         // 一次 `raw_entry_mut` 走完：已存在就就地更新（不分配新 key、不淘汰），
         // 不存在才走淘汰+插入。复用 `hash` 避免再哈希一遍 key。
         match shard
@@ -244,14 +247,13 @@ impl FileCache {
             }
             RawEntryMut::Vacant(_) => {
                 // 满了就淘汰最久没被用到的那条，而不是把整片清空
-                if shard.entries.len() >= CAPACITY_PER_SHARD
-                    && let Some(oldest) = shard
+                if shard.entries.len() >= CAPACITY_PER_SHARD {
+                    evicted = shard
                         .entries
                         .iter()
                         .min_by_key(|(_, entry)| entry.used)
                         .map(|(key, _)| key.clone())
-                {
-                    shard.entries.remove(&oldest);
+                        .and_then(|oldest| shard.entries.remove(&oldest));
                 }
                 let key: Box<str> = path.into();
                 shard.entries.insert(
@@ -267,13 +269,18 @@ impl FileCache {
                 );
             }
         }
+        drop(shard);
+        drop(evicted);
     }
 
     /// 路径已经不存在了，顺手把占着的 fd 放掉。
     pub fn remove(&self, path: &str) {
         let hash = path_hash(path);
         let mut shard = lock(self.shard(hash));
-        shard.entries.remove(path);
+        // 与 `insert` 的淘汰同理：条目带出锁外再丢，`close(2)` 不落在临界区里
+        let dropped = shard.entries.remove(path);
+        drop(shard);
+        drop(dropped);
     }
 
     /// 总条目数，只有测试用得到

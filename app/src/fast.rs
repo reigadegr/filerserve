@@ -307,12 +307,13 @@ mod tests {
 
     /// 基准：前缀匹配各写法的耗时。
     ///
-    /// 常量 needle（`route_mode` 的 `starts_with("/files/")`）：rustc 把常量前缀折成一次
-    /// 直接比较，优化构建下两种写法都在 1 ns 上下，未优化时 `starts_with` 明显更快，
-    /// 所以 `route_mode` 用 `starts_with`。
+    /// `route_mode` 用的是常量 needle 的 `starts_with("/files/")`：rustc 会把常量前缀折成一次
+    /// 直接比较，优化构建下它与 `is_prefix` 都在 1 ns 上下打平，而未优化时 `starts_with` 明显
+    /// 更快，所以 `route_mode` 保持 `starts_with`。`memmem::find` 也在对照里：它要扫完整条路径
+    /// 才能判定"子串不在开头"，慢一个数量级。
     ///
-    /// `sh debug.sh` 跑在 `opt-level = 0`：std 与 libc 都是预编译的优化产物而 `memchr` 不是，
-    /// 打印出来的数会偏向现实现。要看到那个 1.4× 得跑 `cargo test --release`。
+    /// `cargo test` 默认跑在 `opt-level = 0`：std 与 libc 都是预编译的优化产物而 `memchr` 不是，
+    /// 那种 profile 下打印出来的数会偏向现实现，要看真实差距得加 `--release`。
     #[test]
     #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_prefix_match() {
