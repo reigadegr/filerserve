@@ -34,32 +34,50 @@ use crate::{AccessLog, log_access};
 type BoxedFuture =
     Pin<Box<dyn Future<Output = Result<HyperResponse<ResBody>, salvo::hyper::Error>> + Send>>;
 
-/// 剥掉 [`route_mode`] 判过的前缀，去掉开头的斜杠，再按 salvo 的规则解码。
+/// 快路径认的两条端点前缀。
 ///
-/// 调用方必须传 [`route_mode`] 返回的那条前缀。两者看的是同一个 `Uri`——salvo 的
+/// 用枚举而不是 `&'static str`：`sub_path` 剥前缀时只需要一个编译期常量，而 `route_path`
+/// 的匹配天然保证"路由判过的前缀"和"要剥的前缀"是同一个——两者不会再各自看一个字符串。
+#[derive(Copy, Clone)]
+enum Prefix {
+    Files,
+    Pull,
+}
+
+impl Prefix {
+    /// 这条端点要剥掉的前缀。
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Files => "/files/",
+            Self::Pull => "/pull/",
+        }
+    }
+}
+
+/// 剥掉 [`route_path`] 判过的前缀，去掉开头的斜杠，再按 salvo 的规则解码。
+///
+/// 调用方必须传 [`route_path`] 返回的那条前缀。两者看的是同一个 `Uri`——salvo 的
 /// `Request::from_hyper` 把 `uri` 原样搬进 `Request`——所以前缀一定对得上，这里不再自己判一遍。
 /// 切点也由该前缀保证落在字符边界上。
 ///
 /// 末尾带斜杠的请求在 salvo 那边匹配不上（实测 `/files/f.bin/` 是 404），这里用空串表示，
 /// `ServeFiles` 同样会把它判成 404。
-fn sub_path<'a>(path: &'a str, prefix: &'static str) -> Cow<'a, str> {
-    debug_assert!(path.starts_with(prefix), "前缀必须来自 route_mode");
-    let rest = path[prefix.len()..].trim_start_matches('/');
+fn sub_path(path: &str, prefix: Prefix) -> Cow<'_, str> {
+    let rest = path[prefix.as_str().len()..].trim_start_matches('/');
     if rest.ends_with('/') {
         return Cow::Borrowed("");
     }
     decode_url_path(rest)
 }
 
-/// 这条路径归快路径的哪条端点，返回该端点要剥掉的前缀；`None` 表示不归快路径管、交给 salvo。
+/// 这条路径归快路径的哪条端点；`None` 表示不归快路径管、交给 salvo。
 ///
-/// 前缀直接返回给调用方，下面切子路径时就不必再判一次。两条前缀都是编译期常量，
-/// `starts_with` 会被折成一次直接比较（基准见 `bench_prefix_match`）。
-fn route_mode(path: &str) -> Option<&'static str> {
-    if path.starts_with("/files/") {
-        Some("/files/")
-    } else if path.starts_with("/pull/") {
-        Some("/pull/")
+/// 两条前缀都是编译期常量，`starts_with` 会被折成一次直接比较（基准见 `bench_prefix_match`）。
+fn route_path(path: &str) -> Option<Prefix> {
+    if path.starts_with(Prefix::Files.as_str()) {
+        Some(Prefix::Files)
+    } else if path.starts_with(Prefix::Pull.as_str()) {
+        Some(Prefix::Pull)
     } else {
         None
     }
@@ -87,7 +105,7 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
     fn call(&self, req: HyperRequest<Incoming>) -> Self::Future {
         // 分流只判前缀，真正的取值留到下面 `sub_path` 做一次。前缀本身要带进去：
         // 这里已经判过它，`sub_path` 就不必再判一遍
-        let Some(prefix) = route_mode(req.uri().path()) else {
+        let Some(prefix) = route_path(req.uri().path()) else {
             return (self.fallback)(req);
         };
         let files = Arc::clone(&self.files);
@@ -109,10 +127,9 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
                 // 借自 `request`，不再单独分配：`decode_url_path` 在没有 `%` 时就是借用。
                 // 求值放进这个分支里——非 GET/HEAD 只会返回 404，根本用不到子路径
                 let sub = sub_path(request.uri().path(), prefix);
-                if prefix == "/pull/" {
-                    files.serve_raw(&sub, &request, &mut res, Some(&slot)).await;
-                } else {
-                    files.serve(&sub, &request, &mut res, Some(&slot)).await;
+                match prefix {
+                    Prefix::Pull => files.serve_raw(&sub, &request, &mut res, Some(&slot)).await,
+                    Prefix::Files => files.serve(&sub, &request, &mut res, Some(&slot)).await,
                 }
             } else {
                 res.status_code(StatusCode::NOT_FOUND);
@@ -227,26 +244,29 @@ mod tests {
 
     use std::borrow::Cow;
 
-    use super::{route_mode, sub_path};
+    use super::{Prefix, route_path, sub_path};
 
     /// 快路径只认这两条前缀：`/pull` 必须由它自己服务，落到 salvo 就丢了零拷贝与不缓存的收益
     #[test]
-    fn route_mode_claims_files_and_pull_only() {
-        assert_eq!(route_mode("/files/f.bin"), Some("/files/"));
-        assert_eq!(route_mode("/files/sub/g.txt"), Some("/files/"));
-        assert_eq!(route_mode("/pull/f.bin"), Some("/pull/"));
-        assert_eq!(route_mode("/pull/sub/g.txt"), Some("/pull/"));
+    fn route_path_claims_files_and_pull_only() {
+        assert!(matches!(route_path("/files/f.bin"), Some(Prefix::Files)));
+        assert!(matches!(
+            route_path("/files/sub/g.txt"),
+            Some(Prefix::Files)
+        ));
+        assert!(matches!(route_path("/pull/f.bin"), Some(Prefix::Pull)));
+        assert!(matches!(route_path("/pull/sub/g.txt"), Some(Prefix::Pull)));
         // 少一个斜杠或别的路径都不归快路径管
-        assert_eq!(route_mode("/files"), None);
-        assert_eq!(route_mode("/pull"), None);
-        assert_eq!(route_mode("/api/list"), None);
-        assert_eq!(route_mode("/static/x.css"), None);
-        assert_eq!(route_mode("/"), None);
+        assert!(route_path("/files").is_none());
+        assert!(route_path("/pull").is_none());
+        assert!(route_path("/api/list").is_none());
+        assert!(route_path("/static/x.css").is_none());
+        assert!(route_path("/").is_none());
     }
 
     /// 这些取值是拿旧二进制实测出来的：每个用例的注释是它当时的响应。
     ///
-    /// 只喂 [`route_mode`] 认得的路径：前缀由它判过，`sub_path` 自己不再判。
+    /// 只喂 [`route_path`] 认得的路径：前缀由它判过，`sub_path` 自己不再判。
     #[test]
     fn sub_path_matches_the_router() {
         let cases: &[(&str, &str)] = &[
@@ -267,16 +287,16 @@ mod tests {
         ];
         for (path, expected) in cases {
             assert_eq!(
-                &*sub_path(path, "/files/"),
+                &*sub_path(path, Prefix::Files),
                 *expected,
                 "路径 {path} 的子路径取值不对"
             );
         }
     }
 
-    /// `route_mode` 给出的前缀必须正好是 `sub_path` 要剥的那条——两者看的是同一个 `Uri`
+    /// `route_path` 给出的前缀必须正好是 `sub_path` 要剥的那条——两者看的是同一个 `Uri`
     #[test]
-    fn route_mode_prefix_is_what_sub_path_strips() {
+    fn route_path_prefix_is_what_sub_path_strips() {
         let cases = [
             ("/files/f.bin", "f.bin"),
             ("/files/sub/g.txt", "sub/g.txt"),
@@ -284,7 +304,7 @@ mod tests {
             ("/pull/f.bin", "f.bin"),
         ];
         for (path, expected) in cases {
-            let prefix = route_mode(path).unwrap();
+            let prefix = route_path(path).unwrap();
             assert_eq!(&*sub_path(path, prefix), expected, "路径 {path} 的切点不对");
         }
     }
@@ -292,24 +312,27 @@ mod tests {
     /// `/pull` 与 `/files` 共用同一套取值规则，只是前缀不同
     #[test]
     fn pull_sub_path_uses_the_same_rules() {
-        assert_eq!(&*sub_path("/pull/sub/a%20b.txt", "/pull/"), "sub/a b.txt");
-        assert_eq!(&*sub_path("/pull/", "/pull/"), "");
-        assert_eq!(&*sub_path("/pull/f.bin/", "/pull/"), "");
+        assert_eq!(
+            &*sub_path("/pull/sub/a%20b.txt", Prefix::Pull),
+            "sub/a b.txt"
+        );
+        assert_eq!(&*sub_path("/pull/", Prefix::Pull), "");
+        assert_eq!(&*sub_path("/pull/f.bin/", Prefix::Pull), "");
     }
 
     #[test]
     fn sub_path_borrows_when_nothing_is_encoded() {
         assert!(matches!(
-            sub_path("/files/f.bin", "/files/"),
+            sub_path("/files/f.bin", Prefix::Files),
             Cow::Borrowed(_)
         ));
     }
 
     /// 基准：前缀匹配各写法的耗时。
     ///
-    /// `route_mode` 用的是常量 needle 的 `starts_with("/files/")`：rustc 会把常量前缀折成一次
+    /// `route_path` 用的是常量 needle 的 `starts_with("/files/")`：rustc 会把常量前缀折成一次
     /// 直接比较，优化构建下它与 `is_prefix` 都在 1 ns 上下打平，而未优化时 `starts_with` 明显
-    /// 更快，所以 `route_mode` 保持 `starts_with`。`memmem::find` 也在对照里：它要扫完整条路径
+    /// 更快，所以 `route_path` 保持 `starts_with`。`memmem::find` 也在对照里：它要扫完整条路径
     /// 才能判定"子串不在开头"，慢一个数量级。
     ///
     /// `cargo test` 默认跑在 `opt-level = 0`：std 与 libc 都是预编译的优化产物而 `memchr` 不是，
@@ -332,7 +355,7 @@ mod tests {
         }
 
         for path in ["/files/f.bin", "/files/sub/deeper/dir/c.bin"] {
-            // 常量 needle：`route_mode` 的情形
+            // 常量 needle：`route_path` 的情形
             let sw = time(500_000, || path.starts_with("/files/"));
             let ip = time(500_000, || {
                 memchr::arch::all::is_prefix(path.as_bytes(), b"/files/")
