@@ -981,3 +981,47 @@ async fn get_flat_does_not_nest() {
 
     server.abort();
 }
+
+/// 文件夹直链 `http://h/api/zip/<sub>`、`http://h/#<sub>`：当目录整棵拉，落盘语义与
+/// `lanfile get http://h <sub>` 一致（默认套一层）。
+#[tokio::test]
+async fn get_dir_direct_link_pulls_the_tree() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub").join("deeper")).unwrap();
+    std::fs::write(dir.root().join("sub").join("b.txt"), "bbbb").unwrap();
+    std::fs::write(
+        dir.root().join("sub").join("deeper").join("c.bin"),
+        vec![1_u8, 2, 3, 4, 5],
+    )
+    .unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // /api/zip/<sub> 与 /#<sub> 两种写法都要认。
+    for url in [
+        format!("http://{addr}/api/zip/sub"),
+        format!("http://{addr}/#sub"),
+    ] {
+        let dst = TestDir::new();
+        lanfile_pull::run(&[url, dst.root().to_string_lossy().into()])
+            .await
+            .unwrap();
+
+        let mirror = dst.root().join("sub");
+        assert_eq!(std::fs::read(mirror.join("b.txt")).unwrap(), b"bbbb");
+        assert_eq!(
+            std::fs::read(mirror.join("deeper").join("c.bin")).unwrap(),
+            vec![1_u8, 2, 3, 4, 5]
+        );
+    }
+
+    server.abort();
+}

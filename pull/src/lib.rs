@@ -4,7 +4,8 @@
 //! 来源两种：
 //! - 裸 host：`http://h [remote] [local]`——`remote` 缺省拉根；给了名字先试目录，
 //!   `/api/list` 返回 200 当目录拉，404 当单个文件拉；
-//! - 直链：`http://h/files/<sub>`、`http://h/pull/<sub>` 直接连到单个文件。
+//! - 直链：`http://h/files/<sub>`、`http://h/pull/<sub>` 当文件，`http://h/api/zip/<sub>`、
+//!   `http://h/api/list/<sub>`、`http://h/#<sub>` 当目录。
 //!
 //! 只走服务端两个 GET 端点：
 //! - `/api/list/<dir>` 拿到一层目录的条目（name/type/size）；
@@ -98,8 +99,9 @@ impl From<serde_json::Error> for Error {
 /// - 裸 host（`http://h [remote] [local] [--flat]`）：`remote` 缺省即拉根；给了名字则先试
 ///   目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉（对 `lanfile get http://h a.tgz`
 ///   不再因 `/api/list` 404 直接失败，而是改走 `/pull` 把文件拉下来）。
-/// - 直链（`http://h/files/<sub>` 或 `http://h/pull/<sub>`）：直接当文件拉，`<sub>`
-///   即远端相对路径；不给 `local` 则落进当前目录、文件名取末段。
+/// - 直链：`http://h/files/<sub>`、`http://h/pull/<sub>` 当文件，`http://h/api/zip/<sub>`、
+///   `http://h/api/list/<sub>`、`http://h/#<sub>` 当目录；`<sub>` 即远端相对路径，不给
+///   `local` 则落进当前目录（文件取末段为名）。
 ///
 /// 落盘语义对齐 `scp -r`：默认拉目录时在 `local` 下套一层以远端目录名命名的子目录
 /// （`local/dir/`）；`--flat`/`-f` 不套层，目录内容直接落 `local`（恢复 8f8a234 前的默认）。
@@ -107,14 +109,16 @@ impl From<serde_json::Error> for Error {
 /// 当前目录，拉根缺省 `lanfile-root`（避免把整棵 share 散落进当前目录）。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
-    // 直链（文件）直接当文件拉；裸 host 先试目录，`/api/list` 404 再当文件。
-    if p.kind == Kind::File {
-        return run_file(&p).await;
-    }
-    match list_entries(&p.host, &p.remote).await {
-        Ok(entries) => pull_dir_run(&p, entries).await.map_err(Into::into),
-        Err(Error::Http { status: 404, .. }) => run_file(&p).await,
-        Err(e) => Err(e.into()),
+    match p.kind {
+        // 直链已指明 kind：文件直接拉、目录当目录拉。
+        Kind::File => run_file(&p).await,
+        Kind::Dir => run_dir(&p).await,
+        // 裸 host：先试目录，`/api/list` 404 再当文件。
+        Kind::Auto => match list_entries(&p.host, &p.remote).await {
+            Ok(entries) => pull_dir_run(&p, entries).await.map_err(Into::into),
+            Err(Error::Http { status: 404, .. }) => run_file(&p).await,
+            Err(e) => Err(e.into()),
+        },
     }
 }
 
@@ -145,6 +149,8 @@ struct Parsed {
 enum Kind {
     /// 裸 host + 名字：先试目录，404 再当文件。
     Auto,
+    /// `/api/zip/`、`/api/list/`、`/#<sub>` 直链：当目录。
+    Dir,
     /// `/files/`、`/pull/` 直链：直接当文件。
     File,
 }
@@ -158,6 +164,18 @@ async fn run_file(p: &Parsed) -> Result<(), BoxError> {
         .into(),
         e => e.into(),
     })
+}
+
+/// 当目录拉 `/api/list/<remote>`；404 说明远端不是目录。
+async fn run_dir(p: &Parsed) -> Result<(), BoxError> {
+    match list_entries(&p.host, &p.remote).await {
+        Ok(entries) => pull_dir_run(p, entries).await.map_err(Into::into),
+        Err(Error::Http { status: 404, .. }) => Err(Error::NotFound {
+            remote: p.remote.clone(),
+        }
+        .into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// 解析命令行：`<base_url|直链> [remote] [local]`。
@@ -238,34 +256,67 @@ struct Source {
     direct: Option<Direct>,
 }
 
-/// 解析 URL：剥 scheme，分 `host` 与路径，认 `/files/`、`/pull/` 文件直链。
+/// 解析 URL：剥 scheme，分 `host`、路径与 fragment，再交给 [`direct_of`] 认直链。
 fn parse_source(url: &str) -> Result<Source, Error> {
     let rest = url.strip_prefix("http://").ok_or(Error::Malformed(
         "base_url 必须以 http:// 开头（不支持 https）",
     ))?;
-    let (host, after) = rest.split_once('/').unwrap_or((rest, ""));
-    let host = host.to_string();
-    // 路径到 '?' 或 '#' 为止（query 与 fragment 客户端用不到）；两者都是 ASCII 单字节，
-    // 切点必在 UTF-8 字符边界上。
+    // host 到第一个 `/`、`?` 或 `#` 为止——`http://h#frag` 这种没有 `/` 的写法也要切对。
+    let host_end = rest
+        .bytes()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    let host = rest[..host_end].to_string();
+    let tail = &rest[host_end..];
+    let after = tail.strip_prefix('/').unwrap_or(tail);
+    // 路径到 '?' 或 '#' 为止；两者都是 ASCII 单字节，切点必在 UTF-8 字符边界上。
     let path_end = after
         .bytes()
         .position(|b| b == b'?' || b == b'#')
         .unwrap_or(after.len());
     let path = &after[..path_end];
-    // /files/<sub>、/pull/<sub> 直链 → 文件；空 sub（/files/、/pull/）不当直链。
-    let direct = path
-        .strip_prefix("files/")
-        .or_else(|| path.strip_prefix("pull/"))
-        .filter(|sub| !sub.is_empty())
-        .map(|sub| Direct {
-            remote: percent_decode(sub),
-            kind: Kind::File,
-        });
+    let fragment = after[path_end..].strip_prefix('#').unwrap_or("");
     Ok(Source {
         base: format!("http://{host}"),
         host,
-        direct,
+        direct: direct_of(path, fragment),
     })
+}
+
+/// 认直链：`/files/`、`/pull/` 当文件，`/api/zip/`、`/api/list/` 与 `/#<sub>` 当目录；
+/// 都不是则 `None`（裸 host，remote 留给位置参数）。
+fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
+    if let Some(sub) = path
+        .strip_prefix("files/")
+        .or_else(|| path.strip_prefix("pull/"))
+        .filter(|sub| !sub.is_empty())
+    {
+        return Some(Direct {
+            remote: percent_decode(sub),
+            kind: Kind::File,
+        });
+    }
+    if let Some(sub) = path
+        .strip_prefix("api/zip/")
+        .or_else(|| path.strip_prefix("api/list/"))
+        .filter(|sub| !sub.is_empty())
+    {
+        return Some(Direct {
+            remote: percent_decode(sub),
+            kind: Kind::Dir,
+        });
+    }
+    // 站内直链 /#<sub>：path 为空（`/`、`/#<sub>`，或没写 `/` 的 `#<sub>`）。
+    if path.is_empty() {
+        let sub = fragment.trim_start_matches('/');
+        if !sub.is_empty() {
+            return Some(Direct {
+                remote: percent_decode(sub),
+                kind: Kind::Dir,
+            });
+        }
+    }
+    None
 }
 
 /// 百分号解码：把 `%XX` 还原成原字节，用于直链里 URL 编码过的子路径（解码后再交给
@@ -682,6 +733,53 @@ mod tests {
     fn parse_args_no_flat_by_default() {
         let p = parse_args(&["http://h:1".into(), "sub".into(), "./dst".into()]).unwrap();
         assert!(!p.flat);
+    }
+
+    #[test]
+    fn parse_args_zip_direct_link_is_dir() {
+        let p = parse_args(&["http://h:1/api/zip/filerserve".into()]).unwrap();
+        assert_eq!(p.host, "h:1");
+        assert_eq!(p.remote, "filerserve");
+        assert_eq!(p.kind, Kind::Dir);
+        assert_eq!(p.local, PathBuf::from("."));
+    }
+
+    #[test]
+    fn parse_args_list_direct_link_is_dir() {
+        let p = parse_args(&["http://h:1/api/list/a/b".into()]).unwrap();
+        assert_eq!(p.remote, "a/b");
+        assert_eq!(p.kind, Kind::Dir);
+    }
+
+    #[test]
+    fn parse_args_fragment_direct_link_is_dir() {
+        let p = parse_args(&["http://h:1/#filerserve".into()]).unwrap();
+        assert_eq!(p.remote, "filerserve");
+        assert_eq!(p.kind, Kind::Dir);
+        // 不写 `/`、不带路径的 `#<sub>` 同样认
+        let p = parse_args(&["http://h:1#filerserve".into()]).unwrap();
+        assert_eq!(p.remote, "filerserve");
+        assert_eq!(p.kind, Kind::Dir);
+    }
+
+    #[test]
+    fn parse_args_dir_direct_link_explicit_local_and_flat() {
+        let p = parse_args(&[
+            "http://h:1/api/zip/filerserve".into(),
+            "./dst".into(),
+            "--flat".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.local, PathBuf::from("./dst"));
+        assert!(p.flat);
+    }
+
+    #[test]
+    fn parse_args_empty_direct_link_sub_stays_auto() {
+        // /api/zip/、/files/ 这种空 sub 不当直链，仍走裸 host。
+        let p = parse_args(&["http://h:1/api/zip/".into(), "sub".into()]).unwrap();
+        assert_eq!(p.remote, "sub");
+        assert_eq!(p.kind, Kind::Auto);
     }
 
     #[test]
