@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use lanfile_namedfile::{FileMeta, NamedFile};
 use lanfile_sendfile::{SendfileSlot, upgrade_response};
@@ -29,6 +29,11 @@ use file_cache::FileCache;
 #[derive(RustEmbed)]
 #[folder = "static/"]
 pub struct Asset;
+
+/// `/pull` 的类型固定是 `application/octet-stream`：`Arc<Mime>` 只建一次，之后每次请求
+/// 只加一次引用计数，不必每请求都 `Arc::new` 一份（`Mime` 内部是 `String`，那是真的堆分配）。
+static OCTET_STREAM: LazyLock<Arc<Mime>> =
+    LazyLock::new(|| Arc::new(mime::APPLICATION_OCTET_STREAM));
 
 /// 缓存里可以跨请求复用的那一部分：解析好的类型与已经编码好的响应头。
 ///
@@ -71,6 +76,29 @@ type Opened = (Arc<Path>, Arc<File>, FileMeta, Option<Arc<CachedHeaders>>);
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn encoded_last_modified(res: &Response) -> Option<HeaderValue> {
     res.headers().get(LAST_MODIFIED).cloned()
+}
+
+/// 把已经构造好的 [`NamedFile`] 写进响应，需要时升级成 sendfile 零拷贝体。
+///
+/// `HEAD` 与「本平台确实有 sendfile」这两种情况都只写响应头，正文交给 [`upgrade_response`]
+/// 换成零拷贝体；只有没有 sendfile 可用的平台才让 [`NamedFile`] 自己把正文写出来。
+/// `file` 只在真的要升级时才克隆：`/files` 缓存未命中时还需要它去插缓存，所以按引用进来。
+async fn send_named_file(
+    named_file: NamedFile,
+    req: &Request,
+    res: &mut Response,
+    slot: Option<&SendfileSlot>,
+    file: &Arc<File>,
+) {
+    let head_only = req.method() == Method::HEAD;
+    if head_only || (slot.is_some() && cfg!(any(target_os = "linux", target_os = "android"))) {
+        named_file.send_head(req.headers(), res).await;
+    } else {
+        named_file.send(req.headers(), res).await;
+    }
+    if !head_only && let Some(slot) = slot {
+        upgrade_response(slot, res, Arc::clone(file));
+    }
 }
 
 impl ServeFiles {
@@ -298,7 +326,8 @@ impl ServeFiles {
         };
 
         // 关闭 NamedFile 的小文件预读：预读会把内容读进用户态，而 sendfile 直接从页缓存发，
-        // 那次读纯属浪费；关掉后所有响应体都交给 sendfile，HEAD 本来也不需要预读。
+        // 那次读纯属浪费；关掉后 Linux/Android 上的正文都交给 sendfile 零拷贝发，
+        // 其他平台退回 NamedFile 自己的流式响应体，HEAD 本来也不需要预读。
         // 路径走共享的 `Arc<Path>`：命中时它来自缓存，不必每请求再拼一次
         let mut builder = NamedFile::builder_shared(Arc::clone(&path)).preload_threshold(0);
         // 命中时做两件事：类型交给 builder（否则它会自己去 pread 样本嗅探，那是系统调用），
@@ -310,7 +339,7 @@ impl ServeFiles {
         // 绑定上取，不必各自再借一次
         let cached = cached.as_deref();
         if let Some(cached) = cached {
-            builder = builder.content_type(cached.content_type.clone());
+            builder = builder.content_type(Arc::clone(&cached.content_type));
             if let Some(last_modified) = &cached.last_modified {
                 res.headers_mut()
                     .insert(LAST_MODIFIED, last_modified.clone());
@@ -341,15 +370,7 @@ impl ServeFiles {
         // send 会消费掉 named_file，未命中时要写进缓存的那份类型得先取出来
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let resolved_type = cached.is_none().then(|| named_file.content_type());
-        let head_only = req.method() == Method::HEAD;
-        // 有 sendfile 槽位时只写响应头，不构造 ChunkedFile 响应体：
-        // upgrade_response 会立刻用 SendfileBody 替换它，构造了也是丢掉。
-        // 非 Linux/Android 上 arm() 恒返回 None，仍需 send() 留下回退响应体。
-        if head_only || (slot.is_some() && cfg!(any(target_os = "linux", target_os = "android"))) {
-            named_file.send_head(req.headers(), res).await;
-        } else {
-            named_file.send(req.headers(), res).await;
-        }
+        send_named_file(named_file, req, res, slot, &file).await;
 
         // 未命中：编码好的头 `send` 已经写进 `res` 了，直接取回来存缓存，存下来的就是这次
         // 真正发出去的那一份；类型得在 send 之前取，因为 send 会消费掉 named_file
@@ -357,8 +378,8 @@ impl ServeFiles {
         if let Some(content_type) = resolved_type {
             self.cache.insert(
                 sub,
-                Arc::clone(&path),
-                Arc::clone(&file),
+                path,
+                file,
                 metadata,
                 Arc::new(CachedHeaders {
                     content_type,
@@ -367,15 +388,6 @@ impl ServeFiles {
                     disposition: res.headers().get(CONTENT_DISPOSITION).cloned(),
                 }),
             );
-        }
-        if head_only {
-            return;
-        }
-
-        // 满足 sendfile 条件时把响应体换成零拷贝体，否则保持 NamedFile 的普通响应体。
-        // 这里不再 dup：响应体直接共享缓存里那个 fd（sendfile 带显式 offset，共享描述符是安全的）
-        if let Some(slot) = slot {
-            upgrade_response(slot, res, file);
         }
     }
 
@@ -398,7 +410,7 @@ impl ServeFiles {
 
         let mut builder = NamedFile::builder_shared(Arc::clone(&path))
             .preload_threshold(0)
-            .content_type(Arc::new(mime::APPLICATION_OCTET_STREAM))
+            .content_type(Arc::clone(&OCTET_STREAM))
             .use_etag(false)
             .use_last_modified(false);
         // 拉取客户端不保存也不展示，用不到 disposition 的转义与拼接
@@ -410,19 +422,8 @@ impl ServeFiles {
             res.render(StatusError::internal_server_error().brief("read file failed"));
             return;
         };
-        let head_only = req.method() == Method::HEAD;
-        // 与 `/files` 一致：有 sendfile 槽位时只写响应头，响应体交给 upgrade_response 换成零拷贝体
-        if head_only || (slot.is_some() && cfg!(any(target_os = "linux", target_os = "android"))) {
-            named_file.send_head(req.headers(), res).await;
-        } else {
-            named_file.send(req.headers(), res).await;
-        }
-        if head_only {
-            return;
-        }
-        if let Some(slot) = slot {
-            upgrade_response(slot, res, file);
-        }
+        // 与 `/files` 一致：HEAD 与 sendfile 都只写响应头，正文交给 upgrade_response 换成零拷贝体
+        send_named_file(named_file, req, res, slot, &file).await;
     }
 }
 
