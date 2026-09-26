@@ -446,35 +446,14 @@ impl ServeFiles {
     }
 }
 
-/// `/pull` 的 salvo handler：与 `/files` 同构，但走不缓存的 [`ServeFiles::serve_raw`]。
+/// `/`（内嵌的 `index.html`）与 `/static/*`（内嵌资源）这两条 salvo 路由。
 ///
-/// 自带一个 `ServeFiles`：防穿越的 `openat2` 要用它那份 root fd，而它那份 `FileCache` 一条
-/// 都不插，只多一个空表；两份实例互不影响，`/pull` 下载出来的 fd 也不会挤掉 `/files` 的热文件。
-struct ServeRawFiles {
-    files: ServeFiles,
-}
-
-#[handler]
-impl ServeRawFiles {
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        // 与 `/files` 完全相同的分流：非 GET/HEAD 一律 404
-        if req.method() != Method::GET && req.method() != Method::HEAD {
-            res.status_code(StatusCode::NOT_FOUND);
-            return;
-        }
-        let sub = req.params().get("path").map_or("", String::as_str);
-        self.files.serve_raw(sub, req, res, None).await;
-    }
-}
-
+/// `/files/*` 与 `/pull/*` 不在这里登记：它们由 `app` 的 hyper 快路径在 salvo 路由之前
+/// 直接服务掉，salvo 这边永远收不到这两条。原来给它们挂的 salvo 路由只服务于测试、且会
+/// 让人误以为生产里也走 salvo，已移除；需要这两条的测试改走真正的 `serve`（快路径）。
 #[must_use]
-pub fn static_routes(root: PathBuf) -> Router {
+pub fn static_routes() -> Router {
     Router::new()
-        .push(Router::with_path("/files/{**path}").goal(ServeFiles::new(root.clone())))
-        .push(Router::with_path("/pull/{**path}").goal(ServeRawFiles {
-            files: ServeFiles::new(root),
-        }))
         .push(
             Router::new()
                 .filter(filters::get())

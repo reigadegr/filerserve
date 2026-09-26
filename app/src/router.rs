@@ -254,9 +254,7 @@ pub fn build_router(root: PathBuf, port: u16, access_log: Arc<AccessLog>) -> Rou
     } else {
         Router::new().hoop(AccessLogHandler { access_log })
     };
-    router
-        .push(static_routes(root.clone()))
-        .push(list_routes(root, port))
+    router.push(static_routes()).push(list_routes(root, port))
 }
 
 #[cfg(test)]

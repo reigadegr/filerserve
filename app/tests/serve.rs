@@ -157,253 +157,189 @@ async fn api_list_returns_404_for_missing_directory() {
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
 
-// ---- File download tests ----
+// ---- /files 与 /pull：这两条端点由 app 的 hyper 快路径在 salvo 路由之前直接服务 ----
+// 以下测试都起真正的 `serve`（快路径），用裸 TCP 打过去，测的就是生产里真正跑的那条路，
+// 不再经 salvo 路由登记 /files、/pull（生产里 salvo 那边永远收不到这两条）。
 
-#[tokio::test]
-async fn files_endpoint_serves_file() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let mut res = TestClient::get("http://127.0.0.1:5800/files/hello.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    assert_eq!(res.take_string().await.unwrap(), "hello world");
-}
-
-/// 第二次请求同一个文件会走命中缓存的路径：缓存里复用的 `ETag` 与 `Content-Disposition`
-/// 必须与未命中时现算的一模一样，带回这个 `ETag` 再请求也必须仍然是 304
-#[tokio::test]
-async fn files_cache_hit_sends_the_same_headers() {
-    use salvo::http::header::{
-        CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED,
-    };
-
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let url = "http://127.0.0.1:5800/files/hello.txt";
-
-    let missed = TestClient::get(url).send(Arc::clone(&router)).await;
-    assert_eq!(missed.status_code, Some(StatusCode::OK));
-    let hit = TestClient::get(url).send(Arc::clone(&router)).await;
-    assert_eq!(hit.status_code, Some(StatusCode::OK));
-
-    for name in [
-        ETAG,
-        CONTENT_DISPOSITION,
-        CONTENT_TYPE,
-        LAST_MODIFIED,
-        CONTENT_LENGTH,
-    ] {
-        let missed = missed.headers().get(&name);
-        assert!(missed.is_some(), "未命中的响应应当带上 {name}");
-        assert_eq!(
-            missed,
-            hit.headers().get(&name),
-            "命中与未命中的 {name} 必须一致"
-        );
-    }
-
-    let etag = missed.headers().get(ETAG).unwrap().clone();
-    let conditional = TestClient::get(url)
-        .add_header("if-none-match", etag, true)
-        .send(router)
-        .await;
-    assert_eq!(conditional.status_code, Some(StatusCode::NOT_MODIFIED));
-}
-
-#[tokio::test]
-async fn files_endpoint_returns_404_for_missing_file() {
-    let dir = TestDir::new();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::get("http://127.0.0.1:5800/files/nope.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-#[tokio::test]
-async fn files_endpoint_serves_dot_files() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let mut res = TestClient::get("http://127.0.0.1:5800/files/.hidden")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    assert_eq!(res.take_string().await.unwrap(), "secret");
-}
-
-#[tokio::test]
-async fn files_endpoint_serves_hidden_dir_member() {
-    let dir = TestDir::new();
-    std::fs::create_dir_all(dir.root().join(".git")).unwrap();
-    std::fs::write(dir.root().join(".git/config"), "secret-config").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let mut res = TestClient::get("http://127.0.0.1:5800/files/.git/config")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    assert_eq!(res.take_string().await.unwrap(), "secret-config");
-}
-
-#[tokio::test]
-async fn files_endpoint_returns_404_for_directory() {
-    let dir = TestDir::new();
-    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
-    std::fs::write(dir.root().join("sub/inner.txt"), "xyz").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::get("http://127.0.0.1:5800/files/sub")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn files_endpoint_rejects_symlink() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("real.txt"), "real").unwrap();
-    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt")).unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::get("http://127.0.0.1:5800/files/alias.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-#[tokio::test]
-async fn files_endpoint_rejects_path_traversal() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("secret.txt"), "top secret").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::get("http://127.0.0.1:5800/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-#[tokio::test]
-async fn files_endpoint_head_request_succeeds() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::head("http://127.0.0.1:5800/files/hello.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-}
-
-// ---- lanfile get 用的 /pull 端点 ----
-
-/// `/pull` 是给 `lanfile get` 的一次性拉取端点：正文与 `/files` 一致，但类型固定成
-/// `application/octet-stream`，且不编码拉取端根本不看的 `ETag`、`Last-Modified` 与 `Content-Disposition`
-#[tokio::test]
-async fn pull_endpoint_serves_file_with_lean_headers() {
-    use salvo::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, ETAG, LAST_MODIFIED};
-
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let mut res = TestClient::get("http://127.0.0.1:5800/pull/hello.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-    assert_eq!(
-        res.headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()),
-        Some("application/octet-stream"),
-        "类型固定成 octet-stream，省掉建响应体时那次嗅探 pread"
-    );
-    for name in [ETAG, LAST_MODIFIED, CONTENT_DISPOSITION] {
-        assert!(res.headers().get(&name).is_none(), "/pull 不该编码 {name}");
-    }
-    assert_eq!(res.take_string().await.unwrap(), "hello world");
-}
-
-/// `/pull` 与 `/files` 共用同一套路径校验：目录、缺失文件、穿越、符号链接都必须 404
-#[tokio::test]
-async fn pull_endpoint_rejects_what_files_rejects() {
-    let dir = TestDir::new();
-    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
-    std::fs::write(dir.root().join("sub/inner.txt"), "xyz").unwrap();
-    std::fs::write(dir.root().join("real.txt"), "real").unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt")).unwrap();
-
-    let router = api_router(dir.root().to_path_buf());
-    let mut paths = vec![
-        "/pull/sub",
-        "/pull/nope.txt",
-        "/pull/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
-    ];
-    #[cfg(unix)]
-    paths.push("/pull/alias.txt");
-
-    for path in paths {
-        let res = TestClient::get(format!("http://127.0.0.1:5800{path}"))
-            .send(Arc::clone(&router))
-            .await;
-        assert_eq!(
-            res.status_code,
-            Some(StatusCode::NOT_FOUND),
-            "{path} 应当 404"
-        );
-    }
-}
-
-#[tokio::test]
-async fn pull_endpoint_head_request_succeeds() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::head("http://127.0.0.1:5800/pull/hello.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::OK));
-}
-
-/// 非 GET/HEAD 与 `/files` 一样是 404
-#[tokio::test]
-async fn pull_endpoint_rejects_post() {
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::post("http://127.0.0.1:5800/pull/hello.txt")
-        .send(router)
-        .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
-}
-
-// ---- Real TCP download test ----
-
-#[tokio::test]
-async fn serves_over_real_tcp() {
+/// 发一条任意方法/路径的请求，靠 `Connection: close` 收到 EOF 为止，再切成响应头与正文。
+/// 这样 HEAD（无正文）、304（无正文）、普通 GET 都用同一套读法，不必各自猜正文长度。
+async fn http_request(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    extra: &str,
+) -> (String, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let dir = TestDir::new();
-    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
-    let router = api_router(dir.root().to_path_buf());
-    let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
-    let addr = acceptor.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        Server::new(acceptor).serve(router).await;
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream
-        .write_all(b"GET /files/hello.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
         .await
         .unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
-    let text = String::from_utf8_lossy(&buf);
-    assert!(text.starts_with("HTTP/1.1 200"), "response: {text}");
-    assert!(text.contains("hello world"));
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+    let body = buf.get(split + 4..).unwrap_or(&[]).to_vec();
+    (head, body)
+}
+
+/// 响应头里的状态行（第一行）。
+fn status_line(head: &str) -> &str {
+    head.split("\r\n").next().unwrap_or(head)
+}
+
+/// 响应头里某个字段的值（名字大小写不敏感）。
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(n, _)| n.trim().eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.trim())
+}
+
+/// `/files` 走快路径：点文件、隐藏目录里的成员照常服务，HEAD 与 GET 同状态码但不带正文。
+#[tokio::test]
+async fn files_endpoint_serves_special_names() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join(".hidden"), "secret").unwrap();
+    std::fs::create_dir_all(dir.root().join(".git")).unwrap();
+    std::fs::write(dir.root().join(".git/config"), "secret-config").unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let (head, body) = http_request(addr, "GET", "/files/.hidden", "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"secret");
+
+    let (head, body) = http_request(addr, "GET", "/files/.git/config", "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"secret-config");
+
+    let (head, body) = http_request(addr, "HEAD", "/files/.hidden", "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.is_empty(), "HEAD 不该写出正文");
+
+    server.abort();
+}
+
+/// `/files` 走快路径：缺失文件、目录、路径穿越、符号链接一律 404；非 GET/HEAD 也是 404。
+#[tokio::test]
+async fn files_endpoint_rejects_invalid_paths() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub/inner.txt"), "xyz").unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::write(dir.root().join("real.txt"), "real").unwrap();
+        std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt"))
+            .unwrap();
+    }
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let mut paths = vec![
+        "/files/nope.txt",
+        "/files/sub",
+        "/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    ];
+    #[cfg(unix)]
+    paths.push("/files/alias.txt");
+
+    for path in paths {
+        let (head, _) = http_request(addr, "GET", path, "").await;
+        assert!(
+            status_line(&head).starts_with("HTTP/1.1 404"),
+            "{path} 应当 404：{head}"
+        );
+    }
+
+    let (head, _) = http_request(addr, "POST", "/files/sub/inner.txt", "").await;
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 404"),
+        "POST 应当 404：{head}"
+    );
+
+    server.abort();
+}
+
+/// `/pull` 走快路径：正文与 `/files` 一致，但类型固定 `application/octet-stream`，且不编码
+/// `ETag`、`Last-Modified`、`Content-Disposition`；HEAD 同 GET 状态码；缺失文件 404。
+#[tokio::test]
+async fn pull_endpoint_serves_file_with_lean_headers() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let (head, body) = http_request(addr, "GET", "/pull/hello.txt", "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        header(&head, "content-type"),
+        Some("application/octet-stream"),
+        "/pull 类型固定成 octet-stream，省掉建响应体时那次嗅探 pread：{head}"
+    );
+    for name in ["etag", "last-modified", "content-disposition"] {
+        assert!(
+            header(&head, name).is_none(),
+            "/pull 不该编码 {name}：{head}"
+        );
+    }
+    assert_eq!(body, b"hello world");
+
+    let (head, body) = http_request(addr, "HEAD", "/pull/hello.txt", "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.is_empty(), "HEAD 不该写出正文");
+
+    let (head, _) = http_request(addr, "GET", "/pull/nope.txt", "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 404"), "{head}");
+
+    server.abort();
+}
+
+/// 第二次请求同一个文件会走命中缓存的路径：缓存里复用的 `ETag` 等头必须与未命中时现算的
+/// 一模一样，带回这个 `ETag` 再请求也必须仍然是 304。
+#[tokio::test]
+async fn files_cache_hit_sends_the_same_headers() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("hello.txt"), "hello world").unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let (missed, _) = http_request(addr, "GET", "/files/hello.txt", "").await;
+    assert!(status_line(&missed).starts_with("HTTP/1.1 200"), "{missed}");
+    let (hit, _) = http_request(addr, "GET", "/files/hello.txt", "").await;
+    assert!(status_line(&hit).starts_with("HTTP/1.1 200"), "{hit}");
+    for name in [
+        "etag",
+        "content-disposition",
+        "content-type",
+        "last-modified",
+        "content-length",
+    ] {
+        let missed_header = header(&missed, name);
+        assert!(missed_header.is_some(), "未命中也应当带上 {name}：{missed}");
+        assert_eq!(
+            missed_header,
+            header(&hit, name),
+            "命中与未命中的 {name} 必须一致"
+        );
+    }
+
+    let etag = header(&missed, "etag").unwrap();
+    let (head, body) = http_request(
+        addr,
+        "GET",
+        "/files/hello.txt",
+        &format!("If-None-Match: {etag}\r\n"),
+    )
+    .await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 304"), "{head}");
+    assert!(body.is_empty(), "304 不该有正文");
 
     server.abort();
 }
