@@ -1,10 +1,10 @@
 //! HTTP/1.1 keep-alive 传输层：一条可复用的 TCP 连接上跑 `GET`，读状态行与响应头，
-//! 按 `Content-Length` 给正文定界（见 [`copy_body`]）。连接池 [`Pool`] 收口借/还，
+//! 正文由调用方按 `Content-Length` 读完。连接池 [`Pool`] 收口借/还，
 //! [`http_get`] 收口"复用的连接被对端悄悄关掉时换新重试一次"。
 
 use crate::error::Error;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 /// 建连超时：远端在约定时间内没握上手就别耗着。
@@ -18,14 +18,10 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// 正文搬运的缓冲区。开大一点，读的次数与定时器条目就跟着少。
-const COPY_BUF: usize = 64 * 1024;
-
 /// 一条可复用的 HTTP/1.1 keep-alive 连接。顺序拉取只用一条：每请求省掉一次三次握手与慢启动。
 ///
 /// 正文按 `Content-Length` 精确读满后由调用方 [`Pool::release`] 归还，下一请求 [`Pool::acquire`]
-/// 直接拿来用；读取出错、读不满声明的长度、或响应不带 `Content-Length`（见
-/// `crate::fetch::NO_CONTENT_LENGTH`）都不归还，连接随之关闭。
+/// 直接拿来用；读取出错、读不满声明的长度、或响应不带 `Content-Length` 都不归还，连接随之关闭。
 #[derive(Default)]
 pub struct Pool {
     conn: Option<BufReader<TcpStream>>,
@@ -170,41 +166,6 @@ fn status_code(line: &str) -> Option<u16> {
         .position(u8::is_ascii_whitespace)
         .unwrap_or(token.len());
     std::str::from_utf8(&token[..end]).ok()?.parse().ok()
-}
-
-/// 把正文读进 `file` 并落盘，返回落盘字节数。
-///
-/// `max` 是响应声明的 `Content-Length`，每次只读到「还差多少」为止，读满即停——读多一个
-/// 字节就会把下一条响应的开头吃进缓冲，连接就没法复用了；它同时也是完整性的停止条件，
-/// 读不满即截断（由调用方拿返回的字节数判定）。每次读取都套一个空闲超时——服务器接上却
-/// 半路哑掉（既不回数据也不断连）时不能把客户端挂死。不用 `tokio::io::copy` 是因为它没有
-/// 这个挂点；而在外面套一个 `timeout` 又会连总时长一起限住，大文件在慢链路上会被误杀。
-pub async fn copy_body(
-    reader: &mut BufReader<TcpStream>,
-    file: &mut tokio::fs::File,
-    max: u64,
-) -> Result<u64, Error> {
-    let mut buf = vec![0_u8; COPY_BUF];
-    let mut total = 0_u64;
-    loop {
-        let want = buf.len().min((max - total) as usize);
-        if want == 0 {
-            break;
-        }
-        let read = tokio::time::timeout(READ_TIMEOUT, reader.read(&mut buf[..want]))
-            .await
-            .map_err(|_| Error::Timeout {
-                phase: "读取正文"
-            })??;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buf[..read]).await?;
-        total += read as u64;
-    }
-    // 攒在 tokio 文件写缓冲里的尾巴要先落下去，外面的长度校验才算数
-    file.flush().await?;
-    Ok(total)
 }
 
 #[cfg(test)]

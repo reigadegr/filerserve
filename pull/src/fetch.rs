@@ -3,15 +3,19 @@
 //! 读满的连接归还池子复用；读不满即截断，连接丢弃。
 
 use crate::error::Error;
-use crate::http::{Pool, READ_TIMEOUT, copy_body, http_get};
+use crate::http::{Pool, READ_TIMEOUT, http_get};
 use serde::Deserialize;
-use std::path::Path;
-use tokio::io::AsyncReadExt;
+use std::io::{self, Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncReadExt as _, BufReader};
+
+/// 每块搬运的字节数：一次同步 `read` + 一次同步 `write` 处理这么多，够摊薄系统调用。
+const COPY_BUF: usize = 64 * 1024;
 
 /// 响应没带 `Content-Length` 时的报错：正文边界无从得知，当场说清，不猜长度。
 ///
 /// 这里不能退化成读到 EOF——请求不带 `Connection: close`，对端不会关连接，`read_to_end`
-/// 只会空等到 `READ_TIMEOUT` 再报超时，还不如当场把话说清。`/api/list`（salvo 的 `Json`）
+/// 只会空等到 `READ_TIMEOUT` 再报超时，还不如当场把话说清楚。`/api/list`（salvo 的 `Json`）
 /// 与 `/pull`（`NamedFile`）都带长度，所以正常走不到这一支。
 const NO_CONTENT_LENGTH: &str = "响应没有 Content-Length，无法确定正文边界";
 
@@ -85,18 +89,23 @@ pub async fn fetch_file(
     local: &Path,
 ) -> Result<u64, Error> {
     let path = format!("/pull/{}", encode_path(remote));
-    let (mut reader, declared) = http_get(pool, host, &path).await?;
+    let (reader, declared) = http_get(pool, host, &path).await?;
     let want = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
-    let mut file = tokio::fs::File::create(local).await?;
-    let copied = match copy_body(&mut reader, &mut file, want).await {
-        Ok(copied) => copied,
+
+    // `BufReader::into_inner` 会丢弃内部缓冲里已预读的字节，而读响应头时它通常已经
+    // 预读了正文开头；先复制出来交给阻塞线程，避免丢掉正文的前几个字节。
+    let buffered = reader.buffer().to_vec();
+    let stream = reader.into_inner();
+
+    let (copied, stream) = match copy_in_blocking(stream, buffered, local.to_path_buf(), want).await
+    {
+        Ok(pair) => pair,
         Err(error) => {
             discard(local).await;
             return Err(error);
         }
     };
-    // 只有读满声明的长度、连接干净才归还：读多一个字节会把下一条响应的开头吃进缓冲，
-    // 读不满即传输不完整，两种情况都不能复用。
+
     if copied != want {
         discard(local).await;
         return Err(Error::Truncated {
@@ -105,8 +114,90 @@ pub async fn fetch_file(
             got: copied,
         });
     }
-    pool.release(reader);
+    // 把 socket 切回异步、包回 `BufReader` 归还复用。
+    let stream = tokio::net::TcpStream::from_std(stream)?;
+    pool.release(BufReader::new(stream));
     Ok(copied)
+}
+
+/// 在阻塞线程里把正文从 socket 搬进文件，返回落盘字节数与归还的 socket。
+///
+/// 读 socket 与写文件都在同一个阻塞线程里用同步 IO 完成：tokio 的 `fs::File` 每次
+/// `write` 都要把缓冲搬到 blocking pool，异步 socket 每次 `read` 都要过一遍 reactor
+/// 并在 waker 上注册一次；大文件连续传输时这两笔每块固定开销会累加到明显可观的 CPU
+/// 占用。整个循环收进一个 blocking 线程后，一次文件传输只跨线程两次（进、出），其余
+/// 全是同步系统调用与一次 `recv`。
+///
+/// `buffered` 是 `BufReader` 预读出来、还没被消耗的正文开头；`into_inner` 会把它丢掉，
+/// 所以由调用方先取出来，这里负责先落盘再接着读。
+async fn copy_in_blocking(
+    stream: tokio::net::TcpStream,
+    buffered: Vec<u8>,
+    target: PathBuf,
+    want: u64,
+) -> Result<(u64, std::net::TcpStream), Error> {
+    tokio::task::spawn_blocking(move || {
+        // `into_std` 只把 fd 转回 std，不改变阻塞模式；tokio 的 socket 是非阻塞的，
+        // 要做同步读就得先切回阻塞。
+        let mut stream = stream.into_std()?;
+        stream.set_nonblocking(false)?;
+        let copied = copy_sync(&mut stream, &buffered, &target, want)?;
+        // 交还前切回非阻塞，否则 `from_std` 之后 reactor 会在错误的前提上注册 fd。
+        stream.set_nonblocking(true)?;
+        Ok::<_, Error>((copied, stream))
+    })
+    .await
+    .map_err(|join| Error::Io(io::Error::other(join)))?
+}
+
+/// 同步地把正文搬进文件：读满 `want` 字节即停，或用完 socket 上的数据即停。
+///
+/// 读满是因为对端声明了 `Content-Length`，读多一个字节会把下一条响应的开头吃进缓冲；
+/// 读不满则由调用方按截断处理。每次 `read` 都套一个 `READ_TIMEOUT` 的空闲超时（由
+/// `set_read_timeout` 实现），服务器接上却半路哑掉时不会把阻塞线程挂住。
+fn copy_sync(
+    stream: &mut std::net::TcpStream,
+    buffered: &[u8],
+    target: &Path,
+    want: u64,
+) -> Result<u64, Error> {
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    let mut file = std::fs::File::create(target)?;
+    let mut total = 0_u64;
+
+    // `BufReader` 预读出来的正文开头先落盘。对端若发多了（超过 `Content-Length`），
+    // 多出的字节已经在 `BufReader` 里被吞掉，这里截到 `want` 就不会误当正文写下去。
+    let take = buffered.len().min(want as usize);
+    if take > 0 {
+        file.write_all(&buffered[..take])?;
+        total = take as u64;
+    }
+
+    let mut buf = vec![0_u8; COPY_BUF];
+    while total < want {
+        let room = (want - total).min(buf.len() as u64) as usize;
+        let read = match stream.read(&mut buf[..room]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // `set_read_timeout` 超时后 `read` 报 `WouldBlock`（Linux）或
+            // `TimedOut`（部分平台），两种都当作读超时。
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(Error::Timeout {
+                    phase: "读取正文"
+                });
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        file.write_all(&buf[..read])?;
+        total += read as u64;
+    }
+    file.flush()?;
+    Ok(total)
 }
 
 /// 删掉没写完整的本地文件。删不掉也不覆盖真正的错误，只在 stderr 上留一句。
@@ -186,6 +277,9 @@ mod tests {
     /// 两个文件走同一条 keep-alive 连接：服务端只 accept 一次，第二条请求复用第一条归还的连接。
     /// 正文按 `Content-Length` 精确读满即停，读多的一个字节会把下一条响应的开头吃掉——这条
     /// 测试盯住「读满即止」与「归还复用」两件事同时成立。
+    ///
+    /// `BufReader` 在读响应头时通常已经预读了正文开头：这条测试的响应头与正文都很短，
+    /// 恰好把 `into_inner` 丢缓冲这个坑踩在路径上（正文 3 字节，一定落在 `BufReader` 的预读里）。
     #[tokio::test]
     async fn fetch_file_reuses_one_connection_across_files() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
