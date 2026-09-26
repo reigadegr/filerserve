@@ -14,7 +14,7 @@
 //!
 //! v1 顺序拉取：一个文件一个文件、每请求一条 TCP 连接（`Connection: close`，
 //! 读到 EOF 即整段正文，连 `Content-Length` 都不用解析）。结构上每个文件的抓取收口在
-//! [`fetch_file`]、目录枚举收口在 [`pull_dir`]，未来要做有限并发时把它们解耦、对文件
+//! [`fetch_file`]、目录枚举收口在 [`list_entries`]，未来要做有限并发时把它们解耦、对文件
 //! 任务套一层 `buffer_unordered` 即可，不必重写本模块。
 
 use std::{
@@ -93,6 +93,9 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+/// 用法串：直链与裸 host 两种源共用同一个尾部（可选 `local_dir` 与 `--flat`）。
+const USAGE: &str = "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]";
+
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
 /// 两种来源：
@@ -112,13 +115,9 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     match p.kind {
         // 直链已指明 kind：文件直接拉、目录当目录拉。
         Kind::File => run_file(&p).await,
-        Kind::Dir => run_dir(&p).await,
+        Kind::Dir => run_dir(&p, false).await,
         // 裸 host：先试目录，`/api/list` 404 再当文件。
-        Kind::Auto => match list_entries(&p.host, &p.remote).await {
-            Ok(entries) => pull_dir_run(&p, entries).await.map_err(Into::into),
-            Err(Error::Http { status: 404, .. }) => run_file(&p).await,
-            Err(e) => Err(e.into()),
-        },
+        Kind::Auto => run_dir(&p, true).await,
     }
 }
 
@@ -155,57 +154,56 @@ enum Kind {
     File,
 }
 
-/// 当文件拉 `/pull/<remote>`；`/pull` 也 404 说明远端既不是目录也不是文件。
-async fn run_file(p: &Parsed) -> Result<(), BoxError> {
-    pull_file_run(p).await.map_err(|e| match e {
+/// 把 404 转成"远端不存在"；其他错误原样返回。
+///
+/// `/api/list` 与 `/pull` 都用 404 表示"这条远端路径不存在"，目录探测与单文件拉取两处
+/// 都需要做同一个转换，所以收在这里。
+fn to_not_found(error: Error, remote: &str) -> Error {
+    match error {
         Error::Http { status: 404, .. } => Error::NotFound {
-            remote: p.remote.clone(),
-        }
-        .into(),
-        e => e.into(),
-    })
+            remote: remote.to_string(),
+        },
+        other => other,
+    }
 }
 
-/// 当目录拉 `/api/list/<remote>`；404 说明远端不是目录。
-async fn run_dir(p: &Parsed) -> Result<(), BoxError> {
+/// 当文件拉 `/pull/<remote>`；404 统一转成「远端不存在」（裸 host 探测到这一步即目录与文件都不是）。
+async fn run_file(p: &Parsed) -> Result<(), BoxError> {
+    pull_file_run(p)
+        .await
+        .map_err(|error| to_not_found(error, &p.remote).into())
+}
+
+/// 当目录拉 `/api/list/<remote>`；404 时按 `fallback_file` 决定下一步：
+/// - `true`（裸 host）：改走 `/pull` 试单个文件；
+/// - `false`（目录直链）：URL 已经说清楚是目录，直接报"远端不存在"。
+async fn run_dir(p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
     match list_entries(&p.host, &p.remote).await {
         Ok(entries) => pull_dir_run(p, entries).await.map_err(Into::into),
-        Err(Error::Http { status: 404, .. }) => Err(Error::NotFound {
-            remote: p.remote.clone(),
-        }
-        .into()),
-        Err(e) => Err(e.into()),
+        Err(Error::Http { status: 404, .. }) if fallback_file => run_file(p).await,
+        Err(error) => Err(to_not_found(error, &p.remote).into()),
     }
 }
 
-/// 解析命令行：`<base_url|直链> [remote] [local]`。
+/// 解析命令行：`<base_url|直链> [remote] [local] [--flat]`。
 fn parse_args(args: &[String]) -> Result<Parsed, Error> {
     if args.is_empty() {
-        return Err(Error::Malformed(
-            "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]",
-        ));
+        return Err(Error::Malformed(USAGE));
     }
     let src = parse_source(&args[0])?;
-    let trailing = args.get(1..).unwrap_or(&[]);
-    let (pos, flat) = parse_trailing(trailing);
+    let (pos, flat) = parse_trailing(&args[1..]);
     let (remote, kind, local) = if let Some(direct) = src.direct {
         // 直链：remote 已在 URL 里指明，后面只剩可选 local 与 flag。
         let local = match pos {
             [] => None,
             [s] => Some(PathBuf::from(s)),
-            _ => {
-                return Err(Error::Malformed(
-                    "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]",
-                ));
-            }
+            _ => return Err(Error::Malformed(USAGE)),
         };
         (direct.remote, direct.kind, local)
     } else {
-        // 裸 host：[remote] [local] [flag]；remote 缺省即拉根。
+        // 裸 host：[remote] [local]；remote 缺省即拉根。
         if pos.len() > 2 {
-            return Err(Error::Malformed(
-                "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]",
-            ));
+            return Err(Error::Malformed(USAGE));
         }
         let remote = pos
             .first()
@@ -452,8 +450,8 @@ async fn list_entries(host: &str, remote: &str) -> Result<Vec<RemoteEntry>, Erro
 
 /// 把一层条目落到 `local`：目录递归，文件逐个抓。单文件失败只记一条警告并继续。
 ///
-/// 与 [`list_entries`] 拆开是为了让顶层那一次列表请求的失败（404）能被 [`run`] 捕获、
-/// 转成"远端不是目录"，而不是在这里被当成"递归里某层目录没了"。
+/// 与 [`list_entries`] 拆开是为了让顶层那一次列表请求的失败（404）能被 [`run_dir`] 捕获、
+/// 转成"远端不存在"，而不是在这里被当成"递归里某层目录没了"。
 async fn pull_entries(
     host: &str,
     remote: &str,
