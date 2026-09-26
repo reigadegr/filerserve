@@ -1063,3 +1063,54 @@ async fn get_path_only_url_pulls_that_subtree_not_the_root() {
 
     server.abort();
 }
+
+/// 大文件必须整段落盘。
+///
+/// 回归用：客户端原来把 `TcpStream` `into_split`，写半边在请求发完后就出作用域，
+/// `OwnedWriteHalf::drop` 会 `shutdown(Write)`。服务端走的 salvo/hyper 默认
+/// `half_close = false`，读到这个 EOF 会判定连接中断、丢掉还在飞的响应，
+/// 于是 29MB 的文件只落下 3.75MB。两条路径共用 `fetch_file`，一起盯住。
+#[tokio::test]
+async fn get_large_file_is_not_truncated() {
+    let payload: Vec<u8> = (0_u8..=250).cycle().take(8 * 1024 * 1024).collect();
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
+    std::fs::write(dir.root().join("sub").join("big.bin"), &payload).unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 单文件直链
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        format!("http://{addr}/files/big.bin"),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap();
+    let got = std::fs::read(dst.root().join("big.bin")).unwrap();
+    assert_eq!(got.len(), payload.len(), "单文件落盘长度不对");
+    assert!(got == payload, "单文件内容不一致");
+
+    // 目录递归（用户报的那条路径）
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        format!("http://{addr}/api/zip/sub"),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap();
+    let got = std::fs::read(dst.root().join("sub").join("big.bin")).unwrap();
+    assert_eq!(got.len(), payload.len(), "递归落盘长度不对");
+    assert!(got == payload, "递归内容不一致");
+
+    server.abort();
+}

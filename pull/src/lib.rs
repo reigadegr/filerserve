@@ -25,7 +25,7 @@ use std::{
 
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, tcp::OwnedReadHalf};
+use tokio::net::TcpStream;
 
 /// 简化错误类型：一个能跨线程的 boxed error，`run` 的出口用它收口内部各处错误。
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -513,21 +513,25 @@ async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, Error
 
 /// 建连、写 `GET` 请求、读状态行并跳过响应头；返回可继续读正文的 reader，非 200 报错。
 /// `fetch_file`、`list_entries` 共有的请求前置收口于此，避免两处重复。
-async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, Error> {
-    let stream = TcpStream::connect(host)
+///
+/// 建连后整条 `TcpStream` 直接交给 reader，**不做 `into_split`**：那样写半边会在请求发完
+/// 后出作用域，`OwnedWriteHalf::drop` 顺手 `shutdown(Write)`，而这个提前的 half-close 会让
+/// 服务端（salvo/hyper 的 `http1` 默认 `half_close = false`）在读到 EOF 时判定连接中断、
+/// 丢掉还在飞的响应——几十 MB 的文件就只落下几 MB。标准客户端（curl、浏览器）也不 half-close。
+async fn http_get(host: &str, path: &str) -> Result<BufReader<TcpStream>, Error> {
+    let mut stream = TcpStream::connect(host)
         .await
         .map_err(|source| Error::Connect {
             host: host.to_string(),
             source,
         })?;
     let _ = stream.set_nodelay(true);
-    let (read, mut write) = stream.into_split();
-    write
+    stream
         .write_all(
             format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
         )
         .await?;
-    let mut reader = BufReader::new(read);
+    let mut reader = BufReader::new(stream);
     let status = read_status(&mut reader).await?;
     if status != 200 {
         return Err(Error::Http {
@@ -539,7 +543,7 @@ async fn http_get(host: &str, path: &str) -> Result<BufReader<OwnedReadHalf>, Er
 }
 
 /// 读状态行 + 跳过响应头，返回状态码。正文留给调用方接着读。
-async fn read_status(reader: &mut BufReader<OwnedReadHalf>) -> Result<u16, Error> {
+async fn read_status(reader: &mut BufReader<TcpStream>) -> Result<u16, Error> {
     // 状态行最长也就几十字节，一次给够，免得 `read_line` 中途扩容
     let mut status_line = String::with_capacity(64);
     reader.read_line(&mut status_line).await?;
