@@ -91,7 +91,7 @@ struct StackWriter<'a> {
 }
 
 impl StackWriter<'_> {
-    fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+    fn push(&mut self, bytes: &[u8]) -> bool {
         let end = self.len + bytes.len();
         if end > self.out.len() {
             return false;
@@ -99,10 +99,6 @@ impl StackWriter<'_> {
         self.out[self.len..end].copy_from_slice(bytes);
         self.len = end;
         true
-    }
-
-    fn push_str(&mut self, text: &str) -> bool {
-        self.push_bytes(text.as_bytes())
     }
 
     const fn push_byte(&mut self, byte: u8) -> bool {
@@ -115,6 +111,9 @@ impl StackWriter<'_> {
     }
 
     /// 十进制无符号整数，不经过 `fmt`。
+    ///
+    /// 用后置判零的 `loop` 而不是 `while value > 0`：后者遇到 `0` 会一位都不写、
+    /// 输出空串，而这个函数至少要写出一位数字（`status` 与 IPv4 八位组都可能为 0）。
     fn push_uint(&mut self, mut value: u32) -> bool {
         let mut digits = [0_u8; 10];
         let mut at = digits.len();
@@ -126,7 +125,7 @@ impl StackWriter<'_> {
                 break;
             }
         }
-        self.push_bytes(&digits[at..])
+        self.push(&digits[at..])
     }
 }
 
@@ -135,10 +134,10 @@ impl StackWriter<'_> {
 /// IPv6 的 RFC 5952 压缩不值得手写，遇到就返回 `false` 让整行走慢路径。
 fn push_ip(out: &mut StackWriter<'_>, ip: Option<IpAddr>) -> bool {
     match ip {
-        None => out.push_str("None"),
+        None => out.push(b"None"),
         Some(IpAddr::V4(addr)) => {
             let octets = addr.octets();
-            out.push_str("Some(")
+            out.push(b"Some(")
                 && out.push_uint(u32::from(octets[0]))
                 && out.push_byte(b'.')
                 && out.push_uint(u32::from(octets[1]))
@@ -162,7 +161,7 @@ fn push_version(out: &mut StackWriter<'_>, version: Version) -> bool {
         Version::HTTP_3 => "HTTP/3.0",
         _ => return false, // 未知版本退回慢路径
     };
-    out.push_str(text)
+    out.push(text.as_bytes())
 }
 
 /// 直写快路径：把整行（含时间戳）直接拼进定长缓冲，绕开 `fmt::Formatter` 的逐字段分发。
@@ -171,21 +170,21 @@ fn push_version(out: &mut StackWriter<'_>, version: Version) -> bool {
 /// 不值得手写的字段（IPv6）时返回 `None`，由调用方退回 [`render_line`]。
 pub fn render_line_stack(stamp: &str, line: &AccessLine<'_>, out: &mut [u8]) -> Option<usize> {
     let mut out = StackWriter { out, len: 0 };
-    let fits = out.push_str(stamp)
-        && out.push_str("  INFO ")
-        && out.push_str(ACCESS_LOG_TARGET)
-        && out.push_str(": access ip=")
+    let fits = out.push(stamp.as_bytes())
+        && out.push(b"  INFO ")
+        && out.push(ACCESS_LOG_TARGET.as_bytes())
+        && out.push(b": access ip=")
         && push_ip(&mut out, line.ip)
-        && out.push_str(" method=")
-        && out.push_str(line.method)
-        && out.push_str(" path=")
-        && out.push_str(line.path)
-        && out.push_str(" version=")
+        && out.push(b" method=")
+        && out.push(line.method.as_bytes())
+        && out.push(b" path=")
+        && out.push(line.path.as_bytes())
+        && out.push(b" version=")
         && push_version(&mut out, line.version)
-        && out.push_str(" status=")
+        && out.push(b" status=")
         && out.push_uint(u32::from(line.status))
-        && out.push_str(" size=")
-        && out.push_str(line.size)
+        && out.push(b" size=")
+        && out.push(line.size.as_bytes())
         && out.push_byte(b'\n');
     fits.then_some(out.len)
 }
