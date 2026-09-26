@@ -13,12 +13,14 @@
 //! - `/pull/<sub>` 逐个文件落盘。`/pull` 是拉取专用的端点：不碰 `/files` 那套 fd 缓存，
 //!   也不编码拉取端用不到的 `ETag`、`Last-Modified` 与 `Content-Disposition`（见 `lanfile_assets`）。
 //!
-//! v1 顺序拉取：一个文件一个文件、每请求一条 TCP 连接（`Connection: close`，正文读到 EOF
-//! 即整段）。读到 EOF 只说明"连接结束了"，不说明"收全了"——所以正文长度必须再跟响应自己
-//! 声明的 `Content-Length`（没有则退回目录列表里的尺寸）对一遍，对不上就报错并删掉半截文件，
-//! 连接与单次读取也都设了空闲超时，服务器半路哑掉不会把客户端挂死。结构上每个文件的抓取
-//! 收口在 [`fetch_file`]、目录枚举收口在 [`list_entries`]，未来要做有限并发时把它们解耦、
-//! 对文件任务套一层 `buffer_unordered` 即可，不必重写本模块。
+//! v1 顺序拉取：一个文件一个文件，但共用一条 keep-alive 连接——一棵目录树只握一次手，
+//! 省掉每个文件的三次握手与慢启动。正文严格按响应声明的 `Content-Length` 读满即停：长度
+//! 不再是事后校验，而是读取本身的停止条件，读满的连接干净、直接归还池子复用；响应没有
+//! `Content-Length`（理论上不会有）则退化成读到 EOF、丢弃连接，不猜长度。连接与单次读取
+//! 都设了空闲超时，服务器半路哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次
+//! 请求会换一条新连接重试一次。结构上每个文件的抓取收口在 [`fetch_file`]、目录枚举收口
+//! 在 [`list_entries`]，未来要做有限并发时把它们解耦、对文件任务套一层 `buffer_unordered`
+//! 即可，不必重写本模块。
 
 use std::{
     fmt,
@@ -131,12 +133,13 @@ const USAGE: &str = "用法: lanfile get <base_url|直链> [<remote_dir>] [local
 /// 当前目录，拉根缺省 `lanfile-root`（避免把整棵 share 散落进当前目录）。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
+    let mut pool = Pool::default();
     match p.kind {
         // 直链已指明 kind：文件直接拉、目录当目录拉。
-        Kind::File => run_file(&p).await,
-        Kind::Dir => run_dir(&p, false).await,
+        Kind::File => run_file(&mut pool, &p).await,
+        Kind::Dir => run_dir(&mut pool, &p, false).await,
         // 裸 host：先试目录，`/api/list` 404 再当文件。
-        Kind::Auto => run_dir(&p, true).await,
+        Kind::Auto => run_dir(&mut pool, &p, true).await,
     }
 }
 
@@ -187,8 +190,8 @@ fn to_not_found(error: Error, remote: &str) -> Error {
 }
 
 /// 当文件拉 `/pull/<remote>`；404 统一转成「远端不存在」（裸 host 探测到这一步即目录与文件都不是）。
-async fn run_file(p: &Parsed) -> Result<(), BoxError> {
-    pull_file_run(p)
+async fn run_file(pool: &mut Pool, p: &Parsed) -> Result<(), BoxError> {
+    pull_file_run(pool, p)
         .await
         .map_err(|error| to_not_found(error, &p.remote).into())
 }
@@ -196,10 +199,10 @@ async fn run_file(p: &Parsed) -> Result<(), BoxError> {
 /// 当目录拉 `/api/list/<remote>`；404 时按 `fallback_file` 决定下一步：
 /// - `true`（裸 host）：改走 `/pull` 试单个文件；
 /// - `false`（目录直链）：URL 已经说清楚是目录，直接报"远端不存在"。
-async fn run_dir(p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
-    match list_entries(&p.host, &p.remote).await {
-        Ok(entries) => pull_dir_run(p, entries).await.map_err(Into::into),
-        Err(Error::Http { status: 404, .. }) if fallback_file => run_file(p).await,
+async fn run_dir(pool: &mut Pool, p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
+    match list_entries(pool, &p.host, &p.remote).await {
+        Ok(entries) => pull_dir_run(pool, p, entries).await.map_err(Into::into),
+        Err(Error::Http { status: 404, .. }) if fallback_file => run_file(pool, p).await,
         Err(error) => Err(to_not_found(error, &p.remote).into()),
     }
 }
@@ -379,11 +382,11 @@ const fn hex_digit(b: u8) -> Option<u8> {
 }
 
 /// 拉目录到 `local`（默认在 `local` 下套一层远端目录名，对齐 `scp -r`；`--flat` 不套层）。
-async fn pull_dir_run(p: &Parsed, entries: Vec<RemoteEntry>) -> Result<(), Error> {
+async fn pull_dir_run(pool: &mut Pool, p: &Parsed, entries: Vec<RemoteEntry>) -> Result<(), Error> {
     let remote = &p.remote;
     let target = local_target(&p.local, remote, p.flat);
     tokio::fs::create_dir_all(&target).await?;
-    let stats = pull_entries(&p.host, remote, &target, entries).await?;
+    let stats = pull_entries(pool, &p.host, remote, &target, entries).await?;
     eprintln!(
         "lanfile get: {}/{remote} -> {}（{} 文件，{} 字节，{} 目录）",
         p.base,
@@ -396,14 +399,14 @@ async fn pull_dir_run(p: &Parsed, entries: Vec<RemoteEntry>) -> Result<(), Error
 }
 
 /// 拉单个文件到 `local/<basename>`：不套层，落盘根目录按需建。
-async fn pull_file_run(p: &Parsed) -> Result<(), Error> {
+async fn pull_file_run(pool: &mut Pool, p: &Parsed) -> Result<(), Error> {
     let remote = &p.remote;
     let name = basename(remote).unwrap_or("download");
     let target = p.local.join(name);
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let bytes = fetch_file(&p.host, remote, &target, None).await?;
+    let bytes = fetch_file(pool, &p.host, remote, &target).await?;
     eprintln!(
         "lanfile get: {}/{remote} -> {}（{bytes} 字节）",
         p.base,
@@ -461,26 +464,44 @@ struct ListResponse {
 }
 
 /// 递归拉取 `remote` 目录到 `local`：先取这层条目，再逐条落盘。
-async fn pull_dir(host: &str, remote: &str, local: &Path) -> Result<Stats, Error> {
-    let entries = list_entries(host, remote).await?;
-    pull_entries(host, remote, local, entries).await
+async fn pull_dir(pool: &mut Pool, host: &str, remote: &str, local: &Path) -> Result<Stats, Error> {
+    let entries = list_entries(pool, host, remote).await?;
+    pull_entries(pool, host, remote, local, entries).await
 }
 
-/// 取一层目录的条目：`GET /api/list[/<remote>]`，正文一次性读全再反序列化。
-async fn list_entries(host: &str, remote: &str) -> Result<Vec<RemoteEntry>, Error> {
+/// 取一层目录的条目：`GET /api/list[/<remote>]`。正文按 `Content-Length` 精确读满，
+/// 连接干净归还池子复用；没有 `Content-Length`（理论上不会有）才读到 EOF、丢弃连接。
+async fn list_entries(
+    pool: &mut Pool,
+    host: &str,
+    remote: &str,
+) -> Result<Vec<RemoteEntry>, Error> {
     let path = if remote.is_empty() {
         "/api/list".to_string()
     } else {
         format!("/api/list/{}", encode_path(remote))
     };
-    let (mut reader, _) = http_get(host, &path).await?;
-    let mut body = Vec::new();
-    // 列表正文就几十 KB 出头，这里卡的是整段读完的总时长（不是空闲），够用且简单。
-    tokio::time::timeout(READ_TIMEOUT, reader.read_to_end(&mut body))
-        .await
-        .map_err(|_| Error::Timeout {
-            phase: "读取目录列表",
-        })??;
+    let (mut reader, declared) = http_get(pool, host, &path).await?;
+    let body = if let Some(len) = declared {
+        // 有 Content-Length：精确读满，连接可复用；读不满（EOF）算 IO 错，连接丢弃。
+        let mut buf = vec![0_u8; len as usize];
+        tokio::time::timeout(READ_TIMEOUT, reader.read_exact(&mut buf))
+            .await
+            .map_err(|_| Error::Timeout {
+                phase: "读取目录列表",
+            })??;
+        pool.release(reader);
+        buf
+    } else {
+        // 无 Content-Length：读到 EOF，连接不可复用。
+        let mut body = Vec::new();
+        tokio::time::timeout(READ_TIMEOUT, reader.read_to_end(&mut body))
+            .await
+            .map_err(|_| Error::Timeout {
+                phase: "读取目录列表",
+            })??;
+        body
+    };
     Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
 }
 
@@ -489,6 +510,7 @@ async fn list_entries(host: &str, remote: &str) -> Result<Vec<RemoteEntry>, Erro
 /// 与 [`list_entries`] 拆开是为了让顶层那一次列表请求的失败（404）能被 [`run_dir`] 捕获、
 /// 转成"远端不存在"，而不是在这里被当成"递归里某层目录没了"。
 async fn pull_entries(
+    pool: &mut Pool,
     host: &str,
     remote: &str,
     local: &Path,
@@ -506,14 +528,14 @@ async fn pull_entries(
             tokio::fs::create_dir_all(&local_child).await?;
             stats.dirs += 1;
             // async 递归必须装箱，否则 future 尺寸无限
-            let sub = Box::pin(pull_dir(host, &remote_child, &local_child)).await?;
+            let sub = Box::pin(pull_dir(pool, host, &remote_child, &local_child)).await?;
             stats.files += sub.files;
             stats.dirs += sub.dirs;
             stats.bytes += sub.bytes;
         } else {
             let remote_size = entry.size;
             if !skip_existing(&local_child, remote_size).await {
-                match fetch_file(host, &remote_child, &local_child, remote_size).await {
+                match fetch_file(pool, host, &remote_child, &local_child).await {
                     Ok(n) => stats.bytes += n,
                     Err(error) => eprintln!("  跳过 {remote_child}：{error}"),
                 }
@@ -538,37 +560,68 @@ const READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// 正文搬运的缓冲区。开大一点，读的次数与定时器条目就跟着少。
 const COPY_BUF: usize = 64 * 1024;
 
-/// 拉一个文件到 `local`：每请求一条连接，`Connection: close`，正文读到 EOF 落盘。
+/// 一条可复用的 HTTP/1.1 keep-alive 连接。顺序拉取只用一条：每请求省掉一次三次握手与慢启动。
 ///
-/// 落盘字节数要跟 `expected`（调用方从目录列表拿到的尺寸，单文件拉取为 `None`）以及响应
-/// 自己声明的 `Content-Length` 都对得上。对不上、或者半路超时/IO 出错，都把没写完的文件
-/// 删掉再报错——宁可什么都没有，也不留一个看着完整其实残缺的文件。
-async fn fetch_file(
-    host: &str,
-    remote: &str,
-    local: &Path,
-    expected: Option<u64>,
-) -> Result<u64, Error> {
+/// 正文按 `Content-Length` 精确读满后由调用方 [`Pool::release`] 归还，下一请求 [`Pool::acquire`]
+/// 直接拿来用；读取出错、响应不带 `Content-Length`、或连接被对端关掉时不归还，连接随之关闭。
+#[derive(Default)]
+struct Pool {
+    conn: Option<BufReader<TcpStream>>,
+}
+
+impl Pool {
+    /// 借一条连接：池里有就拿来用，没有就新建。取走后池为空，读完正文再由调用方归还或丢弃。
+    async fn acquire(&mut self, host: &str) -> Result<BufReader<TcpStream>, Error> {
+        if let Some(conn) = self.conn.take() {
+            return Ok(conn);
+        }
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(host))
+            .await
+            .map_err(|_| Error::Timeout { phase: "连接" })?
+            .map_err(|source| Error::Connect {
+                host: host.to_string(),
+                source,
+            })?;
+        let _ = stream.set_nodelay(true);
+        Ok(BufReader::new(stream))
+    }
+
+    /// 归还：正文按 `Content-Length` 精确读满、连接干净时才调。
+    fn release(&mut self, conn: BufReader<TcpStream>) {
+        self.conn = Some(conn);
+    }
+}
+
+/// 拉一个文件到 `local`：正文按响应声明的 `Content-Length` 精确读满即停。
+///
+/// 读满后连接干净，归还池子给下一个文件复用；服务端提前 EOF（读到的字节数不足声明的长度）
+/// 或半路超时/IO 出错，都把没写完的文件删掉再报错——宁可什么都没有，也不留一个看着完整
+/// 其实残缺的文件。响应没有 `Content-Length`（理论上不会有）就退化成读到 EOF、连接用完即弃。
+async fn fetch_file(pool: &mut Pool, host: &str, remote: &str, local: &Path) -> Result<u64, Error> {
     let path = format!("/pull/{}", encode_path(remote));
-    let (mut reader, declared) = http_get(host, &path).await?;
+    let (mut reader, declared) = http_get(pool, host, &path).await?;
     let mut file = tokio::fs::File::create(local).await?;
-    let copied = match copy_body(&mut reader, &mut file).await {
+    let copied = match copy_body(&mut reader, &mut file, declared).await {
         Ok(copied) => copied,
         Err(error) => {
             discard(local).await;
             return Err(error);
         }
     };
-    // 响应说的长度最权威；它缺席（理论上不会有）才退回列表里的尺寸。
-    if let Some(want) = declared.or(expected)
-        && copied != want
-    {
-        discard(local).await;
-        return Err(Error::Truncated {
-            remote: remote.to_string(),
-            want,
-            got: copied,
-        });
+    match declared {
+        // 精确读满 Content-Length：连接干净，归还复用
+        Some(want) if copied == want => pool.release(reader),
+        // 读到 EOF 却不足声明的长度：传输不完整
+        Some(want) => {
+            discard(local).await;
+            return Err(Error::Truncated {
+                remote: remote.to_string(),
+                want,
+                got: copied,
+            });
+        }
+        // 无 Content-Length：读到 EOF，连接不可复用，不归还即丢弃
+        None => {}
     }
     Ok(copied)
 }
@@ -582,17 +635,28 @@ async fn discard(local: &Path) {
 
 /// 把正文读进 `file` 并落盘，返回落盘字节数。
 ///
-/// 每次读取都套一个空闲超时——服务器接上却半路哑掉（既不回数据也不断连）时不能把客户端
-/// 挂死。不用 `tokio::io::copy` 是因为它没有这个挂点；而在外面套一个 `timeout` 又会连总
-/// 时长一起限住，大文件在慢链路上会被误杀。
+/// `max` 为响应声明的 `Content-Length` 时每次只读到「还差多少」为止，读满即停——读多一个
+/// 字节就会把下一条响应的开头吃进缓冲，连接就没法复用了；它同时也是完整性的停止条件，读不满
+/// 即截断。`max` 为 `None`（响应没有 `Content-Length`，理论上不会有）退化成读到 EOF、
+/// 连接用完即弃。每次读取都套一个空闲超时——服务器接上却半路哑掉（既不回数据也不断连）时
+/// 不能把客户端挂死。不用 `tokio::io::copy` 是因为它没有这个挂点；而在外面套一个 `timeout`
+/// 又会连总时长一起限住，大文件在慢链路上会被误杀。
 async fn copy_body(
     reader: &mut BufReader<TcpStream>,
     file: &mut tokio::fs::File,
+    max: Option<u64>,
 ) -> Result<u64, Error> {
     let mut buf = vec![0_u8; COPY_BUF];
     let mut total = 0_u64;
     loop {
-        let read = tokio::time::timeout(READ_TIMEOUT, reader.read(&mut buf))
+        let want = match max {
+            Some(m) => buf.len().min((m - total) as usize),
+            None => buf.len(),
+        };
+        if want == 0 {
+            break;
+        }
+        let read = tokio::time::timeout(READ_TIMEOUT, reader.read(&mut buf[..want]))
             .await
             .map_err(|_| Error::Timeout {
                 phase: "读取正文"
@@ -608,36 +672,52 @@ async fn copy_body(
     Ok(total)
 }
 
-/// 建连、写 `GET` 请求、读状态行并跳过响应头；返回可继续读正文的 reader 与响应声明的
-/// `Content-Length`，非 200 报错。`fetch_file`、`list_entries` 共有的请求前置收口于此。
+/// 借/建一条连接，写 `GET` 请求，读状态行并跳过响应头；返回可继续读正文的 reader 与响应
+/// 声明的 `Content-Length`，非 200 报错。`fetch_file`、`list_entries` 共有的请求前置收口于此。
 ///
-/// 建连后整条 `TcpStream` 直接交给 reader，**不做 `into_split`**：那样写半边会在请求发完
-/// 后出作用域，`OwnedWriteHalf::drop` 顺手 `shutdown(Write)`，而这个提前的 half-close 会让
-/// 服务端（salvo/hyper 的 `http1` 默认 `half_close = false`）在读到 EOF 时判定连接中断、
-/// 丢掉还在飞的响应——几十 MB 的文件就只落下几 MB。标准客户端（curl、浏览器）也不 half-close。
-async fn http_get(host: &str, path: &str) -> Result<(BufReader<TcpStream>, Option<u64>), Error> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(host))
-        .await
-        .map_err(|_| Error::Timeout { phase: "连接" })?
-        .map_err(|source| Error::Connect {
-            host: host.to_string(),
-            source,
-        })?;
-    let _ = stream.set_nodelay(true);
-    stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await?;
-    let mut reader = BufReader::new(stream);
-    let (status, content_length) = read_status(&mut reader).await?;
-    if status != 200 {
-        return Err(Error::Http {
-            status,
-            path: path.to_string(),
-        });
+/// 复用的连接若被服务端悄悄关掉（keep-alive 超时、对端 RST），下一次请求会在写或读状态行时
+/// 失败——这时换一条新连接重试一次，不让一个已死的池连接把整次拉取带走。只重试一次、且只在
+/// 确系复用时：新连接也失败就是真出错。超时不重试（服务端活着只是慢，不是连接死了）。
+async fn http_get(
+    pool: &mut Pool,
+    host: &str,
+    path: &str,
+) -> Result<(BufReader<TcpStream>, Option<u64>), Error> {
+    let mut reused = pool.conn.is_some();
+    loop {
+        let mut reader = pool.acquire(host).await?;
+        match request(&mut reader, host, path).await {
+            Ok((200, content_length)) => return Ok((reader, content_length)),
+            Ok((status, _)) => {
+                return Err(Error::Http {
+                    status,
+                    path: path.to_string(),
+                });
+            }
+            Err(error) if reused && !matches!(error, Error::Timeout { .. }) => {
+                reused = false;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    Ok((reader, content_length))
+}
+
+/// 写一条 `GET` 请求并读出状态行与响应头。请求不带 `Connection` 头：HTTP/1.1 默认 keep-alive，
+/// 连接因此可复用。建连后整条 `TcpStream` 直接交给 reader，**不做 `into_split`**：那样写半边
+/// 会在请求发完后出作用域，`OwnedWriteHalf::drop` 顺手 `shutdown(Write)`，而这个提前的
+/// half-close 会让服务端（salvo/hyper 的 `http1` 默认 `half_close = false`）在读到 EOF 时
+/// 判定连接中断、丢掉还在飞的响应——几十 MB 的文件就只落下几 MB。标准客户端（curl、浏览器）
+/// 也不 half-close。
+async fn request(
+    reader: &mut BufReader<TcpStream>,
+    host: &str,
+    path: &str,
+) -> Result<(u16, Option<u64>), Error> {
+    reader
+        .get_mut()
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await?;
+    read_status(reader).await
 }
 
 /// 读状态行 + 跳过响应头，返回状态码与响应声明的 `Content-Length`。正文留给调用方接着读。
@@ -1099,11 +1179,69 @@ mod tests {
 
         let target =
             std::env::temp_dir().join(format!("lanfile-pull-timeout-{}", std::process::id()));
-        let error = fetch_file(&addr.to_string(), "x.bin", &target, None)
+        let mut pool = Pool::default();
+        let error = fetch_file(&mut pool, &addr.to_string(), "x.bin", &target)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Timeout { .. }), "{error}");
         assert!(!target.exists(), "超时后不该留半截文件");
         server.abort();
+    }
+
+    /// 两个文件走同一条 keep-alive 连接：服务端只 accept 一次，第二条请求复用第一条归还的连接。
+    /// 正文按 `Content-Length` 精确读满即停，读多的一个字节会把下一条响应的开头吃掉——这条
+    /// 测试盯住「读满即止」与「归还复用」两件事同时成立。
+    #[tokio::test]
+    async fn fetch_file_reuses_one_connection_across_files() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        // 把请求头读到空行即止（GET 无正文）；BufReader 把整段请求吃进缓冲，读完恰好干净
+        async fn read_request(reader: &mut BufReader<TcpStream>) {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(conn);
+            read_request(&mut reader).await;
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\naaa")
+                .await
+                .unwrap();
+            read_request(&mut reader).await;
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbbb")
+                .await
+                .unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("lanfile-pull-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a.bin");
+        let f2 = dir.join("b.bin");
+        let mut pool = Pool::default();
+        fetch_file(&mut pool, &addr.to_string(), "a.bin", &f1)
+            .await
+            .unwrap();
+        fetch_file(&mut pool, &addr.to_string(), "b.bin", &f2)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&f1).unwrap(), b"aaa");
+        assert_eq!(std::fs::read(&f2).unwrap(), b"bbb");
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
