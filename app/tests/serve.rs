@@ -1114,3 +1114,42 @@ async fn get_large_file_is_not_truncated() {
 
     server.abort();
 }
+
+/// 服务端谎报长度（声明 100 字节、只发 10 字节就断开）时必须报错，而不是把半截文件
+/// 当完整文件留下。
+#[tokio::test]
+async fn get_truncated_transfer_is_reported_and_discarded() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = conn.read(&mut request).await;
+        let _ = conn
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789",
+            )
+            .await;
+        drop(conn);
+    });
+
+    let dst = TestDir::new();
+    let error = lanfile_pull::run(&[
+        format!("http://{addr}/files/x.bin"),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("100"),
+        "报错要带上应得长度：{error}"
+    );
+    assert!(
+        error.to_string().contains("10"),
+        "报错要带上实收长度：{error}"
+    );
+    assert!(!dst.root().join("x.bin").exists(), "半截文件不能留在盘上");
+    server.abort();
+}

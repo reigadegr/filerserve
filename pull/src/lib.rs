@@ -13,14 +13,17 @@
 //! - `/pull/<sub>` 逐个文件落盘。`/pull` 是拉取专用的端点：不碰 `/files` 那套 fd 缓存，
 //!   也不编码拉取端用不到的 `ETag`、`Last-Modified` 与 `Content-Disposition`（见 `lanfile_assets`）。
 //!
-//! v1 顺序拉取：一个文件一个文件、每请求一条 TCP 连接（`Connection: close`，
-//! 读到 EOF 即整段正文，连 `Content-Length` 都不用解析）。结构上每个文件的抓取收口在
-//! [`fetch_file`]、目录枚举收口在 [`list_entries`]，未来要做有限并发时把它们解耦、对文件
-//! 任务套一层 `buffer_unordered` 即可，不必重写本模块。
+//! v1 顺序拉取：一个文件一个文件、每请求一条 TCP 连接（`Connection: close`，正文读到 EOF
+//! 即整段）。读到 EOF 只说明"连接结束了"，不说明"收全了"——所以正文长度必须再跟响应自己
+//! 声明的 `Content-Length`（没有则退回目录列表里的尺寸）对一遍，对不上就报错并删掉半截文件，
+//! 连接与单次读取也都设了空闲超时，服务器半路哑掉不会把客户端挂死。结构上每个文件的抓取
+//! 收口在 [`fetch_file`]、目录枚举收口在 [`list_entries`]，未来要做有限并发时把它们解耦、
+//! 对文件任务套一层 `buffer_unordered` 即可，不必重写本模块。
 
 use std::{
     fmt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -47,6 +50,13 @@ pub enum Error {
     Http { status: u16, path: String },
     /// 远端这个路径既不是目录也不是文件（`/api/list` 与 `/pull` 都 404）。
     NotFound { remote: String },
+    /// 连接或读取超时：远端在约定时间内一句话都没回。
+    Timeout {
+        /// 卡在哪一步（`连接`、`读取响应`、`读取正文`）。
+        phase: &'static str,
+    },
+    /// 正文被提前截断：收到的字节数与应得的不一致。
+    Truncated { remote: String, want: u64, got: u64 },
     /// 命令行参数或响应结构不符合预期。
     Malformed(&'static str),
     /// 底层 IO（读写、建连之后的网络错误等）。
@@ -65,6 +75,13 @@ impl fmt::Display for Error {
             Self::NotFound { remote } => {
                 write!(f, "远端 `{remote}` 不存在（既不是目录也不是文件）")
             }
+            Self::Timeout { phase } => {
+                write!(f, "{phase}超时：远端在约定时间内没有应答")
+            }
+            Self::Truncated { remote, want, got } => write!(
+                f,
+                "远端 `{remote}` 传输不完整：应得 {want} 字节，只收到 {got} 字节"
+            ),
             Self::Malformed(what) => write!(f, "{what}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),
@@ -386,7 +403,7 @@ async fn pull_file_run(p: &Parsed) -> Result<(), Error> {
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let bytes = fetch_file(&p.host, remote, &target).await?;
+    let bytes = fetch_file(&p.host, remote, &target, None).await?;
     eprintln!(
         "lanfile get: {}/{remote} -> {}（{bytes} 字节）",
         p.base,
@@ -456,9 +473,14 @@ async fn list_entries(host: &str, remote: &str) -> Result<Vec<RemoteEntry>, Erro
     } else {
         format!("/api/list/{}", encode_path(remote))
     };
-    let mut reader = http_get(host, &path).await?;
+    let (mut reader, _) = http_get(host, &path).await?;
     let mut body = Vec::new();
-    reader.read_to_end(&mut body).await?;
+    // 列表正文就几十 KB 出头，这里卡的是整段读完的总时长（不是空闲），够用且简单。
+    tokio::time::timeout(READ_TIMEOUT, reader.read_to_end(&mut body))
+        .await
+        .map_err(|_| Error::Timeout {
+            phase: "读取目录列表",
+        })??;
     Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
 }
 
@@ -491,7 +513,7 @@ async fn pull_entries(
         } else {
             let remote_size = entry.size;
             if !skip_existing(&local_child, remote_size).await {
-                match fetch_file(host, &remote_child, &local_child).await {
+                match fetch_file(host, &remote_child, &local_child, remote_size).await {
                     Ok(n) => stats.bytes += n,
                     Err(error) => eprintln!("  跳过 {remote_child}：{error}"),
                 }
@@ -502,25 +524,101 @@ async fn pull_entries(
     Ok(stats)
 }
 
+/// 建连超时：远端在约定时间内没握上手就别耗着。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 单次读取之间允许的最长空闲；超过就认定这条连接已经哑掉（既不回数据也不断开）。
+#[cfg(not(test))]
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 测试里缩到 500ms：好让 `debug.sh` 真跑一遍超时路径，而不必干等半分钟。
+#[cfg(test)]
+const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 正文搬运的缓冲区。开大一点，读的次数与定时器条目就跟着少。
+const COPY_BUF: usize = 64 * 1024;
+
 /// 拉一个文件到 `local`：每请求一条连接，`Connection: close`，正文读到 EOF 落盘。
-async fn fetch_file(host: &str, remote: &str, local: &Path) -> Result<u64, Error> {
+///
+/// 落盘字节数要跟 `expected`（调用方从目录列表拿到的尺寸，单文件拉取为 `None`）以及响应
+/// 自己声明的 `Content-Length` 都对得上。对不上、或者半路超时/IO 出错，都把没写完的文件
+/// 删掉再报错——宁可什么都没有，也不留一个看着完整其实残缺的文件。
+async fn fetch_file(
+    host: &str,
+    remote: &str,
+    local: &Path,
+    expected: Option<u64>,
+) -> Result<u64, Error> {
     let path = format!("/pull/{}", encode_path(remote));
-    let mut reader = http_get(host, &path).await?;
+    let (mut reader, declared) = http_get(host, &path).await?;
     let mut file = tokio::fs::File::create(local).await?;
-    let copied = tokio::io::copy(&mut reader, &mut file).await?;
+    let copied = match copy_body(&mut reader, &mut file).await {
+        Ok(copied) => copied,
+        Err(error) => {
+            discard(local).await;
+            return Err(error);
+        }
+    };
+    // 响应说的长度最权威；它缺席（理论上不会有）才退回列表里的尺寸。
+    if let Some(want) = declared.or(expected)
+        && copied != want
+    {
+        discard(local).await;
+        return Err(Error::Truncated {
+            remote: remote.to_string(),
+            want,
+            got: copied,
+        });
+    }
     Ok(copied)
 }
 
-/// 建连、写 `GET` 请求、读状态行并跳过响应头；返回可继续读正文的 reader，非 200 报错。
-/// `fetch_file`、`list_entries` 共有的请求前置收口于此，避免两处重复。
+/// 删掉没写完整的本地文件。删不掉也不覆盖真正的错误，只在 stderr 上留一句。
+async fn discard(local: &Path) {
+    if let Err(error) = tokio::fs::remove_file(local).await {
+        eprintln!("  清理 {} 失败：{error}", local.display());
+    }
+}
+
+/// 把正文读进 `file` 并落盘，返回落盘字节数。
+///
+/// 每次读取都套一个空闲超时——服务器接上却半路哑掉（既不回数据也不断连）时不能把客户端
+/// 挂死。不用 `tokio::io::copy` 是因为它没有这个挂点；而在外面套一个 `timeout` 又会连总
+/// 时长一起限住，大文件在慢链路上会被误杀。
+async fn copy_body(
+    reader: &mut BufReader<TcpStream>,
+    file: &mut tokio::fs::File,
+) -> Result<u64, Error> {
+    let mut buf = vec![0_u8; COPY_BUF];
+    let mut total = 0_u64;
+    loop {
+        let read = tokio::time::timeout(READ_TIMEOUT, reader.read(&mut buf))
+            .await
+            .map_err(|_| Error::Timeout {
+                phase: "读取正文"
+            })??;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buf[..read]).await?;
+        total += read as u64;
+    }
+    // 攒在 tokio 文件写缓冲里的尾巴要先落下去，外面的长度校验才算数
+    file.flush().await?;
+    Ok(total)
+}
+
+/// 建连、写 `GET` 请求、读状态行并跳过响应头；返回可继续读正文的 reader 与响应声明的
+/// `Content-Length`，非 200 报错。`fetch_file`、`list_entries` 共有的请求前置收口于此。
 ///
 /// 建连后整条 `TcpStream` 直接交给 reader，**不做 `into_split`**：那样写半边会在请求发完
 /// 后出作用域，`OwnedWriteHalf::drop` 顺手 `shutdown(Write)`，而这个提前的 half-close 会让
 /// 服务端（salvo/hyper 的 `http1` 默认 `half_close = false`）在读到 EOF 时判定连接中断、
 /// 丢掉还在飞的响应——几十 MB 的文件就只落下几 MB。标准客户端（curl、浏览器）也不 half-close。
-async fn http_get(host: &str, path: &str) -> Result<BufReader<TcpStream>, Error> {
-    let mut stream = TcpStream::connect(host)
+async fn http_get(host: &str, path: &str) -> Result<(BufReader<TcpStream>, Option<u64>), Error> {
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(host))
         .await
+        .map_err(|_| Error::Timeout { phase: "连接" })?
         .map_err(|source| Error::Connect {
             host: host.to_string(),
             source,
@@ -532,32 +630,67 @@ async fn http_get(host: &str, path: &str) -> Result<BufReader<TcpStream>, Error>
         )
         .await?;
     let mut reader = BufReader::new(stream);
-    let status = read_status(&mut reader).await?;
+    let (status, content_length) = read_status(&mut reader).await?;
     if status != 200 {
         return Err(Error::Http {
             status,
             path: path.to_string(),
         });
     }
-    Ok(reader)
+    Ok((reader, content_length))
 }
 
-/// 读状态行 + 跳过响应头，返回状态码。正文留给调用方接着读。
-async fn read_status(reader: &mut BufReader<TcpStream>) -> Result<u16, Error> {
+/// 读状态行 + 跳过响应头，返回状态码与响应声明的 `Content-Length`。正文留给调用方接着读。
+async fn read_status(reader: &mut BufReader<TcpStream>) -> Result<(u16, Option<u64>), Error> {
     // 状态行最长也就几十字节，一次给够，免得 `read_line` 中途扩容
     let mut status_line = String::with_capacity(64);
-    reader.read_line(&mut status_line).await?;
+    read_line_in_time(reader, &mut status_line).await?;
     let status = status_code(&status_line).ok_or(Error::Malformed("状态行格式异常"))?;
     // 复用同一个 String 读响应头，免得每行各分配一次。
+    let mut content_length = None;
     let mut line = String::new();
     loop {
         line.clear();
-        let read = reader.read_line(&mut line).await?;
+        let read = read_line_in_time(reader, &mut line).await?;
         if read == 0 || line.trim().is_empty() {
             break;
         }
+        take_content_length(&line, &mut content_length)?;
     }
-    Ok(status)
+    Ok((status, content_length))
+}
+
+/// 读一行响应头，套上单次读取的空闲超时：远端接上了却一直不说话也不能挂死。
+async fn read_line_in_time(
+    reader: &mut BufReader<TcpStream>,
+    line: &mut String,
+) -> Result<usize, Error> {
+    tokio::time::timeout(READ_TIMEOUT, reader.read_line(line))
+        .await
+        .map_err(|_| Error::Timeout {
+            phase: "读取响应"
+        })?
+        .map_err(Error::from)
+}
+
+/// 这一行若是 `Content-Length`（名字大小写不敏感）就把值记下来。
+///
+/// 值不是合法数字直接报错：拿不到可信长度就没法判断正文有没有被截断，与其悄悄放过，
+/// 不如当场把"对面发了个看不懂的长度"说出来。
+fn take_content_length(line: &str, content_length: &mut Option<u64>) -> Result<(), Error> {
+    let Some((name, value)) = line.split_once(':') else {
+        return Ok(());
+    };
+    if !name.trim().eq_ignore_ascii_case("content-length") {
+        return Ok(());
+    }
+    *content_length = Some(
+        value
+            .trim()
+            .parse()
+            .map_err(|_| Error::Malformed("Content-Length 不是合法数字"))?,
+    );
+    Ok(())
 }
 
 /// 从状态行 `HTTP/1.1 200 OK` 里取出状态码。
@@ -947,5 +1080,30 @@ mod tests {
                 "memchr 版比原实现慢了一个数量级: {memchr_ns:.1} vs {old_ns:.1} ns"
             );
         }
+    }
+
+    /// 服务端接上却一句话不说时，读取超时要把客户端放出来，并且不留半截文件。
+    #[tokio::test]
+    async fn fetch_file_times_out_on_a_silent_server() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 收下请求就不吭声：既不回响应，也不断开
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let _ = conn.read(&mut request).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let target =
+            std::env::temp_dir().join(format!("lanfile-pull-timeout-{}", std::process::id()));
+        let error = fetch_file(&addr.to_string(), "x.bin", &target, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Timeout { .. }), "{error}");
+        assert!(!target.exists(), "超时后不该留半截文件");
+        server.abort();
     }
 }
