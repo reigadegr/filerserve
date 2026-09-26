@@ -4,8 +4,9 @@
 //! 来源两种：
 //! - 裸 host：`http://h [remote] [local]`——`remote` 缺省拉根；给了名字先试目录，
 //!   `/api/list` 返回 200 当目录拉，404 当单个文件拉；
-//! - 直链：`http://h/files/<sub>`、`http://h/pull/<sub>` 当文件，`http://h/api/zip/<sub>`、
-//!   `http://h/api/list/<sub>`、`http://h/#<sub>` 当目录。
+//! - 直链：URL 的路径或 fragment 直接指明远端——`http://h/files/<sub>`、`http://h/pull/<sub>`
+//!   当文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>`、`http://h/#<sub>` 当目录，
+//!   其余非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、文件还是目录交给 `/api/list` 探测。
 //!
 //! 只走服务端两个 GET 端点：
 //! - `/api/list/<dir>` 拿到一层目录的条目（name/type/size）；
@@ -102,8 +103,9 @@ const USAGE: &str = "用法: lanfile get <base_url|直链> [<remote_dir>] [local
 /// - 裸 host（`http://h [remote] [local] [--flat]`）：`remote` 缺省即拉根；给了名字则先试
 ///   目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉（对 `lanfile get http://h a.tgz`
 ///   不再因 `/api/list` 404 直接失败，而是改走 `/pull` 把文件拉下来）。
-/// - 直链：`http://h/files/<sub>`、`http://h/pull/<sub>` 当文件，`http://h/api/zip/<sub>`、
-///   `http://h/api/list/<sub>`、`http://h/#<sub>` 当目录；`<sub>` 即远端相对路径，不给
+/// - 直链（URL 的路径/fragment 已指明远端）：`http://h/files/<sub>`、`http://h/pull/<sub>` 当
+///   文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>`、`http://h/#<sub>` 当目录，其余
+///   非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、kind 交给 `/api/list` 探测；不给
 ///   `local` 则落进当前目录（文件取末段为名）。
 ///
 /// 落盘语义对齐 `scp -r`：默认拉目录时在 `local` 下套一层以远端目录名命名的子目录
@@ -277,8 +279,11 @@ fn parse_source(url: &str) -> Result<Source, Error> {
     })
 }
 
-/// 认直链：`/files/`、`/pull/` 当文件，`/api/zip/`、`/api/list/` 与 `/#<sub>` 当目录；
-/// 都不是则 `None`（裸 host，remote 留给位置参数）。
+/// 认直链，给出 URL 里已经指明的那条远端路径：
+/// - `/files/<sub>`、`/pull/<sub>` 当文件，`/api/zip/<sub>`、`/api/list/<sub>` 当目录；
+/// - `/#<sub>` 当目录；
+/// - 其余非空路径本身就是远端，kind 待探测——`http://h/.pi` 等价于 `lanfile get http://h .pi`；
+/// - 只有空路径（`http://h`、`http://h/`）返回 `None`，remote 留给位置参数。
 fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
     if let Some(sub) = path
         .strip_prefix("files/")
@@ -311,8 +316,19 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
                 kind: Kind::Dir,
             });
         }
+        return None;
     }
-    None
+    // 其余非空路径本身就是远端，是文件还是目录留给 `/api/list` 探测。早先这里返回 `None`
+    // 退回裸 host，而裸 host 的 remote 缺省为空＝拉根，于是 `http://h/.pi` 这样最自然的
+    // 写法会默默把整棵 share 拖进 `lanfile-root`。
+    let sub = path.trim_matches('/');
+    if sub.is_empty() {
+        return None;
+    }
+    Some(Direct {
+        remote: percent_decode(sub),
+        kind: Kind::Auto,
+    })
 }
 
 /// 百分号解码：把 `%XX` 还原成原字节，用于直链里 URL 编码过的子路径（解码后再交给
@@ -692,10 +708,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_bare_host_with_unrecognized_path_stays_auto() {
-        // 未知路径不当直链：仍走裸 host，remote 从位置参数来。
-        let p = parse_args(&["http://h:1/whatever".into(), "sub".into()]).unwrap();
+    fn parse_args_path_only_url_is_a_remote() {
+        // 路径本身就是远端（kind 待探测）：http://h/.pi 等价于 lanfile get http://h .pi。
+        let p = parse_args(&["http://h:1/.pi".into()]).unwrap();
         assert_eq!(p.host, "h:1");
+        assert_eq!(p.remote, ".pi");
+        assert_eq!(p.kind, Kind::Auto);
+        assert_eq!(p.local, PathBuf::from("."));
+        // 多级路径整条都是远端；它后面的位置参数是 local。
+        let p = parse_args(&["http://h:1/a/b".into(), "./dst".into()]).unwrap();
+        assert_eq!(p.remote, "a/b");
+        assert_eq!(p.kind, Kind::Auto);
+        assert_eq!(p.local, PathBuf::from("./dst"));
+        // 带 fragment 时路径优先，fragment 不再重复当远端。
+        let p = parse_args(&["http://h:1/.pi#x".into()]).unwrap();
+        assert_eq!(p.remote, ".pi");
+        // 只有空路径才算裸 host，remote 仍从位置参数来。
+        let p = parse_args(&["http://h:1/".into(), "sub".into()]).unwrap();
         assert_eq!(p.remote, "sub");
         assert_eq!(p.kind, Kind::Auto);
     }
@@ -788,11 +817,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_empty_direct_link_sub_stays_auto() {
-        // /api/zip/、/files/ 这种空 sub 不当直链，仍走裸 host。
-        let p = parse_args(&["http://h:1/api/zip/".into(), "sub".into()]).unwrap();
-        assert_eq!(p.remote, "sub");
+    fn parse_args_route_prefix_without_name_is_not_a_direct_link() {
+        // `/api/zip/` 后面没名字：不当目录直链，整条路径退化成普通远端（kind 仍待探测）。
+        let p = parse_args(&["http://h:1/api/zip/".into(), "./dst".into()]).unwrap();
+        assert_eq!(p.remote, "api/zip");
         assert_eq!(p.kind, Kind::Auto);
+        assert_eq!(p.local, PathBuf::from("./dst"));
     }
 
     #[test]

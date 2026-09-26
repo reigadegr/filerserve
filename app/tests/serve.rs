@@ -1025,3 +1025,41 @@ async fn get_dir_direct_link_pulls_the_tree() {
 
     server.abort();
 }
+
+/// 路径直链 `http://h/<sub>`（如 `/.pi`）：路径就是远端，只拉那棵子树。
+/// 回归用：早先无法识别的路径会静默退回裸 host、remote 缺省为空＝拉根，把整棵 share
+/// 拖进 `lanfile-root`；这里显式断言根没被碰。
+#[tokio::test]
+async fn get_path_only_url_pulls_that_subtree_not_the_root() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub").join("b.txt"), "bbbb").unwrap();
+    std::fs::write(dir.root().join("root-only.txt"), "root").unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        format!("http://{addr}/sub"),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(dst.root().join("sub").join("b.txt")).unwrap(),
+        b"bbbb"
+    );
+    assert!(!dst.root().join("lanfile-root").exists());
+    assert!(!dst.root().join("root-only.txt").exists());
+
+    server.abort();
+}
